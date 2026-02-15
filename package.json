@@ -1,0 +1,44 @@
+{
+  "name": "visa-bot",
+  "version": "2.0.0",
+  "description": "Multi-tenant visa appointment monitoring and rescheduling bot",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --env-file=.env src/index.ts",
+    "build": "tsc",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "trigger:dev": "npx trigger.dev@latest dev",
+    "login": "npx tsx --env-file=.env scripts/login.ts",
+    "test-fetch": "npx tsx --env-file=.env scripts/test-fetch.ts",
+    "session-test": "npx tsx --env-file=.env scripts/session-duration-test.ts",
+    "session-idle-test": "npx tsx --env-file=.env scripts/session-idle-test.ts",
+    "test-reschedule": "npx tsx --env-file=.env scripts/test-reschedule-e2e.ts",
+    "monitor": "npx tsx --env-file=.env scripts/monitor.ts",
+    "test-notifications": "npx tsx --env-file=.env scripts/test-notifications.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "deploy:rpi": "./scripts/deploy-rpi.sh",
+    "deploy:rpi:full": "./scripts/deploy-rpi.sh --full"
+  },
+  "dependencies": {
+    "@clerk/backend": "^2.31.0",
+    "@hono/node-server": "^1.19.9",
+    "@neondatabase/serverless": "^0.10.4",
+    "@trigger.dev/sdk": "^4.0.0",
+    "drizzle-orm": "^0.38.0",
+    "hono": "^4.6.0",
+    "resend": "^4.0.0",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "^4.3.3",
+    "@types/node": "^22.0.0",
+    "drizzle-kit": "^0.30.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}

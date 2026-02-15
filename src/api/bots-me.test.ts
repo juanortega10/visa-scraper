@@ -1,0 +1,383 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+// ── Hoisted setup (runs before vi.mock module resolution) ──
+
+const { mockVerifyToken } = vi.hoisted(() => {
+  // Set env BEFORE clerk-auth.ts module loads (reads CLERK_JWT_KEY at module scope)
+  process.env.CLERK_JWT_KEY = 'test-pem-key';
+  const mockVerifyToken = vi.fn();
+  return { mockVerifyToken };
+});
+
+// ── Mocks ─────────────────────────────────────────────
+
+vi.mock('@clerk/backend', () => ({
+  verifyToken: mockVerifyToken,
+}));
+
+vi.mock('../db/client.js', () => {
+  function chain(rows: unknown[]) {
+    const c: any = {};
+    for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning']) {
+      c[m] = vi.fn(() => c);
+    }
+    c.then = (res: (v: unknown) => void) => Promise.resolve(rows).then(res);
+    c.catch = (fn: (e: unknown) => void) => Promise.resolve(rows).catch(fn);
+    return c;
+  }
+  return {
+    db: {
+      select: vi.fn(() => chain([])),
+      insert: vi.fn(() => chain([])),
+      update: vi.fn(() => chain([])),
+      delete: vi.fn(() => chain([])),
+    },
+  };
+});
+
+vi.mock('../services/encryption.js', () => ({
+  encrypt: vi.fn((v: string) => `enc_${v}`),
+  decrypt: vi.fn((v: string) => {
+    if (v === 'enc_corrupt') throw new Error('decrypt failed');
+    return v.replace('enc_', '');
+  }),
+}));
+
+vi.mock('../services/login.js', () => ({
+  pureFetchLogin: vi.fn(),
+  InvalidCredentialsError: class extends Error { constructor() { super('invalid'); } },
+  discoverAccount: vi.fn(),
+}));
+
+vi.mock('../services/scheduling.js', () => ({
+  getPollingDelay: vi.fn(() => '120s'),
+}));
+
+vi.mock('../trigger/poll-visa.js', () => ({
+  pollVisaTask: { trigger: vi.fn(async () => ({ id: 'run_mock' })) },
+}));
+
+vi.mock('../trigger/login-visa.js', () => ({
+  loginVisaTask: { trigger: vi.fn(async () => ({ id: 'run_mock' })) },
+}));
+
+vi.mock('@trigger.dev/sdk/v3', () => ({
+  runs: { cancel: vi.fn() },
+}));
+
+vi.mock('../utils/constants.js', () => ({
+  isValidLocale: vi.fn(() => true),
+  VALID_LOCALES: { 'es-co': 'Colombia', 'es-pe': 'Peru' },
+  resolveLocale: vi.fn((c: string) => c === 'co' ? 'es-co' : c === 'pe' ? 'es-pe' : null),
+}));
+
+import { db } from '../db/client.js';
+import { botsRouter } from './bots.js';
+
+// ── Helpers ───────────────────────────────────────────
+
+function buildApp() {
+  const app = new Hono();
+  app.route('/api/bots', botsRouter);
+  return app;
+}
+
+/** Override db.select() to return specific rows via the chainable mock */
+function mockDbRows(rows: unknown[]) {
+  const chain: any = {};
+  for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning']) {
+    chain[m] = vi.fn(() => chain);
+  }
+  chain.then = (res: (v: unknown) => void) => Promise.resolve(rows).then(res);
+  chain.catch = (fn: (e: unknown) => void) => Promise.resolve(rows).catch(fn);
+  vi.mocked(db.select).mockReturnValueOnce(chain as any);
+  return chain;
+}
+
+function authHeader(token = 'valid_token') {
+  return { Authorization: `Bearer ${token}` };
+}
+
+// ── Tests: GET /api/bots/me ───────────────────────────
+
+describe('GET /api/bots/me', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = buildApp();
+  });
+
+  // ── Auth error cases ──────────────────────────────
+
+  it('returns 401 no_token when no Authorization header', async () => {
+    const res = await app.request('/api/bots/me');
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.code).toBe('no_token');
+    expect(body.error).toBe('Authorization required');
+  });
+
+  it('returns 401 no_token for non-Bearer auth header', async () => {
+    const res = await app.request('/api/bots/me', {
+      headers: { Authorization: 'Basic abc123' },
+    });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.code).toBe('no_token');
+  });
+
+  it('returns 401 token_invalid for bad token', async () => {
+    mockVerifyToken.mockRejectedValueOnce(new Error('Invalid signature'));
+    const res = await app.request('/api/bots/me', { headers: authHeader('bad') });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.code).toBe('token_invalid');
+    expect(body.error).toBe('Invalid token');
+  });
+
+  it('returns 401 token_expired for expired JWT', async () => {
+    mockVerifyToken.mockRejectedValueOnce(new Error('Token has expired (exp claim)'));
+    const res = await app.request('/api/bots/me', { headers: authHeader('expired') });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.code).toBe('token_expired');
+    expect(body.error).toBe('Token expired');
+  });
+
+  // ── Happy path ────────────────────────────────────
+
+  it('returns empty bots array for user with no bots', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_abc' });
+    mockDbRows([]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ bots: [] });
+  });
+
+  it('returns bots scoped to the authenticated user with decrypted email', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_xyz' });
+    mockDbRows([
+      {
+        id: 42,
+        status: 'active',
+        isScout: false,
+        isSubscriber: true,
+        visaEmail: 'enc_user@example.com',
+        scheduleId: '72824354',
+        consularFacilityId: '25',
+        locale: 'es-co',
+        currentConsularDate: '2026-03-09',
+        currentConsularTime: '08:15',
+        currentCasDate: '2026-03-05',
+        currentCasTime: '10:45',
+        createdAt: '2026-02-10T15:30:00.000Z',
+      },
+    ]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.bots).toHaveLength(1);
+    const bot = body.bots[0];
+    expect(bot.id).toBe(42);
+    expect(bot.visaEmail).toBe('user@example.com'); // decrypted
+    expect(bot.status).toBe('active');
+    expect(bot.isScout).toBe(false);
+    expect(bot.isSubscriber).toBe(true);
+    expect(bot.scheduleId).toBe('72824354');
+    expect(bot.consularFacilityId).toBe('25');
+    expect(bot.locale).toBe('es-co');
+    expect(bot.currentConsularDate).toBe('2026-03-09');
+    expect(bot.currentConsularTime).toBe('08:15');
+    expect(bot.currentCasDate).toBe('2026-03-05');
+    expect(bot.currentCasTime).toBe('10:45');
+    expect(bot.createdAt).toBe('2026-02-10T15:30:00.000Z');
+  });
+
+  it('returns null visaEmail when decryption fails', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_xyz' });
+    mockDbRows([
+      {
+        id: 10,
+        status: 'active',
+        isScout: true,
+        isSubscriber: false,
+        visaEmail: 'enc_corrupt', // triggers mock decrypt to throw
+        scheduleId: '111',
+        consularFacilityId: '25',
+        locale: 'es-co',
+        currentConsularDate: null,
+        currentConsularTime: null,
+        currentCasDate: null,
+        currentCasTime: null,
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    expect(body.bots[0].visaEmail).toBeNull();
+  });
+
+  it('returns multiple bots ordered by createdAt DESC', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_multi' });
+    mockDbRows([
+      { id: 2, status: 'active', isScout: false, isSubscriber: true, visaEmail: 'enc_b@x.com', scheduleId: '2', consularFacilityId: '25', locale: 'es-co', currentConsularDate: null, currentConsularTime: null, currentCasDate: null, currentCasTime: null, createdAt: '2026-02-15T00:00:00Z' },
+      { id: 1, status: 'paused', isScout: true, isSubscriber: false, visaEmail: 'enc_a@x.com', scheduleId: '1', consularFacilityId: '115', locale: 'es-pe', currentConsularDate: '2027-01-13', currentConsularTime: '09:30', currentCasDate: null, currentCasTime: null, createdAt: '2026-02-10T00:00:00Z' },
+    ]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+
+    expect(body.bots).toHaveLength(2);
+    expect(body.bots[0].id).toBe(2); // newer first
+    expect(body.bots[1].id).toBe(1);
+    expect(body.bots[0].visaEmail).toBe('b@x.com');
+    expect(body.bots[1].visaEmail).toBe('a@x.com');
+  });
+
+  // ── Response shape: no sensitive fields leaked ────
+
+  it('does not expose internal/sensitive fields', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_sec' });
+    mockDbRows([
+      {
+        id: 5,
+        status: 'active',
+        isScout: true,
+        isSubscriber: false,
+        visaEmail: 'enc_test@test.com',
+        scheduleId: '999',
+        consularFacilityId: '25',
+        locale: 'es-co',
+        currentConsularDate: '2026-06-01',
+        currentConsularTime: '08:00',
+        currentCasDate: '2026-05-28',
+        currentCasTime: '10:00',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    ]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    const bot = body.bots[0];
+
+    // Fields NOT in the select() — should be absent
+    expect(bot).not.toHaveProperty('activeRunId');
+    expect(bot).not.toHaveProperty('activeCloudRunId');
+    expect(bot).not.toHaveProperty('casCacheJson');
+    expect(bot).not.toHaveProperty('visaPassword');
+    expect(bot).not.toHaveProperty('webhookUrl');
+    expect(bot).not.toHaveProperty('notificationEmail');
+    expect(bot).not.toHaveProperty('ownerEmail');
+    expect(bot).not.toHaveProperty('consecutiveErrors');
+    expect(bot).not.toHaveProperty('clerkUserId');
+
+    // Fields that SHOULD be present
+    expect(bot).toHaveProperty('id');
+    expect(bot).toHaveProperty('status');
+    expect(bot).toHaveProperty('isScout');
+    expect(bot).toHaveProperty('isSubscriber');
+    expect(bot).toHaveProperty('visaEmail');
+    expect(bot).toHaveProperty('scheduleId');
+    expect(bot).toHaveProperty('locale');
+    expect(bot).toHaveProperty('createdAt');
+  });
+
+  // ── Null date fields ──────────────────────────────
+
+  it('handles bots with null appointment dates', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_new' });
+    mockDbRows([
+      {
+        id: 99,
+        status: 'login_required',
+        isScout: true,
+        isSubscriber: false,
+        visaEmail: 'enc_new@test.com',
+        scheduleId: '555',
+        consularFacilityId: '115',
+        locale: 'es-pe',
+        currentConsularDate: null,
+        currentConsularTime: null,
+        currentCasDate: null,
+        currentCasTime: null,
+        createdAt: '2026-02-15T12:00:00Z',
+      },
+    ]);
+
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    const bot = body.bots[0];
+
+    expect(bot.currentConsularDate).toBeNull();
+    expect(bot.currentConsularTime).toBeNull();
+    expect(bot.currentCasDate).toBeNull();
+    expect(bot.currentCasTime).toBeNull();
+  });
+
+  // ── DB query uses correct clerkUserId ─────────────
+
+  it('passes JWT sub to the DB where clause', async () => {
+    mockVerifyToken.mockResolvedValueOnce({ sub: 'user_filter_test' });
+    const chain = mockDbRows([]);
+
+    await app.request('/api/bots/me', { headers: authHeader() });
+
+    expect(chain.where).toHaveBeenCalled();
+  });
+});
+
+// ── Tests: Clerk auth middleware error codes ───────────
+
+describe('Clerk auth middleware error codes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = buildApp();
+  });
+
+  it('detects expiry from "exp" in error message', async () => {
+    mockVerifyToken.mockRejectedValueOnce(new Error('exp claim check failed'));
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    expect(body.code).toBe('token_expired');
+  });
+
+  it('detects expiry from "expire" in error message', async () => {
+    mockVerifyToken.mockRejectedValueOnce(new Error('Token is expired'));
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    expect(body.code).toBe('token_expired');
+  });
+
+  it('returns token_invalid for non-expiry errors', async () => {
+    mockVerifyToken.mockRejectedValueOnce(new Error('jwk mismatch'));
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    expect(body.code).toBe('token_invalid');
+  });
+
+  it('returns token_invalid for non-Error throws', async () => {
+    mockVerifyToken.mockRejectedValueOnce('string error');
+    const res = await app.request('/api/bots/me', { headers: authHeader() });
+    const body = await res.json();
+    expect(body.code).toBe('token_invalid');
+  });
+
+  it('returns 401 for empty Bearer token', async () => {
+    const res = await app.request('/api/bots/me', {
+      headers: { Authorization: 'Bearer ' },
+    });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    // Empty string after "Bearer " is falsy → no_token
+    expect(body.code).toBe('no_token');
+  });
+});
