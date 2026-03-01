@@ -31,7 +31,7 @@ export const prefetchCasSchedule = schedules.task({
     environments: ['PRODUCTION'],
   },
   machine: { preset: 'micro' },
-  maxDuration: 120,
+  maxDuration: 240,
 
   run: async () => {
     // SELECT only needed columns — casCacheJson needed for dedup + diff
@@ -182,6 +182,11 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
         newSessionData.authenticityToken = loginResult.authenticityToken;
       }
       await db.update(sessions).set(newSessionData).where(eq(sessions.botId, botId));
+      // Update in-memory session variables so VisaClient uses fresh tokens
+      if (loginResult.hasTokens) {
+        session.csrfToken = loginResult.csrfToken;
+        session.authenticityToken = loginResult.authenticityToken;
+      }
       logger.info('Inline re-login OK', { botId, cookieLen: cookie.length, hasTokens: loginResult.hasTokens });
     } catch (e) {
       if (e instanceof InvalidCredentialsError) {
@@ -208,7 +213,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
       applicantIds: bot.applicantIds,
       consularFacilityId: bot.consularFacilityId,
       ascFacilityId: bot.ascFacilityId,
-      proxyProvider: 'direct',
+      proxyProvider: (bot.proxyProvider as import('../services/proxy-fetch.js').ProxyProvider) || 'direct',
       userId: bot.userId,
       locale: bot.locale,
     },

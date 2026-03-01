@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
-import { bots, excludedDates, excludedTimes, sessions } from '../db/schema.js';
+import { bots, excludedDates, excludedTimes, sessions, pollLogs, authLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
 import { eq, and, desc, inArray, sql } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
@@ -48,7 +48,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^\d{2}:\d{2}$/;
 const DIGITS_RE = /^\d+$/;
-const VALID_PROXY_PROVIDERS = ['direct', 'brightdata'];
+const VALID_PROXY_PROVIDERS = ['direct', 'brightdata', 'webshare'];
 
 function validateExclusions(body: Record<string, unknown>): string | null {
   if (body.excludedDateRanges !== undefined) {
@@ -532,6 +532,39 @@ botsRouter.get('/:id', async (c) => {
     endDate: excludedDates.endDate,
   }).from(excludedDates).where(eq(excludedDates.botId, id));
 
+  // Scout info for subscriber-only bots
+  let scoutInfo: { id: number; status: string; lastPollAt: string | null } | null = null;
+  if (bot.isSubscriber && !bot.isScout) {
+    const [scout] = await db
+      .select({
+        id: bots.id,
+        status: bots.status,
+      })
+      .from(bots)
+      .where(
+        and(
+          eq(bots.isScout, true),
+          eq(bots.consularFacilityId, bot.consularFacilityId!),
+          inArray(bots.status, ['active', 'login_required', 'paused']),
+        ),
+      )
+      .limit(1);
+
+    if (scout) {
+      const [lastPoll] = await db
+        .select({ createdAt: pollLogs.createdAt })
+        .from(pollLogs)
+        .where(eq(pollLogs.botId, scout.id))
+        .orderBy(desc(pollLogs.createdAt))
+        .limit(1);
+      scoutInfo = {
+        id: scout.id,
+        status: scout.status as string,
+        lastPollAt: lastPoll?.createdAt ? new Date(lastPoll.createdAt).toISOString() : null,
+      };
+    }
+  }
+
   return c.json({
     id: bot.id,
     scheduleId: bot.scheduleId,
@@ -540,6 +573,7 @@ botsRouter.get('/:id', async (c) => {
     isScout: bot.isScout,
     isSubscriber: bot.isSubscriber,
     proxyProvider: bot.proxyProvider,
+    consularFacilityId: bot.consularFacilityId,
     ascFacilityId: bot.ascFacilityId,
     currentConsularDate: bot.currentConsularDate,
     currentConsularTime: bot.currentConsularTime,
@@ -558,6 +592,7 @@ botsRouter.get('/:id', async (c) => {
     updatedAt: bot.updatedAt,
     sessionCreatedAt: session?.createdAt ?? null,
     excludedDateRanges: exDates,
+    scoutInfo,
     casCache: (() => {
       const cache = bot.casCacheJson as CasCacheData | null;
       if (!cache) return null;
@@ -590,6 +625,7 @@ botsRouter.put('/:id', async (c) => {
   if (body.notificationEmail !== undefined) updates.notificationEmail = body.notificationEmail;
   if (body.ownerEmail !== undefined) updates.ownerEmail = body.ownerEmail;
   if (body.proxyProvider !== undefined) updates.proxyProvider = body.proxyProvider;
+  if (body.proxyUrls !== undefined) updates.proxyUrls = body.proxyUrls;
   if (body.ascFacilityId !== undefined) updates.ascFacilityId = body.ascFacilityId;
   if (body.consularFacilityId !== undefined) updates.consularFacilityId = body.consularFacilityId;
   if (body.currentConsularDate !== undefined) updates.currentConsularDate = body.currentConsularDate;

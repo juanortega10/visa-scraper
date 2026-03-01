@@ -10,6 +10,7 @@ import {
   date,
   serial,
   index,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
 
 // ── Enums ──────────────────────────────────────────────
@@ -26,6 +27,7 @@ export const proxyProviderEnum = pgEnum('proxy_provider', [
   'direct',
   'brightdata',
   'firecrawl',
+  'webshare',
 ]);
 
 
@@ -64,6 +66,7 @@ export const bots = pgTable(
     currentCasTime: varchar('current_cas_time', { length: 5 }),
     status: botStatusEnum('status').notNull().default('created'),
     proxyProvider: proxyProviderEnum('proxy_provider').notNull().default('direct'),
+    proxyUrls: jsonb('proxy_urls').$type<string[] | null>(),
     isScout: boolean('is_scout').notNull().default(false),
     isSubscriber: boolean('is_subscriber').notNull().default(true),
     userId: varchar('user_id', { length: 20 }),
@@ -76,6 +79,7 @@ export const bots = pgTable(
     targetDateBefore: date('target_date_before'),                       // hard cutoff: only reschedule to dates < this (YYYY-MM-DD exclusive)
     maxReschedules: integer('max_reschedules'),                         // null = unlimited, e.g. Peru = 2
     rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
+    maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
     webhookUrl: text('webhook_url'),
     notificationEmail: text('notification_email'),   // operational alerts (all events) — typically the admin
@@ -136,7 +140,7 @@ export const sessions = pgTable(
     lastUsedAt: timestamp('last_used_at').notNull().defaultNow(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
-  (table) => [index('sessions_bot_idx').on(table.botId)],
+  (table) => [uniqueIndex('sessions_bot_idx').on(table.botId)],
 );
 
 // ── Poll Logs ──────────────────────────────────────────
@@ -167,6 +171,12 @@ export const pollLogs = pgTable(
     publicIp: varchar('public_ip', { length: 45 }), // IPv4 or IPv6
     dateChanges: jsonb('date_changes').$type<{ appeared: string[], disappeared: string[] }>(),
     error: text('error'),
+    connectionInfo: jsonb('connection_info').$type<{
+      proxyAttemptIp?: string | null;  // webshare IP tried before fallback (lost if lastProxyIp reset)
+      fallbackHappened?: boolean;      // webshare TCP fail → direct fallback
+      fallbackReason?: string;         // ECONNRESET | ETIMEDOUT | ECONNREFUSED | ...
+      websharePoolSize?: number;       // IPs disponibles en el pool al momento del request
+    }>(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (table) => [

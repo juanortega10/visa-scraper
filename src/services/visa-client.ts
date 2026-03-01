@@ -1,5 +1,7 @@
+import { logger } from '@trigger.dev/sdk/v3';
 import { USER_AGENT, BROWSER_HEADERS, getBaseUrl, getLocaleTexts, type LocaleTexts } from '../utils/constants.js';
 import { proxyFetch, type ProxyProvider } from './proxy-fetch.js';
+import { extractAppointments } from './html-parsers.js';
 
 export class SessionExpiredError extends Error {
   constructor(detail?: string) {
@@ -25,10 +27,10 @@ export interface TimeSlots {
 }
 
 export interface CurrentAppointment {
-  consularDate: string;  // YYYY-MM-DD
-  consularTime: string;  // HH:MM
-  casDate: string;       // YYYY-MM-DD
-  casTime: string;       // HH:MM
+  consularDate: string;       // YYYY-MM-DD
+  consularTime: string;       // HH:MM
+  casDate: string | null;     // YYYY-MM-DD (null for embassies without CAS, e.g. Peru)
+  casTime: string | null;     // HH:MM
 }
 
 export interface VisaClientConfig {
@@ -37,31 +39,10 @@ export interface VisaClientConfig {
   consularFacilityId: string;
   ascFacilityId: string;
   proxyProvider: ProxyProvider;
+  proxyUrls?: string[] | null;
   userId?: string | null;
   locale?: string;
-}
-
-// URL locale (/es-co/) controls the language. Support Spanish + English for robustness.
-const MONTH_MAP: Record<string, string> = {
-  enero: '01', febrero: '02', marzo: '03', abril: '04',
-  mayo: '05', junio: '06', julio: '07', agosto: '08',
-  septiembre: '09', octubre: '10', noviembre: '11', diciembre: '12',
-  january: '01', february: '02', march: '03', april: '04',
-  may: '05', june: '06', july: '07', august: '08',
-  september: '09', october: '10', november: '11', december: '12',
-};
-
-function parseAppointmentDate(text: string): { date: string; time: string } | null {
-  // Format: "30 noviembre, 2026, 08:45 ..." or "30 November, 2026, 08:45 ..."
-  const match = text.match(/(\d{1,2})\s+(\w+),\s*(\d{4}),\s*(\d{2}:\d{2})/);
-  if (!match) return null;
-  const [, day, monthName, year, time] = match;
-  const month = MONTH_MAP[monthName!.toLowerCase()];
-  if (!month) return null;
-  return {
-    date: `${year}-${month}-${day!.padStart(2, '0')}`,
-    time: time!,
-  };
+  captureHtml?: boolean;
 }
 
 export class VisaClient {
@@ -71,6 +52,7 @@ export class VisaClient {
   private baseUrl: string;
   private texts: LocaleTexts;
   private extractedAscFacilityId: string | null = null;
+  private capturedPages = new Map<string, string>();
 
   constructor(session: VisaSession, config: VisaClientConfig) {
     this.session = { ...session };
@@ -85,12 +67,20 @@ export class VisaClient {
     return { ...this.session };
   }
 
+  getConfig(): VisaClientConfig {
+    return { ...this.config };
+  }
+
   getUserId(): string | null {
     return this.userId;
   }
 
   getExtractedAscFacilityId(): string | null {
     return this.extractedAscFacilityId;
+  }
+
+  getCapturedPages(): Map<string, string> {
+    return this.capturedPages;
   }
 
   updateSession(newSession: Partial<VisaSession>): void {
@@ -114,17 +104,18 @@ export class VisaClient {
   }
 
   private updateCookieFromResponse(resp: Response): void {
-    const setCookie = resp.headers.get('set-cookie');
-    if (setCookie) {
-      const match = setCookie.match(/_yatri_session=([^;]+)/);
+    const cookies = resp.headers.getSetCookie();
+    for (const cookie of cookies) {
+      const match = cookie.match(/_yatri_session=([^;]+)/);
       if (match?.[1]) {
         this.session.cookie = match[1];
+        return;
       }
     }
   }
 
   private async doFetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const resp = await proxyFetch(url, options, this.config.proxyProvider);
+    const resp = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls);
     this.updateCookieFromResponse(resp);
     return resp;
   }
@@ -168,6 +159,20 @@ export class VisaClient {
     }
   }
 
+  /** Parse JSON safely — empty/truncated body (session expired) → SessionExpiredError */
+  private async safeJson<T>(resp: Response, label: string): Promise<T> {
+    const text = await resp.text();
+    if (!text || text.length === 0) {
+      throw new SessionExpiredError(`${label}: empty response body (session likely expired)`);
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      // Truncated JSON or HTML = session expired
+      throw new SessionExpiredError(`${label}: invalid JSON (${text.length} bytes, starts with: ${text.substring(0, 40)})`);
+    }
+  }
+
   // ── Token Refresh ──────────────────────────────────────
 
   async refreshTokens(): Promise<void> {
@@ -189,6 +194,7 @@ export class VisaClient {
     this.assertOk(resp, 'Appointment page');
 
     const html = await resp.text();
+    if (this.config.captureHtml) this.capturedPages.set('appointment-page', html);
 
     const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/);
     if (!csrfMatch?.[1]) throw new Error('CSRF token not found in HTML');
@@ -229,22 +235,16 @@ export class VisaClient {
     if (resp.status !== 200) return null;
 
     const html = await resp.text();
+    if (this.config.captureHtml) this.capturedPages.set('groups-page', html);
 
-    const consularMatch = html.match(/<p class='consular-appt'>[\s\S]*?<\/strong>\s*\n?\s*([^<&]+)/);
-    const casMatch = html.match(/<p class='asc-appt'>[\s\S]*?<\/strong>\s*\n?\s*([^<&]+)/);
-
-    if (!consularMatch?.[1] || !casMatch?.[1]) return null;
-
-    const consular = parseAppointmentDate(consularMatch[1].trim());
-    const cas = parseAppointmentDate(casMatch[1].trim());
-
-    if (!consular || !cas) return null;
+    const extracted = extractAppointments(html);
+    if (!extracted.currentConsularDate || !extracted.currentConsularTime) return null;
 
     return {
-      consularDate: consular.date,
-      consularTime: consular.time,
-      casDate: cas.date,
-      casTime: cas.time,
+      consularDate: extracted.currentConsularDate,
+      consularTime: extracted.currentConsularTime,
+      casDate: extracted.currentCasDate,
+      casTime: extracted.currentCasTime,
     };
   }
 
@@ -257,7 +257,7 @@ export class VisaClient {
       'Consular days',
     );
     this.assertOk(resp, 'Consular days');
-    return resp.json() as Promise<DaySlot[]>;
+    return this.safeJson<DaySlot[]>(resp, 'Consular days');
   }
 
   // ── Consular Times ─────────────────────────────────────
@@ -269,7 +269,7 @@ export class VisaClient {
       'Consular times',
     );
     this.assertOk(resp, 'Consular times');
-    return resp.json() as Promise<TimeSlots>;
+    return this.safeJson<TimeSlots>(resp, 'Consular times');
   }
 
   // ── CAS Days ───────────────────────────────────────────
@@ -281,7 +281,7 @@ export class VisaClient {
       'CAS days',
     );
     this.assertOk(resp, 'CAS days');
-    return resp.json() as Promise<DaySlot[]>;
+    return this.safeJson<DaySlot[]>(resp, 'CAS days');
   }
 
   // ── CAS Times ──────────────────────────────────────────
@@ -293,7 +293,7 @@ export class VisaClient {
       'CAS times',
     );
     this.assertOk(resp, 'CAS times');
-    return resp.json() as Promise<TimeSlots>;
+    return this.safeJson<TimeSlots>(resp, 'CAS times');
   }
 
   // ── Reschedule ─────────────────────────────────────────
@@ -304,11 +304,6 @@ export class VisaClient {
     casDate?: string,
     casTime?: string,
   ): Promise<boolean> {
-    // Tokens already valid — session proven alive by prior API calls in this run.
-    // refreshTokens() is called in poll-visa before triggering reschedule-visa,
-    // and reschedule-visa makes 4+ API calls (getDays, getTimes, getCasDays, getCasTimes)
-    // before reaching this point. No need to refresh again (~1s saved).
-
     const body = new URLSearchParams({
       authenticity_token: this.session.authenticityToken,
       confirmed_limit_message: '1',
@@ -329,14 +324,26 @@ export class VisaClient {
       body.set('commit', this.texts.rescheduleText);
     }
 
-    // Match real browser POST: no X-CSRF-Token (form uses authenticity_token in body),
-    // full Referer with query params, Upgrade-Insecure-Requests, sec-ch-ua headers
     const qs = this.config.applicantIds.map(id => `applicants%5B%5D=${id}`).join('&');
+
+    logger.info('[reschedule] POST details', {
+      scheduleId: this.config.scheduleId,
+      consular: `${consularDate} ${consularTime}`,
+      cas: casDate ? `${casDate} ${casTime}` : 'N/A',
+      applicantIds: this.config.applicantIds,
+      authTokenLen: this.session.authenticityToken?.length ?? 0,
+      authTokenPrefix: this.session.authenticityToken?.substring(0, 16) ?? '(empty)',
+      csrfTokenLen: this.session.csrfToken?.length ?? 0,
+      cookieLen: this.session.cookie?.length ?? 0,
+      bodyLen: body.toString().length,
+    });
+
     const resp = await this.doDirectFetch(`${this.baseUrl}/schedule/${this.config.scheduleId}/appointment`, {
       method: 'POST',
       headers: {
         Cookie: `_yatri_session=${this.session.cookie}`,
         'Content-Type': 'application/x-www-form-urlencoded',
+        'X-CSRF-Token': this.session.csrfToken,
         'User-Agent': USER_AGENT,
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         Referer: `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment?${qs}&confirmed_limit_message=1&commit=${this.texts.continueText}`,
@@ -346,6 +353,13 @@ export class VisaClient {
       },
       redirect: 'manual',
       body: body.toString(),
+    });
+
+    logger.info('[reschedule] POST response', {
+      status: resp.status,
+      location: resp.headers.get('location') ?? '(none)',
+      contentType: resp.headers.get('content-type') ?? '(none)',
+      setCookie: resp.headers.getSetCookie().length > 0,
     });
 
     // Follow redirect chain: POST → 302 /continue → 302 /instructions → 200
@@ -361,13 +375,23 @@ export class VisaClient {
       const location = current.headers.get('location');
       if (!location) break;
 
+      logger.info('[reschedule] Redirect hop', { hop: hops, status: current.status, location });
+
       if (location.includes('sign_in')) {
+        // Read body for diagnostic before throwing
+        const body = await current.text().catch(() => '(unreadable)');
+        logger.error('[reschedule] Redirected to sign_in — session expired', {
+          hop: hops, location, bodyPreview: body.substring(0, 300),
+        });
         throw new SessionExpiredError();
       }
 
-      if (location.includes('instructions') || location.includes('/continue')) {
-        return true; // success! (/continue already confirms the reschedule went through)
+      if (location.includes('instructions')) {
+        return true; // success — /instructions is the final confirmation page
       }
+
+      // /continue is NOT a success signal — it's a normal intermediate redirect.
+      // Follow it to see where it actually leads (could be /instructions or /appointment).
 
       current = await this.doDirectFetch(location, {
         headers: {
@@ -384,9 +408,19 @@ export class VisaClient {
     // Check final page content
     if (current.status === 200) {
       const text = await current.text();
+      logger.info('[reschedule] Final page', {
+        status: 200,
+        hasSuccess: text.includes('programado exitosamente') || text.includes('instructions'),
+        bodyPreview: text.substring(0, 300),
+      });
       if (text.includes('programado exitosamente') || text.includes('instructions')) {
         return true;
       }
+    } else {
+      logger.warn('[reschedule] Unexpected final status', {
+        status: current.status,
+        contentType: current.headers.get('content-type') ?? '(none)',
+      });
     }
 
     return false;

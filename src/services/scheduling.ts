@@ -1,5 +1,16 @@
-/** Default polling interval outside drop windows (2 min). */
-export const DEFAULT_POLL_INTERVAL_S = 120;
+/** Default polling interval outside drop windows (20s).
+ * Exp 9 confirmed 20/min/IP on days.json with zero blocks.
+ * With 3 Webshare IPs + dual-env = ~0.5/min/IP — well within safe limits. */
+export const DEFAULT_POLL_INTERVAL_S = 20;
+
+/** Per-locale override for the normal polling interval. */
+const LOCALE_POLL_INTERVALS: Record<string, number> = {
+  'es-pe': 10,
+};
+
+export function getNormalInterval(locale?: string): number {
+  return LOCALE_POLL_INTERVALS[locale ?? ''] ?? DEFAULT_POLL_INTERVAL_S;
+}
 
 // ── Drop schedule per locale ──────────────────────────────────
 
@@ -45,7 +56,7 @@ function localMinutes(timezone: string): { day: number; t: number; secondsInDay:
  *   D - 2m  → D + 8m   : super-critical (1s, continuous loop)
  *   D + 8m  → D + 60m  : burst (10s)
  *   D + 60m → D + 2h   : tail (5 min)
- *   rest                : normal (2 min)
+ *   rest                : normal (1.5 min)
  *
  * All intervals include ±5% jitter except super-critical.
  */
@@ -64,21 +75,26 @@ export function getCurrentPhase(locale?: string): { seconds: number; label: stri
     if (rel >= -240 && rel < -10) return { seconds: 600, label: '10m', phase: 'early' };
   }
 
-  return { seconds: DEFAULT_POLL_INTERVAL_S, label: '2m', phase: 'normal' };
+  const normalSeconds = getNormalInterval(locale);
+  const normalLabel = normalSeconds >= 60 ? `${(normalSeconds / 60).toFixed(1).replace(/\.0$/, '')}m` : `${normalSeconds}s`;
+  return { seconds: normalSeconds, label: normalLabel, phase: 'normal' };
 }
 
-export function getPollingDelay(locale?: string): string {
+export function getPollingDelay(locale?: string, healthyIpsCount?: number): string {
   const { seconds, phase } = getCurrentPhase(locale);
   if (phase === 'super-critical') return '1s';
-  return jitter(seconds);
+  if (phase !== 'normal' || !healthyIpsCount || healthyIpsCount <= 1) return jitter(seconds);
+  // Floor: 2s (webshare rotates IPs so per-IP rate stays well under 20/min/IP even at 2s)
+  const MIN_INTERVAL_SECONDS = 2;
+  const dynamicSeconds = Math.max(MIN_INTERVAL_SECONDS, Math.ceil(seconds / healthyIpsCount));
+  return jitter(dynamicSeconds);
 }
 
 /** Adds ±5% jitter to a base delay in seconds, returns Trigger.dev delay string. */
 function jitter(baseSeconds: number): string {
   const factor = 0.95 + Math.random() * 0.1; // 0.95–1.05
   const seconds = Math.round(baseSeconds * factor);
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.round(seconds / 60)}m`;
+  return `${seconds}s`;
 }
 
 /** Returns true during the burst window (drop - 2min → drop + 60min). */

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
-import { pollLogs, rescheduleLogs, casPrefetchLogs, dispatchLogs } from '../db/schema.js';
+import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, dispatchLogs } from '../db/schema.js';
 import { eq, desc, and, gte, sql } from 'drizzle-orm';
 
 export const logsRouter = new Hono();
@@ -73,6 +73,259 @@ logsRouter.get('/bots/:id/logs/polls/summary', async (c) => {
   return c.json({ buckets, top5, totalPolls: rows.length, totalOkPolls, totalFilteredOutPolls, windowHours: hours });
 });
 
+// Cancellations (server-side computation over full 24h window)
+logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const hours = parseInt(c.req.query('hours') || '24');
+  const since = new Date(Date.now() - hours * 3600_000);
+
+  const rows = await db
+    .select({
+      topDates: pollLogs.topDates,
+      dateChanges: pollLogs.dateChanges,
+      createdAt: pollLogs.createdAt,
+    })
+    .from(pollLogs)
+    .where(
+      and(
+        eq(pollLogs.botId, botId),
+        gte(pollLogs.createdAt, since),
+        sql`${pollLogs.status} IN ('ok', 'filtered_out')`,
+      ),
+    )
+    .orderBy(desc(pollLogs.createdAt));
+
+  // Reconstruct dateChanges from topDates for polls missing it (historical)
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].dateChanges) continue;
+    const curTd = rows[i].topDates as string[] | null;
+    if (!curTd || curTd.length === 0) continue;
+    const curSet = new Set(curTd);
+    // Find older poll with topDates
+    const prevSet = new Set<string>();
+    for (let k = i + 1; k < rows.length; k++) {
+      const ptd = rows[k].topDates as string[] | null;
+      if (ptd && ptd.length > 0) { ptd.forEach((d) => prevSet.add(d)); break; }
+    }
+    const appeared = [...curSet].filter((d) => !prevSet.has(d));
+    const disappeared = [...prevSet].filter((d) => !curSet.has(d));
+    if (appeared.length > 0 || disappeared.length > 0) {
+      (rows[i] as any).dateChanges = { appeared, disappeared };
+    }
+  }
+
+  // Compute today in Bogota for "days from now"
+  const nowBog = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+  const todayMs = new Date(nowBog.getFullYear(), nowBog.getMonth(), nowBog.getDate()).getTime();
+  function daysFr(ds: string) {
+    const [y, m, d] = ds.split('-').map(Number) as [number, number, number];
+    return Math.round((new Date(y, m - 1, d).getTime() - todayMs) / 864e5);
+  }
+
+  // Build disappearance lookup: date → timestamps[]
+  const disMap = new Map<string, number[]>();
+  for (const r of rows) {
+    const dc = r.dateChanges as { appeared?: string[]; disappeared?: string[] } | null;
+    if (!dc?.disappeared?.length) continue;
+    const time = new Date(r.createdAt!).getTime();
+    for (const dd of dc.disappeared) {
+      let arr = disMap.get(dd);
+      if (!arr) { arr = []; disMap.set(dd, arr); }
+      arr.push(time);
+    }
+  }
+  for (const arr of disMap.values()) arr.sort((a, b) => a - b);
+
+  // Build events
+  const events: { time: number; date: string; days: number; goneAt: number | null; dur: number | null }[] = [];
+  const uniq = new Set<string>();
+  const burstMap = new Map<number, { time: number; count: number; best: number }>();
+
+  for (const r of rows) {
+    const dc = r.dateChanges as { appeared?: string[]; disappeared?: string[] } | null;
+    if (!dc?.appeared?.length) continue;
+    if (dc.appeared.length > 30) continue; // skip false bursts
+    const time = new Date(r.createdAt!).getTime();
+    let burst = burstMap.get(time);
+    if (!burst) { burst = { time, count: 0, best: 99999 }; burstMap.set(time, burst); }
+
+    for (const date of dc.appeared) {
+      const days = daysFr(date);
+      let goneAt: number | null = null, dur: number | null = null;
+      const disList = disMap.get(date);
+      if (disList) {
+        for (const g of disList) { if (g > time) { goneAt = g; dur = g - time; break; } }
+      }
+      events.push({ time, date, days, goneAt, dur });
+      uniq.add(date);
+      burst.count++;
+      if (days < burst.best) burst.best = days;
+    }
+  }
+
+  if (events.length === 0) return c.json(null);
+
+  const tMin = rows.length > 0 ? new Date(rows[rows.length - 1].createdAt!).getTime() : 0;
+  let tMax = rows.length > 0 ? new Date(rows[0].createdAt!).getTime() : 1;
+  if (tMin === tMax) tMax = tMin + 1;
+
+  const bursts = [...burstMap.values()]
+    .filter((b) => b.count > 1)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 3);
+
+  let closeCount = 0;
+  for (const e of events) if (e.days < 60) closeCount++;
+
+  return c.json({
+    events, tMin, tMax, bursts,
+    totalEvents: events.length, uniqueDates: uniq.size, closeCount,
+  });
+});
+
+// Poll health (chain + IP aggregation)
+logsRouter.get('/bots/:id/logs/polls/health', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const minutes = parseInt(c.req.query('minutes') || '15');
+  const since = new Date(Date.now() - minutes * 60_000);
+
+  const rows = await db
+    .select({
+      chainId: pollLogs.chainId,
+      provider: pollLogs.provider,
+      publicIp: pollLogs.publicIp,
+      status: pollLogs.status,
+      responseTimeMs: pollLogs.responseTimeMs,
+      createdAt: pollLogs.createdAt,
+    })
+    .from(pollLogs)
+    .where(and(eq(pollLogs.botId, botId), gte(pollLogs.createdAt, since)))
+    .orderBy(desc(pollLogs.createdAt));
+
+  const windowMs = minutes * 60_000;
+
+  // Aggregate by chain
+  const chainMap = new Map<string, { polls: number; latencySum: number; latencyCount: number; lastPollAt: string; statuses: Record<string, number> }>();
+  // Aggregate by IP
+  const ipMap = new Map<string, { polls: number; latencySum: number; latencyCount: number; chain: string; chainCounts: Record<string, number>; successCount: number; tcpBlockedCount: number; lastSeenAt: string; provider: string }>();
+
+  for (const r of rows) {
+    const chain = r.chainId || 'unknown';
+    const ip = r.publicIp || 'unknown';
+    const latency = r.responseTimeMs ?? 0;
+    const status = r.status || 'unknown';
+    const ts = new Date(r.createdAt!).toISOString();
+    const isSuccess = status === 'ok' || status === 'filtered_out';
+
+    // Chain aggregation
+    let ch = chainMap.get(chain);
+    if (!ch) { ch = { polls: 0, latencySum: 0, latencyCount: 0, lastPollAt: ts, statuses: {} }; chainMap.set(chain, ch); }
+    ch.polls++;
+    if (latency > 0) { ch.latencySum += latency; ch.latencyCount++; }
+    ch.statuses[status] = (ch.statuses[status] || 0) + 1;
+
+    // IP aggregation
+    let ipEntry = ipMap.get(ip);
+    if (!ipEntry) { ipEntry = { polls: 0, latencySum: 0, latencyCount: 0, chain, chainCounts: {}, successCount: 0, tcpBlockedCount: 0, lastSeenAt: ts, provider: r.provider || 'unknown' }; ipMap.set(ip, ipEntry); }
+    ipEntry.polls++;
+    if (latency > 0) { ipEntry.latencySum += latency; ipEntry.latencyCount++; }
+    if (isSuccess) ipEntry.successCount++;
+    if (status === 'tcp_blocked') ipEntry.tcpBlockedCount++;
+    ipEntry.chainCounts[chain] = (ipEntry.chainCounts[chain] || 0) + 1;
+  }
+
+  const chains: Record<string, object> = {};
+  for (const [name, ch] of chainMap) {
+    chains[name] = {
+      polls: ch.polls,
+      pollsPerMin: +(ch.polls / (windowMs / 60_000)).toFixed(1),
+      avgLatencyMs: ch.latencyCount > 0 ? Math.round(ch.latencySum / ch.latencyCount) : 0,
+      lastPollAt: ch.lastPollAt,
+      statuses: ch.statuses,
+    };
+  }
+
+  const ips: Record<string, object> = {};
+  for (const [ip, entry] of ipMap) {
+    // Determine predominant chain
+    let predominantChain = entry.chain;
+    let maxCount = 0;
+    for (const [ch, count] of Object.entries(entry.chainCounts)) {
+      if (count > maxCount) { predominantChain = ch; maxCount = count; }
+    }
+    ips[ip] = {
+      polls: entry.polls,
+      pollsPerMin: +(entry.polls / (windowMs / 60_000)).toFixed(1),
+      avgLatencyMs: entry.latencyCount > 0 ? Math.round(entry.latencySum / entry.latencyCount) : 0,
+      successRate: entry.polls > 0 ? +(entry.successCount / entry.polls * 100).toFixed(0) : 0,
+      tcpBlockedCount: entry.tcpBlockedCount,
+      tcpBlockedRate: entry.polls > 0 ? +(entry.tcpBlockedCount / entry.polls * 100).toFixed(1) : 0,
+      chain: predominantChain,
+      lastSeenAt: entry.lastSeenAt,
+      provider: entry.provider,
+    };
+  }
+
+  // Alerts
+  const alerts: Array<{ type: string; message: string; severity: string }> = [];
+
+  // high_fallback: chain with webshare provider but >50% polls on unknown/direct IP
+  for (const [chain, ch] of chainMap) {
+    const chainIps = [...ipMap.entries()].filter(([, e]) => e.chainCounts[chain]);
+    const directPolls = chainIps
+      .filter(([ip]) => ip === 'unknown' || !ip.match(/\d+\.\d+\.\d+\.\d+/) || chainIps.length === 1)
+      .reduce((sum, [, e]) => sum + (e.chainCounts[chain] || 0), 0);
+    if (ch.polls > 5 && directPolls / ch.polls > 0.5) {
+      // Check if this chain should be using webshare
+      const webshareIps = chainIps.filter(([, e]) => e.provider === 'webshare');
+      if (webshareIps.length === 0 && chainIps.some(([, e]) => e.provider === 'direct')) {
+        // All direct — expected for cloud chain, skip
+      }
+    }
+  }
+
+  // chain_silent: chain without polls in last 3 min
+  const threeMinAgo = Date.now() - 3 * 60_000;
+  for (const [chain, ch] of chainMap) {
+    const lastMs = new Date(ch.lastPollAt).getTime();
+    if (lastMs < threeMinAgo) {
+      alerts.push({ type: 'chain_silent', message: `${chain} chain: no polls in ${Math.round((Date.now() - lastMs) / 60_000)}min`, severity: 'warning' });
+    }
+  }
+
+  // rate_high: IP with >15 req/min
+  for (const [ip, entry] of ipMap) {
+    const rate = entry.polls / (windowMs / 60_000);
+    if (rate > 15) {
+      alerts.push({ type: 'rate_high', message: `${ip}: ${rate.toFixed(1)} req/min (limit ~20)`, severity: rate > 18 ? 'critical' : 'warning' });
+    }
+  }
+
+  // ip_block_rate_high: IP with >5% tcp_blocked in the window (circuit breaker threshold = 3 in 20min)
+  for (const [ip, entry] of ipMap) {
+    if (entry.tcpBlockedCount === 0) continue;
+    const blockRate = entry.tcpBlockedCount / entry.polls;
+    if (entry.tcpBlockedCount >= 3 || blockRate > 0.05) {
+      const pct = (blockRate * 100).toFixed(0);
+      const label = entry.tcpBlockedCount >= 3 ? 'circuit breaker active' : `${pct}% bloqueo`;
+      alerts.push({
+        type: 'ip_block_rate_high',
+        message: `${ip}: ${entry.tcpBlockedCount} tcp_blocked/${entry.polls} polls (${pct}%) — ${label}`,
+        severity: blockRate > 0.15 ? 'critical' : 'warning',
+      });
+    }
+  }
+
+  return c.json({
+    windowMinutes: minutes,
+    totalPolls: rows.length,
+    ratePerMin: +(rows.length / (windowMs / 60_000)).toFixed(1),
+    chains,
+    ips,
+    alerts,
+  });
+});
+
 // Poll logs
 logsRouter.get('/bots/:id/logs/polls', async (c) => {
   const botId = parseInt(c.req.param('id'));
@@ -91,6 +344,7 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
       chainId: pollLogs.chainId, provider: pollLogs.provider,
       reloginHappened: pollLogs.reloginHappened,
       dateChanges: pollLogs.dateChanges,
+      publicIp: pollLogs.publicIp,
       createdAt: pollLogs.createdAt,
     })
     .from(pollLogs)
@@ -171,6 +425,155 @@ logsRouter.get('/bots/:id/logs/dispatches', async (c) => {
     .offset(offset);
 
   return c.json(logs);
+});
+
+// Dispatches received by a subscriber bot
+logsRouter.get('/bots/:id/logs/dispatches/received', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const limit = parseInt(c.req.query('limit') || '20');
+  const offset = parseInt(c.req.query('offset') || '0');
+
+  // Get subscriber's facility to filter dispatch_logs
+  const [bot] = await db
+    .select({ consularFacilityId: bots.consularFacilityId })
+    .from(bots)
+    .where(eq(bots.id, botId))
+    .limit(1);
+  if (!bot) return c.json({ error: 'Bot not found' }, 404);
+
+  // Query dispatch_logs for this facility, then filter details in JS for this botId
+  const logs = await db
+    .select({
+      id: dispatchLogs.id,
+      scoutBotId: dispatchLogs.scoutBotId,
+      facilityId: dispatchLogs.facilityId,
+      availableDates: dispatchLogs.availableDates,
+      details: dispatchLogs.details,
+      durationMs: dispatchLogs.durationMs,
+      createdAt: dispatchLogs.createdAt,
+    })
+    .from(dispatchLogs)
+    .where(eq(dispatchLogs.facilityId, bot.consularFacilityId))
+    .orderBy(desc(dispatchLogs.createdAt))
+    .limit(limit * 3) // over-fetch since we filter in JS
+    .offset(offset);
+
+  // Filter to dispatches that include this subscriber and extract their detail
+  const result = [];
+  for (const log of logs) {
+    if (result.length >= limit) break;
+    const detail = (log.details || []).find((d) => d.botId === botId);
+    if (!detail) continue;
+    result.push({
+      id: log.id,
+      scoutBotId: log.scoutBotId,
+      availableDates: log.availableDates,
+      createdAt: log.createdAt,
+      durationMs: log.durationMs,
+      detail,
+    });
+  }
+
+  return c.json(result);
+});
+
+// Proxy pool health — derived from poll_logs.connectionInfo (cross-process safe)
+// Also fetches the current IP list from Webshare API so unobserved IPs are visible.
+logsRouter.get('/bots/:id/proxy-pool', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const windowHours = parseInt(c.req.query('hours') || '2');
+  const since = new Date(Date.now() - windowHours * 3_600_000);
+
+  // Fetch bot config + poll logs in parallel
+  const [botRows, rows] = await Promise.all([
+    db.select({ proxyProvider: bots.proxyProvider, proxyUrls: bots.proxyUrls })
+      .from(bots).where(eq(bots.id, botId)).limit(1),
+    db.select({
+      createdAt: pollLogs.createdAt,
+      status: pollLogs.status,
+      responseTimeMs: pollLogs.responseTimeMs,
+      connectionInfo: pollLogs.connectionInfo,
+    }).from(pollLogs)
+      .where(and(eq(pollLogs.botId, botId), gte(pollLogs.createdAt, since)))
+      .orderBy(pollLogs.createdAt),
+  ]);
+
+  const bot = botRows[0];
+
+  // Fetch current IP list from Webshare API (only if bot uses webshare and no per-bot overrides)
+  let websharePool: { ip: string; valid: boolean; country: string }[] = [];
+  const apiKey = process.env.WEBSHARE_API_KEY;
+  if (bot?.proxyProvider === 'webshare' && apiKey) {
+    try {
+      const resp = await fetch('https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100', {
+        headers: { Authorization: `Token ${apiKey}` },
+      });
+      if (resp.ok) {
+        const json = await resp.json() as { results: { proxy_address: string; valid: boolean; country_code: string }[] };
+        websharePool = json.results.map((p) => ({ ip: p.proxy_address, valid: p.valid, country: p.country_code }));
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Aggregate per attemptedIp (the ip tried before any fallback)
+  const ipData: Record<string, {
+    polls: number; tcpBlocked: number; ok: number;
+    latencies: number[]; lastSeen: string; lastStatus: string;
+  }> = {};
+
+  for (const r of rows) {
+    const ci = r.connectionInfo as Record<string, unknown> | null;
+    const ip: string = (ci?.proxyAttemptIp as string) || 'direct';
+    const fallback = !!(ci?.fallbackHappened);
+    const isTcp = r.status === 'tcp_blocked' || fallback;
+
+    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '' };
+    const d = ipData[ip]!;
+    d.polls++;
+    d.lastSeen = r.createdAt?.toISOString() ?? '';
+    d.lastStatus = r.status ?? '';
+    if (isTcp) d.tcpBlocked++;
+    else {
+      d.ok++;
+      if (r.responseTimeMs) d.latencies.push(r.responseTimeMs);
+    }
+  }
+
+  // Seed unobserved Webshare IPs with zero stats
+  for (const { ip } of websharePool) {
+    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '' };
+  }
+
+  // Build response — attach Webshare metadata where available
+  const webshareByIp = Object.fromEntries(websharePool.map((p) => [p.ip, p]));
+  const ips = Object.fromEntries(
+    Object.entries(ipData).map(([ip, d]) => {
+      const ws = webshareByIp[ip];
+      const avgLatMs = d.latencies.length > 0
+        ? Math.round(d.latencies.reduce((s, v) => s + v, 0) / d.latencies.length)
+        : null;
+      return [ip, {
+        polls: d.polls,
+        tcpBlocked: d.tcpBlocked,
+        tcpBlockedRate: d.polls > 0 ? Math.round(d.tcpBlocked / d.polls * 100) : 0,
+        okRate: d.polls > 0 ? Math.round(d.ok / d.polls * 100) : 100,
+        avgLatMs,
+        lastSeen: d.lastSeen || null,
+        lastStatus: d.lastStatus || null,
+        // Webshare metadata (null for direct/non-webshare IPs)
+        wsValid: ws?.valid ?? null,
+        wsCountry: ws?.country ?? null,
+        windowHours,
+      }];
+    })
+  );
+
+  return c.json({
+    ips,
+    websharePoolSize: websharePool.length,
+    windowHours,
+    totalPolls: rows.length,
+  });
 });
 
 // Reschedule logs

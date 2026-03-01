@@ -114,8 +114,9 @@ async function triggerEligibleBots(source: Source): Promise<void> {
 }
 
 /**
- * Cloud cron: even minutes, PRODUCTION only.
- * Triggers poll-visa for bots with 'prod' in pollEnvironments.
+ * Cloud cron: even minutes (0,2,4...), PRODUCTION only.
+ * Fallback for when chain is not active. Chains use exact 90s self-trigger.
+ * Combined with local cron (1min offset), effective gap ~1min between sources.
  */
 export const pollCronCloud = schedules.task({
   id: 'poll-cron-cloud',
@@ -129,8 +130,9 @@ export const pollCronCloud = schedules.task({
 });
 
 /**
- * Local cron: odd minutes, no env restriction (runs on DEV/RPi).
- * Triggers poll-visa for bots with 'dev' in pollEnvironments.
+ * Local cron: odd minutes (1,3,5...), DEV/RPi only.
+ * Fallback for when chain is not active. Chains use exact 90s self-trigger.
+ * 1min offset from cloud cron (closest to ideal 45s offset that cron supports).
  */
 export const pollCronLocal = schedules.task({
   id: 'poll-cron-local',

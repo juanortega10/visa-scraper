@@ -1,5 +1,14 @@
 import { USER_AGENT, getBaseUrl, getLocaleTexts } from '../utils/constants.js';
 import type { VisaSession } from './visa-client.js';
+import { logAuth } from '../utils/auth-logger.js';
+import {
+  extractScheduleId,
+  extractApplicantIdsFromGroups,
+  extractApplicantIdsFromAppointment,
+  extractApplicantNames,
+  extractAppointments,
+  extractFacilityIds,
+} from './html-parsers.js';
 
 export interface LoginCredentials {
   email: string;
@@ -148,17 +157,32 @@ export async function pureFetchLogin(
   const qs = creds.applicantIds.map((id) => `applicants[]=${id}`).join('&');
   const appointmentUrl = `${nivBaseUrl}/schedule/${creds.scheduleId}/appointment?${qs}&confirmed_limit_message=1&commit=${texts.continueText}`;
 
-  const tokenResp = await fetch(appointmentUrl, {
-    headers: {
-      'Cookie': `_yatri_session=${cookie}`,
-      'User-Agent': USER_AGENT,
-      'Accept': 'text/html',
-    },
-    redirect: 'follow',
-  });
+  let tokenResp: Response;
+  try {
+    tokenResp = await fetch(appointmentUrl, {
+      headers: {
+        'Cookie': `_yatri_session=${cookie}`,
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+      },
+      redirect: 'manual',
+    });
+  } catch (fetchErr) {
+    const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+    const cause = fetchErr instanceof Error && fetchErr.cause ? String(fetchErr.cause) : undefined;
+    const detail = `fetch_error: ${errMsg}${cause ? ` cause=${cause}` : ''}`;
+    console.warn(`[login] Appointment page fetch FAILED: ${detail}`);
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
+    return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
+  }
 
   if (tokenResp.status !== 200) {
-    console.warn(`[login] Appointment page returned ${tokenResp.status}, returning cookie without tokens`);
+    const location = tokenResp.headers.get('location') || '';
+    const bodyPreview = await tokenResp.text().catch(() => '(unreadable)');
+    const detail = `http_${tokenResp.status} location=${location} body=${bodyPreview.substring(0, 200)}`;
+    console.warn(`[login] Appointment page returned HTTP ${tokenResp.status}, location=${location}, body=${bodyPreview.substring(0, 300)}`);
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
     return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
   }
 
@@ -167,7 +191,12 @@ export async function pureFetchLogin(
   const authMatch = apptHtml.match(/<input[^>]+name="authenticity_token"[^>]+value="([^"]+)"/);
 
   if (!apptCsrfMatch?.[1] || !authMatch?.[1]) {
-    console.warn('[login] Could not extract tokens from appointment page, returning cookie only');
+    const hasForm = apptHtml.includes('<form');
+    const hasCloudflare = apptHtml.includes('challenge-platform') || apptHtml.includes('cf-chl');
+    const titleMatch = apptHtml.match(/<title>([^<]*)<\/title>/);
+    const detail = `parse_failed: htmlLen=${apptHtml.length} hasForm=${hasForm} cloudflare=${hasCloudflare} title="${titleMatch?.[1] ?? '(none)'}"`
+    console.warn(`[login] Could not extract tokens from appointment page — ${detail}`);
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
     return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
   }
 
@@ -179,13 +208,8 @@ export async function pureFetchLogin(
   };
 }
 
-// ── Known facility IDs per locale (fallback when appointment page is inaccessible) ──
-
-const KNOWN_FACILITIES: Record<string, { consular: string; asc: string }> = {
-  'es-co': { consular: '25', asc: '26' },
-  'es-pe': { consular: '115', asc: '' },
-  // Add more as discovered
-};
+// Re-export parseApptDate for external consumers (e.g. visa-client.ts)
+export { parseApptDate } from './html-parsers.js';
 
 // ── Discovery ──────────────────────────────────────────
 
@@ -202,25 +226,6 @@ export interface DiscoverResult {
   ascFacilityId: string;
   collectsBiometrics: boolean;
   cookie: string;
-}
-
-// Month map for parsing dates (same as visa-client.ts)
-const MONTH_MAP: Record<string, string> = {
-  enero: '01', febrero: '02', marzo: '03', abril: '04',
-  mayo: '05', junio: '06', julio: '07', agosto: '08',
-  septiembre: '09', octubre: '10', noviembre: '11', diciembre: '12',
-  january: '01', february: '02', march: '03', april: '04',
-  may: '05', june: '06', july: '07', august: '08',
-  september: '09', october: '10', november: '11', december: '12',
-};
-
-function parseApptDate(text: string): { date: string; time: string } | null {
-  const match = text.match(/(\d{1,2})\s+(\w+),\s*(\d{4}),\s*(\d{2}:\d{2})/);
-  if (!match) return null;
-  const [, day, monthName, year, time] = match;
-  const month = MONTH_MAP[monthName!.toLowerCase()];
-  if (!month) return null;
-  return { date: `${year}-${month}-${day!.padStart(2, '0')}`, time: time! };
 }
 
 /**
@@ -272,41 +277,14 @@ export async function discoverAccount(
   const groupsHtml = await accountResp.text();
 
   // Extract scheduleId from links like /schedule/72824354/
-  const scheduleMatch = groupsHtml.match(/\/schedule\/(\d+)/);
-  if (!scheduleMatch?.[1]) throw new Error('Could not find scheduleId in groups page');
-  const scheduleId = scheduleMatch[1];
+  const scheduleId = extractScheduleId(groupsHtml);
+  if (!scheduleId) throw new Error('Could not find scheduleId in groups page');
 
   // Extract current appointments
-  let currentConsularDate: string | null = null;
-  let currentConsularTime: string | null = null;
-  let currentCasDate: string | null = null;
-  let currentCasTime: string | null = null;
-
-  const consularApptMatch = groupsHtml.match(/<p class='consular-appt'>[\s\S]*?<\/strong>\s*\n?\s*([^<&]+)/);
-  if (consularApptMatch?.[1]) {
-    const parsed = parseApptDate(consularApptMatch[1].trim());
-    if (parsed) { currentConsularDate = parsed.date; currentConsularTime = parsed.time; }
-  }
-
-  const casApptMatch = groupsHtml.match(/<p class='asc-appt'>[\s\S]*?<\/strong>\s*\n?\s*([^<&]+)/);
-  if (casApptMatch?.[1]) {
-    const parsed = parseApptDate(casApptMatch[1].trim());
-    if (parsed) { currentCasDate = parsed.date; currentCasTime = parsed.time; }
-  }
+  const { currentConsularDate, currentConsularTime, currentCasDate, currentCasTime } = extractAppointments(groupsHtml);
 
   // Pre-extract applicant IDs from groups page (needed in appointment URL)
-  const groupsApplicantIds: string[] = [];
-  {
-    const groupsApplicantRegex = /\/applicants\/(\d+)/g;
-    const seen = new Set<string>();
-    let gMatch;
-    while ((gMatch = groupsApplicantRegex.exec(groupsHtml)) !== null) {
-      if (!seen.has(gMatch[1]!)) {
-        seen.add(gMatch[1]!);
-        groupsApplicantIds.push(gMatch[1]!);
-      }
-    }
-  }
+  const groupsApplicantIds = extractApplicantIdsFromGroups(groupsHtml);
 
   // Step 3: GET appointment page → applicantIds, names, facility IDs
   // applicantIds from groups page are needed in query string — without them the server
@@ -372,82 +350,17 @@ export async function discoverAccount(
     console.warn('[discover] Could not access appointment page — using fallbacks');
   }
 
-  // Extract applicant IDs from checkboxes: <input ... name="applicants[]" ... value="87117943" ...>
-  const applicantIds: string[] = [];
-  if (apptPageOk) {
-    const applicantIdRegex = /name="applicants\[\]"[^>]*value="(\d+)"/g;
-    let idMatch;
-    while ((idMatch = applicantIdRegex.exec(apptHtml)) !== null) {
-      applicantIds.push(idMatch[1]!);
-    }
-    if (applicantIds.length === 0) {
-      // Try reverse attribute order: value before name
-      const reverseRegex = /value="(\d+)"[^>]*name="applicants\[\]"/g;
-      while ((idMatch = reverseRegex.exec(apptHtml)) !== null) {
-        applicantIds.push(idMatch[1]!);
-      }
-    }
-  }
+  // Extract applicant IDs: try appointment page checkboxes first, fallback to groups page links
+  let applicantIds = apptPageOk ? extractApplicantIdsFromAppointment(apptHtml) : [];
   if (applicantIds.length === 0) {
-    // Fallback: extract from groups page links like /applicants/87066525
-    const groupsApplicantRegex = /\/applicants\/(\d+)/g;
-    const seen = new Set<string>();
-    let gMatch;
-    while ((gMatch = groupsApplicantRegex.exec(groupsHtml)) !== null) {
-      if (!seen.has(gMatch[1]!)) {
-        seen.add(gMatch[1]!);
-        applicantIds.push(gMatch[1]!);
-      }
-    }
+    applicantIds = extractApplicantIdsFromGroups(groupsHtml);
   }
 
-  // Extract applicant names — they're text nodes after each checkbox:
-  // <input type="checkbox" name="applicants[]" ... value="87117943" ... />\nJuan Alberto Ortega Riveros\n<br>
-  const applicantNames: string[] = [];
-  if (apptPageOk) {
-    const nameRegex = /name="applicants\[\]"[^>]*\/>\s*\n?\s*([^\n<]+)/g;
-    let nameMatch;
-    while ((nameMatch = nameRegex.exec(apptHtml)) !== null) {
-      const name = nameMatch[1]!.trim();
-      if (name) applicantNames.push(name);
-    }
-  }
-  if (applicantNames.length === 0) {
-    // Fallback: extract names from groups page table (Peru has names in <td> before passport number)
-    const tdNameRegex = /<td>([A-Z][a-záéíóúñ]+(?: [A-Z][a-záéíóúñ]+)+)<\/td>/g;
-    let tdMatch;
-    while ((tdMatch = tdNameRegex.exec(groupsHtml)) !== null) {
-      applicantNames.push(tdMatch[1]!);
-    }
-  }
+  // Extract applicant names: try appointment page checkboxes first, fallback to groups page <td>
+  const applicantNames = extractApplicantNames(groupsHtml, apptHtml, apptPageOk);
 
-  // Extract consular facility ID from the appointment form
-  let consularFacilityId = '';
-  if (apptPageOk) {
-    const consularFacilityMatch = apptHtml.match(/consulate_appointment_facility_id[\s\S]*?value="(\d+)"/);
-    if (consularFacilityMatch?.[1]) consularFacilityId = consularFacilityMatch[1];
-  }
-  // Fallback: known facilities map
-  if (!consularFacilityId) {
-    const knownFacility = KNOWN_FACILITIES[locale];
-    if (knownFacility) consularFacilityId = knownFacility.consular;
-  }
-
-  // Extract ASC facility ID from select dropdown
-  let ascFacilityId = '';
-  if (apptPageOk) {
-    const ascMatch = apptHtml.match(/<select[^>]+asc_appointment_facility_id[^>]*>[\s\S]*?<option[^>]+value="(\d+)"/);
-    if (ascMatch?.[1]) ascFacilityId = ascMatch[1];
-  }
-  // Fallback: known facilities
-  if (!ascFacilityId) {
-    const knownFacility = KNOWN_FACILITIES[locale];
-    if (knownFacility?.asc) ascFacilityId = knownFacility.asc;
-  }
-
-  // Biometrics/ASC is required if an ASC facility section exists in the form.
-  // The data-collects-biometrics attribute on the consular option is unreliable
-  // (Colombia has "false" but still requires ASC).
+  // Extract facility IDs from appointment page with locale-based fallback
+  const { consularFacilityId, ascFacilityId } = extractFacilityIds(apptHtml, apptPageOk, locale);
   const collectsBiometrics = ascFacilityId !== '';
 
   return {

@@ -48,6 +48,7 @@ export async function sendWebhook(
       'X-Signature': signature,
     },
     body,
+    signal: AbortSignal.timeout(10_000),
   });
 }
 

@@ -32,9 +32,19 @@ export const rescheduleVisaTask = task({
       currentConsularDate: bots.currentConsularDate, currentConsularTime: bots.currentConsularTime,
       currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
       casCacheJson: bots.casCacheJson,
+      targetDateBefore: bots.targetDateBefore,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays,
     }).from(bots).where(eq(bots.id, botId));
     if (!bot) throw new Error(`Bot ${botId} not found`);
     logger.info('Bot loaded', { botId, locale: bot.locale, consularFacility: bot.consularFacilityId, ascFacility: bot.ascFacilityId });
+
+    // Guard: respect maxReschedules limit (critical for Peru with max=2)
+    if (bot.maxReschedules != null && bot.rescheduleCount >= bot.maxReschedules) {
+      logger.warn('Reschedule BLOCKED — max reschedule limit reached', {
+        botId, rescheduleCount: bot.rescheduleCount, maxReschedules: bot.maxReschedules,
+      });
+      return { success: false, reason: 'max_reschedules_reached' };
+    }
 
     const [session] = await db.select({
       yatriCookie: sessions.yatriCookie,

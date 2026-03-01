@@ -1,6 +1,6 @@
 import { db } from '../db/client.js';
 import { bots, excludedDates } from '../db/schema.js';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, ne, inArray } from 'drizzle-orm';
 import type { DaySlot } from './visa-client.js';
 import { isDateExcluded, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
 import type { DateRange } from '../utils/date-helpers.js';
@@ -24,7 +24,9 @@ export interface SubscriberCandidate {
   casCacheJson: unknown;
   userId: string | null;
   proxyProvider: string;
+  proxyUrls: string[] | null;
   exclusions: DateRange[];
+  targetDateBefore: string | null;
   bestDate: string;
   improvementDays: number;
 }
@@ -52,6 +54,7 @@ export async function getSubscribersForFacility(
       currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       casCacheJson: bots.casCacheJson,
+      proxyUrls: bots.proxyUrls,
       targetDateBefore: bots.targetDateBefore,
       maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     })
@@ -61,21 +64,24 @@ export async function getSubscribersForFacility(
         eq(bots.isSubscriber, true),
         eq(bots.consularFacilityId, facilityId),
         eq(bots.status, 'active'),
+        ne(bots.id, scoutBotId),
       ),
     );
 
   if (allSubscribers.length === 0) return [];
 
-  // Load exclusions for all subscribers in bulk (filter in memory)
+  // Load exclusions for subscribers in bulk (filtered at DB level)
   const subscriberIds = new Set(allSubscribers.map((s) => s.id));
   const exclusionsByBot = new Map<number, DateRange[]>();
-  const exRows = await db.select({
-    botId: excludedDates.botId,
-    startDate: excludedDates.startDate,
-    endDate: excludedDates.endDate,
-  }).from(excludedDates);
+  const subscriberIdArray = [...subscriberIds];
+  const exRows = subscriberIdArray.length > 0
+    ? await db.select({
+        botId: excludedDates.botId,
+        startDate: excludedDates.startDate,
+        endDate: excludedDates.endDate,
+      }).from(excludedDates).where(inArray(excludedDates.botId, subscriberIdArray))
+    : [];
   for (const row of exRows) {
-    if (!subscriberIds.has(row.botId)) continue;
     const list = exclusionsByBot.get(row.botId) ?? [];
     list.push({ startDate: row.startDate, endDate: row.endDate });
     exclusionsByBot.set(row.botId, list);
@@ -118,7 +124,9 @@ export async function getSubscribersForFacility(
       casCacheJson: sub.casCacheJson,
       userId: sub.userId,
       proxyProvider: sub.proxyProvider,
+      proxyUrls: sub.proxyUrls as string[] | null,
       exclusions,
+      targetDateBefore: sub.targetDateBefore,
       bestDate,
       improvementDays,
     });

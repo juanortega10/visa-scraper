@@ -2,16 +2,16 @@ import { task, logger, metadata, runs } from '@trigger.dev/sdk/v3';
 import { visaPollingQueue } from './queues.js';
 import { db } from '../db/client.js';
 import { bots, sessions, excludedDates, excludedTimes, pollLogs, rescheduleLogs } from '../db/schema.js';
-import { eq, and, desc, gte } from 'drizzle-orm';
+import { eq, and, desc, gte, sql } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
-import { getPollingDelay, calculatePriority, isInBurstWindow, isInSuperCriticalWindow, getSniperWaitMs, isPreDropWarmup, getCurrentPhase } from '../services/scheduling.js';
+import { getPollingDelay, calculatePriority, isInBurstWindow, isInSuperCriticalWindow, getSniperWaitMs, isPreDropWarmup, getCurrentPhase, getNormalInterval } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
 import { performLogin, InvalidCredentialsError, type LoginCredentials } from '../services/login.js';
-import type { ProxyProvider } from '../services/proxy-fetch.js';
+import { getLastProxyIp, getProxyFetchMeta, getPoolState, type ProxyProvider } from '../services/proxy-fetch.js';
 import type { CasCacheData } from '../db/schema.js';
 import { dispatchToSubscribers } from '../services/dispatch.js';
 
@@ -20,13 +20,11 @@ import { dispatchToSubscribers } from '../services/dispatch.js';
  * concurrencyKey prevents concurrent execution but NOT accumulation of delayed runs.
  * IMPORTANT: skip if activeRunId === currentRunId to avoid self-cancellation.
  */
-async function cancelPreviousRun(currentRunId: string, activeRunId: string | null): Promise<void> {
+function cancelPreviousRun(currentRunId: string, activeRunId: string | null): void {
   if (!activeRunId || activeRunId === currentRunId) return;
-  try {
-    await runs.cancel(activeRunId);
-  } catch {
-    // Already completed/cancelled — ignore
-  }
+  // Fire-and-forget: don't await — concurrencyKey prevents concurrent execution.
+  // runs.cancel() has internal retries that waste ~2s on 404 "Resource not found".
+  runs.cancel(activeRunId).catch(() => {});
 }
 
 interface PollPayload {
@@ -35,7 +33,26 @@ interface PollPayload {
   cronTriggered?: boolean; // true = cron triggered, don't self-reschedule in normal mode
   dryRun?: boolean;
   lastDatesCount?: number; // raw dates from previous run (for soft ban detection)
-  tcpBackoff?: number; // escalating backoff counter for TCP/5xx errors (0 = first error)
+}
+
+/** Extract error message including undici's nested cause (e.g. "fetch failed: ECONNRESET"). */
+function extractErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  let msg = err.message;
+  // undici wraps connection errors twice with the same "fetch failed" message:
+  //   TypeError: fetch failed → cause: UndiciError: fetch failed → cause: ECONNRESET ...
+  // So we ALWAYS recurse to innerCause regardless of whether cause.message == msg.
+  const cause = (err as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    if (cause.message && cause.message !== msg) {
+      msg += `: ${cause.message}`;
+    }
+    const innerCause = (cause as Error & { cause?: unknown }).cause;
+    if (innerCause instanceof Error && innerCause.message && !msg.includes(innerCause.message)) {
+      msg += `: ${innerCause.message}`;
+    }
+  }
+  return msg;
 }
 
 /** Detect TCP-level blocks (connection refused, reset, timeout). */
@@ -68,11 +85,8 @@ export const pollVisaTask = task({
     const timings: Record<string, number> = {};
     logger.info('poll-visa START', { botId, chainId, dryRun });
 
-    // Resolve public IP (awaited before first logPoll so it's captured in DB)
-    const ipPromise = fetch('https://api.ipify.org?format=text', { signal: AbortSignal.timeout(3000) })
-      .then(r => r.text())
-      .then(ip => { publicIp = ip.trim(); logger.info('Public IP resolved', { botId, publicIp }); })
-      .catch(() => { /* non-fatal */ });
+    // Public IP resolved lazily after bot load (need to know provider)
+    let ipPromise: Promise<void> = Promise.resolve();
     metadata.set("phase", "Cargando bot...");
 
     // Load bot (first — early exit if paused/missing)
@@ -90,7 +104,8 @@ export const pollVisaTask = task({
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore,
-      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays,
+      proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
     }).from(bots).where(eq(bots.id, botId));
@@ -126,7 +141,7 @@ export const pollVisaTask = task({
           if (minSince < STANDBY_THRESHOLD_MIN) {
             // Cloud chain alive — dev goes to standby
             logger.info('Standby: cloud chain alive, dev backing off', { botId, minSince: Math.round(minSince) });
-            await cancelPreviousRun(ctx.run.id, activeRunIdField);
+            cancelPreviousRun(ctx.run.id, activeRunIdField);
             const handle = await pollVisaTask.trigger(
               { botId },
               { delay: '5m', concurrencyKey: `poll-${botId}`, tags: [`bot:${botId}`] },
@@ -172,17 +187,26 @@ export const pollVisaTask = task({
           activeStatus: activeRun.status,
         });
       } catch {
-        logger.info('Cannot verify activeRunId status, proceeding', { botId, runId: ctx.run.id, activeRunId: activeRunIdField });
+        logger.warn('Cannot verify activeRunId status, proceeding', { botId, runId: ctx.run.id, activeRunId: activeRunIdField });
       }
     }
     logger.info('Bot loaded', {
       botId,
       status: bot.status,
       locale: bot.locale,
-      provider: bot.proxyProvider,
+      configuredProvider: bot.proxyProvider,
+      cronTriggered,
+      chainId,
+      dryRun: dryRun || undefined,
       currentConsular: `${bot.currentConsularDate} ${bot.currentConsularTime}`,
-      currentCas: `${bot.currentCasDate} ${bot.currentCasTime}`,
+      currentCas: bot.currentCasDate ? `${bot.currentCasDate} ${bot.currentCasTime}` : 'N/A',
     });
+
+    // Resolve public IP via ipify (always — webshare with "direct" entries needs it as fallback)
+    ipPromise = fetch('https://api.ipify.org?format=text', { signal: AbortSignal.timeout(3000) })
+      .then(r => r.text())
+      .then(ip => { publicIp = ip.trim(); logger.info('Public IP resolved', { botId, publicIp }); })
+      .catch(() => { /* non-fatal */ });
 
     metadata.set("phase", "Cargando sesion...");
     // Load session + exclusions + last poll (for date diff) in parallel
@@ -220,11 +244,14 @@ export const pollVisaTask = task({
     const sessionAgeMin = Math.round(sessionAgeMs / 60000);
     logger.info('Session loaded', { botId, sessionAgeMin, lastUsedAt: session.lastUsedAt?.toISOString() });
 
-    // Pre-emptive re-login: refresh session before the ~88min hard TTL
-    // Also force warmup on Tuesday 8:56–8:58 to guarantee fresh session for super-critical window
-    const RE_LOGIN_THRESHOLD_MIN = 44; // half of ~88min TTL
+    // Pre-emptive re-login: refresh session before the ~88min hard TTL.
+    // 50min threshold — Peru sessions expire at ~60min (Colombia ~88min).
+    // 10min margin before shortest TTL. Force warmup on pre-drop window.
+    // Dual-env guard: skip re-login if session was refreshed <3min ago (other chain already did it).
+    const RE_LOGIN_THRESHOLD_MIN = 50;
     const forceWarmup = isPreDropWarmup(bot.locale) && sessionAgeMin > 5;
-    if ((sessionAgeMin > RE_LOGIN_THRESHOLD_MIN || forceWarmup) && !dryRun) {
+    const recentlyRefreshed = sessionAgeMin < 3; // other chain just re-logged in
+    if ((sessionAgeMin > RE_LOGIN_THRESHOLD_MIN || forceWarmup) && !dryRun && !recentlyRefreshed) {
       logger.info('Pre-emptive re-login (session age > threshold)', { botId, sessionAgeMin, threshold: RE_LOGIN_THRESHOLD_MIN });
       metadata.set("phase", "Re-login preventivo...");
       const reloginStart = Date.now();
@@ -256,7 +283,6 @@ export const pollVisaTask = task({
         }
 
         // Update session in DB with new cookie + tokens
-        const oldCookie = session.yatriCookie;
         const oldCsrf = session.csrfToken;
         const newSessionData: Record<string, unknown> = {
           yatriCookie: encrypt(loginResult.cookie),
@@ -267,8 +293,11 @@ export const pollVisaTask = task({
           newSessionData.csrfToken = loginResult.csrfToken;
           newSessionData.authenticityToken = loginResult.authenticityToken;
         } else {
-          // Keep old tokens — better than null. poll will refreshTokens() if needed.
-          logger.warn('Keeping old tokens in DB (appointment page failed)', { botId });
+          // CRITICAL: old tokens are session-bound (authenticity_token) — invalid with new cookie.
+          // Set to null to force refreshTokens() on next poll cycle.
+          newSessionData.csrfToken = null;
+          newSessionData.authenticityToken = null;
+          logger.warn('Clearing stale tokens in DB (appointment page failed, old tokens invalid with new cookie)', { botId });
         }
         await db.update(sessions).set(newSessionData).where(eq(sessions.botId, botId));
 
@@ -277,16 +306,18 @@ export const pollVisaTask = task({
         if (loginResult.hasTokens) {
           session.csrfToken = loginResult.csrfToken;
           session.authenticityToken = loginResult.authenticityToken;
+        } else {
+          // Clear in-memory too — forces refreshTokens() later in this run
+          session.csrfToken = null as unknown as string;
+          session.authenticityToken = null as unknown as string;
         }
         session.createdAt = new Date();
 
         reloginHappened = true;
         timings.relogin = Date.now() - reloginStart;
-        const cookieChanged = encrypt(loginResult.cookie) !== oldCookie;
         const csrfChanged = loginResult.hasTokens ? loginResult.csrfToken !== oldCsrf : false;
         logger.info('Pre-emptive re-login: DB updated', {
           botId,
-          cookieChanged,
           csrfChanged,
           tokensFromFreshLogin: loginResult.hasTokens,
         });
@@ -314,6 +345,15 @@ export const pollVisaTask = task({
 
     logger.info(`Cookie: len=${cookie.length} prefix=${cookie.substring(0, 30)} csrf=${(session.csrfToken ?? '').substring(0, 15)}`, { botId });
 
+    // Cloud: always direct — webshare fails TCP ~73% from cloud workers,
+    // fallback always lands on the same cloud IP anyway (no diversity gain).
+    // Dev: bot's configured provider (webshare rotates across proxy IPs + RPi direct).
+    const effectiveProvider: ProxyProvider = isCloud ? 'direct' : bot.proxyProvider as ProxyProvider;
+    const effectiveProxyUrls = isCloud ? null : bot.proxyUrls as string[] | null;
+    if (effectiveProvider !== bot.proxyProvider) {
+      logger.info('Provider override', { botId, configured: bot.proxyProvider, effective: effectiveProvider, reason: 'cloud_direct' });
+    }
+
     const client = new VisaClient(
       {
         cookie,
@@ -325,7 +365,8 @@ export const pollVisaTask = task({
         applicantIds: bot.applicantIds,
         consularFacilityId: bot.consularFacilityId,
         ascFacilityId: bot.ascFacilityId,
-        proxyProvider: bot.proxyProvider as ProxyProvider,
+        proxyProvider: effectiveProvider,
+        proxyUrls: effectiveProxyUrls,
         userId: bot.userId,
         locale: bot.locale,
       },
@@ -333,6 +374,7 @@ export const pollVisaTask = task({
 
     const dateExclusions = exDates.map((d) => ({ startDate: d.startDate, endDate: d.endDate }));
 
+    let capturedConnInfo: LogPollExtra['connectionInfo'] = null;
     try {
       let allDays: DaySlot[];
       let days: Array<{ date: string }>;
@@ -390,24 +432,30 @@ export const pollVisaTask = task({
         const superCritical = isInSuperCriticalWindow(bot.locale);
         const burst = !superCritical && isInBurstWindow(bot.locale);
         const maxFetches = burst ? 3 : 1;
-        const skipSync = process.env.SKIP_APPOINTMENT_SYNC === 'true';
+        // Skip appointment sync if: env var set, burst mode, or appointment is >6 months away (won't change often)
+        const apptFarAway = bot.currentConsularDate && (new Date(bot.currentConsularDate).getTime() - Date.now()) > 180 * 86400000;
+        const skipSync = process.env.SKIP_APPOINTMENT_SYNC === 'true' || burst || !!apptFarAway;
         metadata.set("phase", "Consultando dias...");
-        logger.info('Fetching consular days...', { botId, provider: bot.proxyProvider, superCritical, burst, maxFetches, skipSync });
+        logger.info('Fetching consular days...', { botId, provider: effectiveProvider, superCritical, burst, maxFetches, skipSync });
 
         const fetchStart = Date.now();
+        // Kick off consular days fetch first
+        const daysPromise = client.getConsularDays().then((result) => {
+          capturedConnInfo = captureConnInfo();
+          // Capture webshare IP immediately (before appointment fetch overwrites lastProxyIp)
+          const proxyIp = getLastProxyIp();
+          if (proxyIp) publicIp = proxyIp;
+          return result;
+        });
+        const apptPromise = skipSync ? Promise.resolve(null) : client.getCurrentAppointment().catch((err) => {
+          logger.warn('Failed to fetch current appointment', {
+            botId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        });
         // ipPromise runs in parallel with consular days fetch (0 extra latency, resolved before logPoll)
-        const [firstDaysResult, currentAppt] = await Promise.all([
-          client.getConsularDays(),
-          skipSync ? Promise.resolve(null) : client.getCurrentAppointment().catch((err) => {
-            logger.warn('Failed to fetch current appointment', {
-              botId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            return null;
-          }),
-          ipPromise,
-        ]);
-
+        const [firstDaysResult, currentAppt] = await Promise.all([daysPromise, apptPromise, ipPromise]);
         timings.fetch = Date.now() - fetchStart;
 
         // Sync current appointment from website → DB if changed
@@ -415,7 +463,7 @@ export const pollVisaTask = task({
           logger.info('Current appointment from web', {
             botId,
             consular: `${currentAppt.consularDate} ${currentAppt.consularTime}`,
-            cas: `${currentAppt.casDate} ${currentAppt.casTime}`,
+            cas: currentAppt.casDate ? `${currentAppt.casDate} ${currentAppt.casTime}` : 'N/A',
           });
           const changed =
             currentAppt.consularDate !== bot.currentConsularDate ||
@@ -427,9 +475,9 @@ export const pollVisaTask = task({
             logger.info('Appointment changed externally — syncing DB', {
               botId,
               dbConsular: `${bot.currentConsularDate} ${bot.currentConsularTime}`,
-              dbCas: `${bot.currentCasDate} ${bot.currentCasTime}`,
+              dbCas: bot.currentCasDate ? `${bot.currentCasDate} ${bot.currentCasTime}` : 'N/A',
               webConsular: `${currentAppt.consularDate} ${currentAppt.consularTime}`,
-              webCas: `${currentAppt.casDate} ${currentAppt.casTime}`,
+              webCas: currentAppt.casDate ? `${currentAppt.casDate} ${currentAppt.casTime}` : 'N/A',
             });
             // Update in-memory for comparison, persist in background
             bot.currentConsularDate = currentAppt.consularDate;
@@ -484,7 +532,7 @@ export const pollVisaTask = task({
           const firstEarliest = days[0]?.date;
           const firstStatus = softBanNotified ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
           const firstDateChanges = computeDateChanges(allDays, previousDates);
-          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, (days.length > 0 ? days : allDays).slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: bot.proxyProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges });
+          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, connectionInfo: capturedConnInfo });
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
 
@@ -530,7 +578,7 @@ export const pollVisaTask = task({
             } catch (fetchErr) {
               if (fetchErr instanceof SessionExpiredError) throw fetchErr;
               const fetchMs = Date.now() - fetchStart;
-              const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+              const errMsg = extractErrorMessage(fetchErr);
 
               // Classify error
               const tcpBlock = isTcpBlockError(errMsg);
@@ -539,7 +587,11 @@ export const pollVisaTask = task({
               if (serverOverload) {
                 // 5xx: backoff but don't break — server may recover
                 consecutive5xx++;
-                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: bot.proxyProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp });
+                {
+                  const proxyIp = getLastProxyIp();
+                  if (proxyIp) publicIp = proxyIp;
+                }
+                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo() });
                 logger.warn(`Super-critical fetch ${loopFetchCount} — HTTP 5xx (${consecutive5xx} consecutive)`, { botId, error: errMsg });
                 if (consecutive5xx >= 2 && !throttleNotified) {
                   throttleNotified = true;
@@ -562,11 +614,17 @@ export const pollVisaTask = task({
               // Non-5xx errors (TCP block, etc.)
               consecutiveErrors++;
               consecutive5xx = 0;
-              logPoll(pending, botId, null, 0, fetchMs, tcpBlock ? 'tcp_blocked' : 'error', errMsg, undefined, undefined, { provider: bot.proxyProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp });
+              // Capture proxy IP even on failure (getLastProxyIp is set before HTTP request)
+              {
+                const proxyIp = getLastProxyIp();
+                if (proxyIp) publicIp = proxyIp;
+              }
+              logPoll(pending, botId, null, 0, fetchMs, tcpBlock ? 'tcp_blocked' : 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo() });
               logger.warn(`Super-critical fetch ${loopFetchCount} error`, { botId, consecutiveErrors, error: errMsg });
               if (tcpBlock && !tcpBlockNotified) {
                 tcpBlockNotified = true;
                 logger.error('TCP BLOCK detected during super-critical window', { botId, error: errMsg });
+                // Always notify during super-critical (high-value window)
                 pending.push(
                   notifyUserTask.trigger({
                     botId,
@@ -602,7 +660,7 @@ export const pollVisaTask = task({
             const fetchMs2 = Date.now() - fetchStart;
             const fetchStatus = isSoftBan ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
             const loopDateChanges = computeDateChanges(allDays, previousDates);
-            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, (days.length > 0 ? days : allDays).slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: bot.proxyProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges });
+            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, connectionInfo: captureConnInfo() });
             previousDates = new Set(allDays.map(d => d.date));
             logger.info(`Super-critical fetch ${loopFetchCount} result`, {
               botId,
@@ -662,16 +720,19 @@ export const pollVisaTask = task({
           earliest,
         });
         metadata.set("phase", "Despachando a subscribers...");
-        // Fire-and-forget: don't await, don't block self-trigger
-        dispatchToSubscribers({
-          facilityId: bot.consularFacilityId,
-          availableDates: allDays,
-          scoutBotId: botId,
-          pollLogId: null, // TODO: get pollLogId from insert returning
-          runId: ctx.run.id,
-        })
-          .then((r) => logger.info(`[dispatch] ${r.succeeded}/${r.attempted} succeeded`, { dispatchLogId: r.dispatchLogId, durationMs: r.durationMs }))
-          .catch((err) => logger.error(`[dispatch] error`, { error: String(err) }));
+        // Track dispatch in pending[] so Promise.allSettled waits for it before exit
+        // Runs in parallel with inline reschedule (no blocking)
+        pending.push(
+          dispatchToSubscribers({
+            facilityId: bot.consularFacilityId,
+            availableDates: allDays,
+            scoutBotId: botId,
+            pollLogId: null, // TODO: get pollLogId from insert returning
+            runId: ctx.run.id,
+          })
+            .then((r) => logger.info(`[dispatch] ${r.succeeded}/${r.attempted} succeeded`, { dispatchLogId: r.dispatchLogId, durationMs: r.durationMs }))
+            .catch((err) => logger.error(`[dispatch] error`, { error: String(err) })),
+        );
       }
       // Inline reschedule for THIS bot (scouts AND non-scouts)
       // For scouts: runs after dispatch fire-and-forget (no conflict — inline goes first, dispatch does login ~1s per subscriber)
@@ -735,6 +796,7 @@ export const pollVisaTask = task({
           dryRun,
           pending,
           loginCredentials: loginCreds,
+          maxReschedules: bot.maxReschedules,
         });
         timings.reschedule = Date.now() - rescheduleStart;
         rescheduleResultObj = result;
@@ -777,7 +839,7 @@ export const pollVisaTask = task({
         const finalDateChanges = computeDateChanges(allDays, previousDates);
         const extra: LogPollExtra = {
           rawDatesCount: allDays.length,
-          provider: bot.proxyProvider,
+          provider: effectiveProvider,
           reloginHappened,
           phaseTimings: { ...timings },
           ...(rescheduleResultObj?.attempts ? { rescheduleDetails: { attempts: rescheduleResultObj.attempts } } : {}),
@@ -787,11 +849,14 @@ export const pollVisaTask = task({
           runId: ctx.run.id,
           publicIp,
           dateChanges: finalDateChanges,
+          connectionInfo: capturedConnInfo,
         };
 
+        // topDates always uses raw (unfiltered) dates for consistent cancellation tracking
+        const topDatesRaw = allDays.slice(0, 3).map(d => d.date);
         if (days.length === 0) {
           logger.info('No available dates', { botId, responseTimeMs, softBan: softBanNotified });
-          logPoll(pending, botId, null, 0, responseTimeMs, finalStatus, undefined, allDays.slice(0, 3).map(d => d.date), undefined, extra);
+          logPoll(pending, botId, null, 0, responseTimeMs, finalStatus, undefined, topDatesRaw, undefined, extra);
         } else {
           logger.info('Dates found', {
             botId,
@@ -801,7 +866,7 @@ export const pollVisaTask = task({
             current: bot.currentConsularDate,
             responseTimeMs,
           });
-          logPoll(pending, botId, earliest!, days.length, responseTimeMs, finalStatus, undefined, days.slice(0, 3).map(d => d.date), rescheduleResultLabel, extra);
+          logPoll(pending, botId, earliest!, days.length, responseTimeMs, finalStatus, undefined, topDatesRaw, rescheduleResultLabel, extra);
         }
       } else if (rescheduleResultLabel) {
         // Super-critical/burst: update the most recent poll_log with the reschedule result
@@ -837,13 +902,18 @@ export const pollVisaTask = task({
         pending.push(db.update(bots).set({ consecutiveErrors: 0, status: 'active', updatedAt: new Date() }).where(eq(bots.id, botId)).catch((e) => logger.error('error reset failed', { error: String(e) })));
       }
     } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
+      const errMsg = extractErrorMessage(error);
       const responseTimeMs = Date.now() - startMs;
       const tcpBlock = isTcpBlockError(errMsg);
       const serverOverload = is5xxError(errMsg);
       const logStatus = tcpBlock ? 'tcp_blocked' : 'error';
+      // Capture proxy IP even on failure (null = direct, ipify already resolved)
+      {
+        const proxyIp = getLastProxyIp();
+        if (proxyIp) publicIp = proxyIp;
+      }
       logger.error(`Poll error: ${errMsg}`, { botId, responseTimeMs, tcpBlock, serverOverload });
-      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { provider: bot.proxyProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: getCurrentPhase(bot.locale).phase, runId: ctx.run.id, publicIp });
+      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: getCurrentPhase(bot.locale).phase, runId: ctx.run.id, publicIp, connectionInfo: capturedConnInfo });
 
       if (error instanceof SessionExpiredError) {
         logger.warn(`SESSION EXPIRED: ${errMsg} — attempting inline re-login`, { botId });
@@ -883,7 +953,7 @@ export const pollVisaTask = task({
 
           // Don't retry fetch in this run — self-reschedule with short delay to poll immediately
           logger.info('Re-login saved, self-rescheduling with short delay to retry', { botId, chainId });
-          await cancelPreviousRun(ctx.run.id, activeRunIdField);
+          cancelPreviousRun(ctx.run.id, activeRunIdField);
           await Promise.allSettled(pending);
 
           const reloginConcKey = isCloud ? `poll-cloud-${botId}` : `poll-${botId}`;
@@ -923,32 +993,28 @@ export const pollVisaTask = task({
         }
       }
 
-      // Notify on first TCP block in this run
+      // Notify on TCP block (once per run)
       if (tcpBlock && !tcpBlockNotified) {
         tcpBlockNotified = true;
-        const nextBackoff = (payload.tcpBackoff ?? 0) + 1;
-        const backoffMin = Math.min(nextBackoff * 5, 30);
-        logger.error(`TCP BLOCK detected — will backoff ${backoffMin}min`, { botId, error: errMsg, tcpBackoff: nextBackoff });
+        logger.error('TCP BLOCK detected', { botId, error: errMsg });
         pending.push(
           notifyUserTask.trigger({
             botId,
             event: 'tcp_blocked',
-            data: { error: errMsg, tcpBackoff: nextBackoff },
+            data: { error: errMsg },
           }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('tcp_blocked notify failed', { error: String(e) })),
         );
       }
 
-      // Notify on first 5xx throttle (outside super-critical where it's handled in-loop)
+      // Notify on first 5xx throttle (once per run)
       if (serverOverload && !throttleNotified) {
         throttleNotified = true;
-        const nextBackoff = (payload.tcpBackoff ?? 0) + 1;
-        const backoffMin = Math.min(nextBackoff * 5, 30);
-        logger.warn(`SERVER THROTTLE detected — will backoff ${backoffMin}min`, { botId, error: errMsg, tcpBackoff: nextBackoff });
+        logger.warn('SERVER THROTTLE detected — will backoff 3min', { botId, error: errMsg });
         pending.push(
           notifyUserTask.trigger({
             botId,
             event: 'server_throttled',
-            data: { consecutive5xx: 1, error: errMsg, window: 'normal', tcpBackoff: nextBackoff },
+            data: { consecutive5xx: 1, error: errMsg, window: 'normal' },
           }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('throttle notify failed', { error: String(e) })),
         );
       }
@@ -959,11 +1025,11 @@ export const pollVisaTask = task({
         logger.warn('Transient error (TCP/5xx) — NOT incrementing consecutiveErrors, will backoff', { botId, tcpBlock, serverOverload });
       } else {
         const newErrors = bot.consecutiveErrors + 1;
-        pending.push(db.update(bots).set({ consecutiveErrors: newErrors, updatedAt: new Date() }).where(eq(bots.id, botId)).catch((e) => logger.error('error count failed', { error: String(e) })));
+        pending.push(db.update(bots).set({ consecutiveErrors: sql`${bots.consecutiveErrors} + 1`, updatedAt: new Date() }).where(eq(bots.id, botId)).catch((e) => logger.error('error count failed', { error: String(e) })));
         logger.warn('Consecutive errors incremented', { botId, errors: newErrors });
 
         if (newErrors >= 5) {
-          logger.error('TOO MANY ERRORS — marking bot as error (chain stays alive for auto-recovery)', { botId, errors: newErrors });
+          logger.error('TOO MANY ERRORS — marking bot as error (chain stays alive for auto-recovery)', { botId, chainId, errors: newErrors });
           await db.update(bots).set({ status: 'error', consecutiveErrors: 0, updatedAt: new Date() }).where(eq(bots.id, botId));
           pending.push(
             notifyUserTask.trigger({
@@ -978,10 +1044,25 @@ export const pollVisaTask = task({
       }
     }
 
+    // Re-read bot status + consecutiveErrors from DB (may have been changed by other chain or /pause)
+    const [freshState] = await db.select({ status: bots.status, consecutiveErrors: bots.consecutiveErrors })
+      .from(bots).where(eq(bots.id, botId));
+    const freshStatus = freshState?.status ?? bot.status;
+    const freshErrors = freshState?.consecutiveErrors ?? bot.consecutiveErrors;
+
+    // #4: If bot was paused/stopped externally, don't self-trigger
+    if (freshStatus !== 'active' && freshStatus !== 'error' && freshStatus !== 'login_required') {
+      logger.info('Bot no longer active — stopping chain', { botId, freshStatus });
+      await Promise.allSettled(pending);
+      return;
+    }
+
     // Determine if we should self-trigger (chain) or let cron handle next run
     const hadTransientError = tcpBlockNotified || throttleNotified;
-    const botJustErrored = bot.status === 'error' || (bot.consecutiveErrors >= 4 && !hadTransientError);
+    const botJustErrored = freshStatus === 'error' || (freshErrors >= 4 && !hadTransientError);
+    const subMinutePolling = getNormalInterval(bot.locale) < 60; // Cron can't handle <60s
     const shouldChain = !cronTriggered           // Legacy chain mode (not cron-triggered)
+      || subMinutePolling                          // Sub-minute intervals need chain
       || isInSuperCriticalWindow(bot.locale)      // Continuous coverage during drop
       || isInBurstWindow(bot.locale)              // Burst coverage post-drop
       || hadTransientError                         // TCP/5xx backoff needs chain
@@ -989,14 +1070,34 @@ export const pollVisaTask = task({
 
     if (shouldChain) {
       // Self-reschedule (cancel previous delayed run first to prevent pile-up)
-      await cancelPreviousRun(ctx.run.id, activeRunIdField);
-      const nextTcpBackoff = hadTransientError ? (payload.tcpBackoff ?? 0) + 1 : 0;
-      const normalDelay = getPollingDelay(bot.locale);
-      const tcpDelayMin = Math.min(nextTcpBackoff * 5, 30);
-      const delay = botJustErrored ? '30m' : hadTransientError ? `${tcpDelayMin}m` : normalDelay;
+      cancelPreviousRun(ctx.run.id, activeRunIdField);
+      const poolForDelay = bot.proxyProvider === 'webshare' ? getPoolState() : null;
+      const healthyIpsForDelay = poolForDelay
+        ? Object.values(poolForDelay.ips).filter((h) => h.state === 'closed').length
+        : undefined;
+      const normalDelay = getPollingDelay(bot.locale, healthyIpsForDelay);
+      // tcp_blocked:
+      //   webshare → ProxyPoolManager rotates to a healthy IP, use normalDelay (or 5min emergency if all IPs open)
+      //   direct/brightdata/firecrawl → 30min to avoid escalating a single-IP ban
+      // 5xx throttle → 3min (server-side, not IP-specific)
+      let delay: string;
+      if (botJustErrored) {
+        delay = '30m';
+      } else if (tcpBlockNotified && bot.proxyProvider === 'webshare') {
+        const allOpen = poolForDelay != null &&
+          Object.values(poolForDelay.ips).length > 0 &&
+          Object.values(poolForDelay.ips).every((h) => h.state === 'open');
+        delay = allOpen ? '5m' : normalDelay;
+      } else if (tcpBlockNotified) {
+        delay = '30m'; // direct/brightdata/firecrawl: avoid IP ban escalation
+      } else if (throttleNotified) {
+        delay = '3m';
+      } else {
+        delay = normalDelay;
+      }
       const priority = calculatePriority(bot.activatedAt);
       const concurrencyKey = isCloud ? `poll-cloud-${botId}` : `poll-${botId}`;
-      logger.info('Self-rescheduling (chain)', { botId, chainId, delay, priority, cronTriggered, ...(hadTransientError ? { tcpBackoff: nextTcpBackoff, tcpDelayMin } : {}) });
+      logger.info('Self-rescheduling (chain)', { botId, chainId, delay, priority, cronTriggered, ...(hadTransientError ? { tcpBlock, throttle: serverOverload } : {}) });
 
       metadata.set("phase", "Auto-programando...");
       const handle = await pollVisaTask.trigger(
@@ -1006,7 +1107,6 @@ export const pollVisaTask = task({
           cronTriggered: cronTriggered, // Preserve: when window ends, cron-triggered runs exit
           ...(dryRun ? { dryRun } : {}),
           ...(runRawDatesCount > 0 ? { lastDatesCount: runRawDatesCount } : {}),
-          ...(nextTcpBackoff > 0 ? { tcpBackoff: nextTcpBackoff } : {}),
         },
         {
           delay: dryRun ? '30s' : delay,
@@ -1055,6 +1155,22 @@ interface LogPollExtra {
   runId?: string;
   publicIp?: string | null;
   dateChanges?: { appeared: string[], disappeared: string[] } | null;
+  connectionInfo?: {
+    proxyAttemptIp?: string | null;
+    fallbackHappened?: boolean;
+    fallbackReason?: string;
+    websharePoolSize?: number;
+  } | null;
+}
+
+function captureConnInfo(): LogPollExtra['connectionInfo'] {
+  const m = getProxyFetchMeta();
+  return (m.fallbackHappened || m.proxyAttemptIp || (m.websharePoolSize ?? 0) > 0) ? {
+    proxyAttemptIp: m.proxyAttemptIp,
+    fallbackHappened: m.fallbackHappened || undefined,
+    fallbackReason: m.fallbackReason || undefined,
+    websharePoolSize: (m.websharePoolSize ?? 0) > 0 ? m.websharePoolSize : undefined,
+  } : null;
 }
 
 function logPoll(
@@ -1091,6 +1207,7 @@ function logPoll(
       runId: extra?.runId ?? null,
       publicIp: extra?.publicIp ?? null,
       dateChanges: extra?.dateChanges ?? null,
+      connectionInfo: extra?.connectionInfo ?? null,
     }).catch((e) => logger.error('logPoll failed', { error: String(e) })),
   );
 }
@@ -1120,9 +1237,11 @@ function computeDateChanges(
   currentDates: DaySlot[],
   previousDates: Set<string> | null,
 ): { appeared: string[], disappeared: string[] } | null {
-  if (!previousDates) return null;
+  if (currentDates.length === 0 && !previousDates) return null;
   const currentSet = new Set(currentDates.map(d => d.date));
-  const appeared = [...currentSet].filter(d => !previousDates.has(d));
-  const disappeared = [...previousDates].filter(d => !currentSet.has(d));
+  // First poll after restart: treat all current dates as newly appeared
+  const prev = previousDates ?? new Set<string>();
+  const appeared = [...currentSet].filter(d => !prev.has(d));
+  const disappeared = [...prev].filter(d => !currentSet.has(d));
   return { appeared, disappeared };
 }

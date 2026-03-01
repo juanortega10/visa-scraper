@@ -151,7 +151,7 @@ export const loginVisaTask = task({
       const handle = await pollVisaTask.trigger(
         { botId, ...(isCloud ? { chainId: 'cloud' as const } : {}) },
         {
-          delay: getPollingDelay(),
+          delay: getPollingDelay(bot.locale),
           concurrencyKey,
           tags: [`bot:${botId}`, ...(isCloud ? ['cloud'] : [])],
         },

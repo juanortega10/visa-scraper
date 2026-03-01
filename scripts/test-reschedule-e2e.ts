@@ -185,11 +185,14 @@ async function main() {
     step(6, 'reschedule() POST — SKIPPED (dry-run)');
     console.log('  Pass --commit flag to execute the actual reschedule POST.');
     console.log('  ⚠️  This is IRREVERSIBLE — it will change your real appointment.');
+  } else if (!wouldImprove) {
+    step(6, 'reschedule() POST — BLOCKED');
+    console.log('  ❌ BLOCKED: proposed date is NOT earlier than current. Refusing to execute.');
+    console.log('  This protection prevents losing a valuable earlier appointment slot.');
+    console.log(`\n✅ E2E flow completed (POST blocked). Total API calls: 5`);
+    process.exit(0);
   } else {
     step(6, 'reschedule() POST — EXECUTING');
-    if (!wouldImprove) {
-      console.log('  ⚠️  WARNING: proposed date is NOT earlier. Proceeding anyway (--commit)...');
-    }
     const t6 = Date.now();
     const success = await client.reschedule(targetDate, consularTime, casDate, casTime);
     console.log(`  Result: ${success ? '✅ SUCCESS' : '❌ FAILED'}`);

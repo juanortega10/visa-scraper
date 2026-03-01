@@ -22,7 +22,7 @@ const {
 // Build a chainable that resolves to a value via real Promise
 function chain(resolveValue: any) {
   const c: any = {};
-  for (const m of ['from', 'where', 'orderBy', 'limit', 'offset', 'set', 'values']) {
+  for (const m of ['from', 'where', 'orderBy', 'limit', 'offset', 'set', 'values', 'onConflictDoUpdate']) {
     c[m] = () => c;
   }
   c.returning = () => Promise.resolve(resolveValue);
@@ -53,7 +53,9 @@ vi.mock('drizzle-orm', () => ({
   eq: (...args: any[]) => ({ _op: 'eq', args }),
   and: (...args: any[]) => ({ _op: 'and', args }),
   gte: (...args: any[]) => ({ _op: 'gte', args }),
+  gt: (...args: any[]) => ({ _op: 'gt', args }),
   desc: (...args: any[]) => ({ _op: 'desc', args }),
+  ne: (...args: any[]) => ({ _op: 'ne', args }),
   inArray: (...args: any[]) => ({ _op: 'inArray', args }),
 }));
 
@@ -68,10 +70,18 @@ vi.mock('../login.js', () => ({
   InvalidCredentialsError: class InvalidCredentialsError extends Error { constructor(msg: string) { super(msg); this.name = 'InvalidCredentialsError'; } },
 }));
 
+const mockGetCurrentAppointment = vi.fn();
+const mockRefreshTokens = vi.fn();
+const mockGetUserId = vi.fn();
+
 vi.mock('../visa-client.js', () => ({
   VisaClient: class MockVisaClient {
     constructor() {}
     getSession() { return { cookie: 'c', csrfToken: 'csrf', authenticityToken: 'auth' }; }
+    getCurrentAppointment() { return mockGetCurrentAppointment(); }
+    refreshTokens() { return mockRefreshTokens(); }
+    getUserId() { return mockGetUserId(); }
+    getCapturedPages() { return new Map(); }
   },
 }));
 
@@ -171,10 +181,13 @@ describe('dispatchToSubscribers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     executeRescheduleCalls.length = 0;
+    mockGetCurrentAppointment.mockResolvedValue(null);
+    mockRefreshTokens.mockResolvedValue(undefined);
+    mockGetUserId.mockReturnValue(null);
     setupDbMocks();
   });
 
-  it('returns early with zero counts when no subscribers', async () => {
+  it('returns early with zero counts and no DB insert when no subscribers', async () => {
     mockGetSubscribers.mockResolvedValue([]);
 
     const result = await dispatchToSubscribers({
@@ -185,7 +198,10 @@ describe('dispatchToSubscribers', () => {
 
     expect(result.attempted).toBe(0);
     expect(result.succeeded).toBe(0);
+    expect(result.dispatchLogId).toBe(0);
     expect(mockPerformLogin).not.toHaveBeenCalled();
+    // Should NOT insert a dispatch_log when 0 subscribers (avoids dedup pollution)
+    expect(mockDbInsert).not.toHaveBeenCalled();
   });
 
   it('logs in and reschedules each subscriber sequentially', async () => {
@@ -289,6 +305,7 @@ describe('dispatchToSubscribers', () => {
     });
 
     expect(result.skipped).toBe(1);
+    expect(mockPerformLogin).not.toHaveBeenCalled(); // pre-login check prevents wasting a login attempt
     expect(mockExecuteReschedule).not.toHaveBeenCalled();
   });
 
@@ -307,7 +324,7 @@ describe('dispatchToSubscribers', () => {
     expect(mockExecuteReschedule).not.toHaveBeenCalled();
   });
 
-  it('passes preFetchedDays to executeReschedule', async () => {
+  it('does NOT pass preFetchedDays to subscriber (schedule-specific dates)', async () => {
     const days = [{ date: '2026-03-05', business_day: true as const }, { date: '2026-03-08', business_day: true as const }];
     mockGetSubscribers.mockResolvedValue([mkSub({ id: 42 })]);
     mockPerformLogin.mockResolvedValue(defaultLoginResult);
@@ -318,8 +335,9 @@ describe('dispatchToSubscribers', () => {
       scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
     });
 
+    // preFetchedDays must be undefined — scout's dates are schedule-specific and don't apply to subscriber
     expect(mockExecuteReschedule).toHaveBeenCalledWith(
-      expect.objectContaining({ preFetchedDays: days }),
+      expect.objectContaining({ preFetchedDays: undefined }),
     );
   });
 
@@ -342,5 +360,156 @@ describe('dispatchToSubscribers', () => {
         }),
       }),
     );
+  });
+
+  it('dedup ignores logs with 0 attempted (empty dispatches)', async () => {
+    // Dedup query should include gt(subscribersAttempted, 0), so
+    // even if there are recent dispatch_logs with 0 attempted, they are ignored.
+    // We verify dispatch proceeds (calls getSubscribers) when dedup returns [].
+    mockGetSubscribers.mockResolvedValue([mkSub({ id: 42 })]);
+    mockPerformLogin.mockResolvedValue(defaultLoginResult);
+    mockExecuteReschedule.mockResolvedValue(defaultRescheduleSuccess);
+
+    const result = await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    // Dispatch proceeded because dedup returned [] (default mock)
+    expect(result.attempted).toBe(1);
+    expect(result.succeeded).toBe(1);
+  });
+
+  // ── Appointment sync tests ──────────────────────────────
+
+  it('syncs appointment from web before reschedule (detects manual change)', async () => {
+    mockGetSubscribers.mockResolvedValue([
+      mkSub({ id: 42, currentConsularDate: '2026-12-17', userId: '12345' }),
+    ]);
+    mockPerformLogin.mockResolvedValue(defaultLoginResult);
+    mockGetCurrentAppointment.mockResolvedValue({
+      consularDate: '2026-06-15',
+      consularTime: '08:00',
+      casDate: '2026-06-13',
+      casTime: '10:00',
+    });
+    mockExecuteReschedule.mockResolvedValue(defaultRescheduleSuccess);
+
+    await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    // DB update should have been called for the appointment sync
+    expect(mockDbUpdate).toHaveBeenCalled();
+    // getCurrentAppointment should have been called
+    expect(mockGetCurrentAppointment).toHaveBeenCalledTimes(1);
+  });
+
+  it('discovers userId via refreshTokens when userId is null', async () => {
+    mockGetSubscribers.mockResolvedValue([
+      mkSub({ id: 42, userId: null }),
+    ]);
+    mockPerformLogin.mockResolvedValue(defaultLoginResult);
+    mockRefreshTokens.mockResolvedValue(undefined);
+    mockGetUserId.mockReturnValue('discovered_123');
+    mockGetCurrentAppointment.mockResolvedValue(null);
+    mockExecuteReschedule.mockResolvedValue(defaultRescheduleSuccess);
+
+    await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    // refreshTokens should have been called for userId discovery
+    expect(mockRefreshTokens).toHaveBeenCalledTimes(1);
+    // DB update should persist discovered userId
+    expect(mockDbUpdate).toHaveBeenCalled();
+  });
+
+  it('appointment sync failure does not abort dispatch', async () => {
+    mockGetSubscribers.mockResolvedValue([
+      mkSub({ id: 42, userId: '12345' }),
+    ]);
+    mockPerformLogin.mockResolvedValue(defaultLoginResult);
+    mockGetCurrentAppointment.mockRejectedValue(new Error('Network error'));
+    mockExecuteReschedule.mockResolvedValue(defaultRescheduleSuccess);
+
+    const result = await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    // Dispatch should still succeed despite sync failure
+    expect(result.succeeded).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(mockExecuteReschedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('dedup blocks when recent dispatch has attempted > 0', async () => {
+    // Override dedup query to return a recent dispatch
+    mockDbSelect.mockImplementation((..._selectArgs: any[]) => {
+      const c: any = {};
+      c.from = (table: any) => {
+        let resolveValue: any;
+        if (table?._name === 'dispatchLogs') resolveValue = [{ id: 55 }]; // recent dispatch found
+        else resolveValue = [];
+        const inner: any = {};
+        inner.where = () => inner;
+        inner.orderBy = () => inner;
+        inner.limit = () => inner;
+        inner.then = (res: any, rej?: any) => Promise.resolve(resolveValue).then(res, rej);
+        inner.catch = (fn: any) => Promise.resolve(resolveValue).catch(fn);
+        return inner;
+      };
+      return c;
+    });
+
+    const result = await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    expect(result.dispatchLogId).toBe(0);
+    expect(result.attempted).toBe(0);
+    expect(mockGetSubscribers).not.toHaveBeenCalled();
+  });
+
+  it('session upsert uses onConflictDoUpdate (atomic)', async () => {
+    mockGetSubscribers.mockResolvedValue([mkSub({ id: 42 })]);
+    mockPerformLogin.mockResolvedValue(defaultLoginResult);
+    mockExecuteReschedule.mockResolvedValue(defaultRescheduleSuccess);
+
+    // Track insert chain calls to verify onConflictDoUpdate is called
+    const onConflictSpy = vi.fn();
+    mockDbInsert.mockImplementation((_table: any) => {
+      const c: any = {};
+      for (const m of ['from', 'where', 'orderBy', 'limit', 'offset', 'set']) {
+        c[m] = () => c;
+      }
+      c.values = () => c;
+      c.onConflictDoUpdate = (...args: any[]) => {
+        onConflictSpy(...args);
+        return c;
+      };
+      c.returning = () => Promise.resolve([{ id: 99 }]);
+      c.then = (res: any, rej?: any) => Promise.resolve([{ id: 99 }]).then(res, rej);
+      c.catch = (fn: any) => Promise.resolve([{ id: 99 }]).catch(fn);
+      return c;
+    });
+
+    await dispatchToSubscribers({
+      facilityId: '25',
+      availableDates: [{ date: '2026-03-05', business_day: true }],
+      scoutBotId: 6, pollLogId: 100, runId: 'run_abc',
+    });
+
+    // onConflictDoUpdate should have been called for the session insert
+    expect(onConflictSpy).toHaveBeenCalled();
   });
 });

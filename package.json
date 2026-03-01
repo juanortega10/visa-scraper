@@ -27,14 +27,14 @@
     "@clerk/backend": "^2.31.0",
     "@hono/node-server": "^1.19.9",
     "@neondatabase/serverless": "^0.10.4",
-    "@trigger.dev/sdk": "^4.0.0",
+    "@trigger.dev/sdk": "^4.4.1",
     "drizzle-orm": "^0.38.0",
     "hono": "^4.6.0",
     "resend": "^4.0.0",
     "undici": "^7.0.0"
   },
   "devDependencies": {
-    "@trigger.dev/build": "^4.3.3",
+    "@trigger.dev/build": "^4.4.1",
     "@types/node": "^22.0.0",
     "drizzle-kit": "^0.30.0",
     "tsx": "^4.19.0",

@@ -7,13 +7,13 @@ export function getBaseUrl(locale: string = 'es-co'): string {
 export interface LocaleTexts {
   continueText: string;
   rescheduleText: string;
-  /** Whether to include `commit` field in reschedule POST. Lima (es-pe) omits it. */
+  /** Whether to include `commit` field in reschedule POST body. */
   includeCommit: boolean;
 }
 
 export function getLocaleTexts(locale: string): LocaleTexts {
   if (locale === 'es-pe') {
-    return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: false };
+    return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: true };
   }
   if (locale.startsWith('es-')) {
     return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: true };

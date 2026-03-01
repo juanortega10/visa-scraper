@@ -29,6 +29,7 @@ async function ensureChainForBot(
   activatedAt: Date | null,
   tags: string[],
   usesCron: boolean,
+  chainId?: 'dev' | 'cloud',
 ): Promise<{ action: RunAction; newRunId?: string }> {
   const status = await getRunStatus(runId);
 
@@ -62,7 +63,7 @@ async function ensureChainForBot(
 
   const { pollVisaTask } = await import('./poll-visa.js');
   const handle = await pollVisaTask.trigger(
-    { botId },
+    { botId, ...(chainId === 'cloud' ? { chainId: 'cloud' as const } : {}) },
     {
       delay: '1s',
       concurrencyKey,
@@ -125,6 +126,7 @@ export const ensureChainSchedule = schedules.task({
           bot.activatedAt,
           [`bot:${bot.id}`, 'guardian'],
           usesCron,
+          'dev',
         );
         if (dev.newRunId) {
           await db.update(bots)
@@ -142,6 +144,7 @@ export const ensureChainSchedule = schedules.task({
           bot.activatedAt,
           [`bot:${bot.id}`, 'cloud', 'guardian'],
           usesCron,
+          'cloud',
         );
         if (cloud.newRunId) {
           await db.update(bots)

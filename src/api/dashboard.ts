@@ -4,10 +4,39 @@ export const dashboardRouter = new Hono();
 
 dashboardRouter.get('/', (c) => c.html(renderLanding()));
 
-dashboardRouter.get('/:botId', (c) => {
-  const botId = c.req.param('botId');
-  return c.html(renderDashboard(botId));
+dashboardRouter.get('/:botId', async (c) => {
+  const raw = c.req.param('botId');
+  const botId = parseInt(raw, 10);
+  if (isNaN(botId)) return c.text('Invalid bot ID', 400);
+  const webshareIps = await fetchAllWebshareIps();
+  return c.html(renderDashboard(String(botId), webshareIps));
 });
+
+// ── Webshare IP list (cached 5min) ─────────────────────────
+let _webshareIpsCache: { ips: string[]; ts: number } | null = null;
+
+async function fetchAllWebshareIps(): Promise<string[]> {
+  if (_webshareIpsCache && Date.now() - _webshareIpsCache.ts < 5 * 60 * 1000) {
+    return _webshareIpsCache.ips;
+  }
+
+  const apiKey = process.env.WEBSHARE_API_KEY;
+  if (!apiKey) return [];
+
+  try {
+    const resp = await fetch('https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100', {
+      headers: { Authorization: `Token ${apiKey}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) return [];
+    const json = await resp.json() as { results: { proxy_address: string; valid: boolean }[] };
+    const ips = json.results.filter(p => p.valid).map(p => p.proxy_address);
+    _webshareIpsCache = { ips, ts: Date.now() };
+    return ips;
+  } catch {
+    return _webshareIpsCache?.ips ?? [];
+  }
+}
 
 // ── Country metadata ──────────────────────────────────────
 const COUNTRY_META: Record<string, { flag: string; name: string }> = {
@@ -248,7 +277,7 @@ setInterval(load,30000);
 </html>`;
 }
 
-function renderDashboard(botId: string): string {
+function renderDashboard(botId: string, webshareIps: string[] = []): string {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -481,6 +510,21 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   -webkit-tap-highlight-color:transparent;transition:all .15s}
 .ct-btn.ct-on{background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border)}
 
+/* ── Subscriber view ── */
+.sub-kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)}
+.sub-kv:last-child{border-bottom:none}
+.sub-k{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.sub-v{font-weight:700;font-size:11px}
+.sub-scout-status{display:flex;align-items:center;gap:8px;padding:6px 0}
+.sub-scout-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.sub-disp-item{padding:6px 0;border-bottom:1px solid var(--border);font-size:11px}
+.sub-disp-item:last-child{border-bottom:none}
+.sub-disp-dates{font-size:10px;color:var(--muted);margin-top:2px}
+.sub-disp-timing{font-size:9px;color:var(--dim);margin-top:1px}
+.sub-limits{display:flex;align-items:center;gap:6px}
+.sub-limits-bar{flex:1;max-width:80px;height:6px;background:var(--dim);border-radius:3px;overflow:hidden}
+.sub-limits-fill{height:100%;border-radius:3px}
+
 .empty{color:var(--muted);text-align:center;padding:14px;font-size:11px}
 .sk{background:linear-gradient(90deg,var(--surface) 25%,var(--surface2) 50%,var(--surface) 75%);
   background-size:200%;animation:shimmer 2s infinite;border-radius:3px;height:14px;display:inline-block}
@@ -538,6 +582,48 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 .cal-ch-date{font-weight:700;min-width:46px}
 .cal-ch-app{color:var(--green)}
 .cal-ch-dis{color:var(--red);text-decoration:line-through}
+.hlth-chain{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}
+.hlth-chain:last-child{border-bottom:none}
+.hlth-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.hlth-lbl{font-size:10px;font-weight:700;color:var(--bright);min-width:38px}
+.hlth-stat{font-size:9px;color:var(--muted)}
+.hlth-stat b{color:var(--bright);font-weight:700}
+.hlth-alert{font-size:9px;padding:4px 8px;border-radius:4px;margin-bottom:3px}
+.hlth-alert-warning{background:rgba(252,211,77,.08);color:var(--amber);border:1px solid rgba(252,211,77,.15)}
+.hlth-alert-critical{background:rgba(248,113,113,.08);color:var(--red);border:1px solid rgba(248,113,113,.15)}
+.hlth-ip-tbl{width:100%;border-collapse:collapse;font-size:9px}
+.hlth-ip-tbl th{text-align:left;color:var(--muted);font-weight:400;padding:2px 4px;border-bottom:1px solid var(--border)}
+.hlth-ip-tbl td{padding:3px 4px;border-bottom:1px solid var(--border)}
+.hlth-ip-tbl tr:last-child td{border-bottom:none}
+.hlth-bar{height:3px;border-radius:2px;background:var(--surface2);min-width:30px}
+.hlth-bar-fill{height:100%;border-radius:2px}
+
+/* ── Proxy Pool Panel ── */
+.pp-header{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+.pp-summary{font-size:9px;color:var(--muted);margin-left:auto}
+.pp-dots{display:flex;gap:4px;align-items:center}
+.pp-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.pp-dot.closed{background:var(--green)}
+.pp-dot.half_open{background:var(--amber)}
+.pp-dot.open{background:var(--red);opacity:.7}
+.pp-label{font-size:8px;font-weight:700;margin-left:2px}
+.pp-ip-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:10px}
+.pp-ip-row:last-child{border-bottom:none}
+.pp-ip-name{min-width:28px;font-weight:700}
+.pp-ip-state{font-size:8px;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.3px;flex-shrink:0}
+.pp-state-closed{background:rgba(74,222,128,.1);color:var(--green)}
+.pp-state-half_open{background:rgba(252,211,77,.1);color:var(--amber)}
+.pp-state-open{background:rgba(248,113,113,.1);color:var(--red)}
+.pp-bar-wrap{display:flex;align-items:center;gap:4px;margin-left:auto}
+.pp-bar{width:36px;height:3px;border-radius:2px;background:var(--surface2);overflow:hidden}
+.pp-bar-fill{height:100%;border-radius:2px}
+.pp-stat{font-size:9px;color:var(--muted);min-width:28px;text-align:right}
+.pp-cd{font-size:8px;color:var(--red);min-width:40px;text-align:right}
+.pp-ev-list{margin-top:6px;padding-top:6px;border-top:1px solid var(--border)}
+.pp-ev{display:flex;align-items:baseline;gap:5px;padding:3px 0;font-size:9px;color:var(--muted)}
+.pp-ev-icon{flex-shrink:0;font-size:9px;min-width:10px;text-align:center}
+.pp-ev-time{color:var(--dim);min-width:38px;flex-shrink:0;font-variant-numeric:tabular-nums}
+.pp-ev-body{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -564,6 +650,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   <span><span class="strip-lbl">via</span><span id="proxyVal" class="strip-val" style="font-size:10px">--</span></span>
   <span class="sep">&middot;</span>
   <span><span class="strip-lbl">poll</span><span id="pollSrc" class="strip-val" style="font-size:10px">--</span></span>
+  <span id="lastRsRow" style="display:none"><span class="sep">&middot;</span><span class="strip-lbl">resch</span><span id="lastRsVal" class="strip-val" style="font-size:10px">--</span></span>
   <div id="actions" class="actions" style="display:none;width:100%;margin-top:4px"></div>
 </div>
 
@@ -579,15 +666,51 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
       <span class="appt-lbl">cas</span>
       <span><span id="casDate" class="appt-val"><span class="sk" style="width:100px">&nbsp;</span></span><span id="casDays" class="appt-days"></span></span>
     </div>
+    <div id="targetRow" class="appt-row" style="display:none;margin-top:4px;border-top:1px solid var(--border);padding-top:6px">
+      <span class="appt-lbl" style="color:var(--muted)">objetivo</span>
+      <span><span id="targetVal" class="appt-val" style="font-size:12px"></span><span id="targetWindow" class="appt-days"></span></span>
+    </div>
+    <div id="rsLimitRow" class="appt-row" style="display:none">
+      <span class="appt-lbl" style="color:var(--muted)">intentos</span>
+      <span id="rsLimitVal" style="font-size:11px;font-weight:700"></span>
+    </div>
+    <div id="exclRow" style="display:none;margin-top:5px;padding-top:5px;border-top:1px solid var(--border);font-size:9px;line-height:1.8"></div>
   </div>
 </div>
 
-<!-- Tabs -->
-<div class="tabs">
+<!-- Tabs (hidden for subscribers) -->
+<div class="tabs" id="scoutTabs">
   <div class="tab on" onclick="switchTab(0)">monitor</div>
   <div id="casTabBtn" class="tab" onclick="switchTab(1)">cas map</div>
   <div class="tab" onclick="switchTab(2)">eventos</div>
   <div class="tab" onclick="switchTab(3)">calendario</div>
+</div>
+
+<!-- ═══ SUBSCRIBER VIEW (hidden for scouts) ═══ -->
+<div id="subscriberView" style="display:none">
+
+<div class="card">
+  <div class="card-t">configuracion</div>
+  <div id="subConfig" style="font-size:11px;line-height:2"></div>
+</div>
+
+<div class="card">
+  <div class="card-t">scout</div>
+  <div id="subScout" style="font-size:11px"></div>
+</div>
+
+<div class="card">
+  <div class="card-t">dispatches recibidos</div>
+  <div id="subDispatches"></div>
+  <div id="subDispEmpty" class="empty">sin dispatches</div>
+</div>
+
+<div class="card">
+  <div class="card-t">reagendamientos</div>
+  <div id="subReschedules"></div>
+  <div id="subRsEmpty" class="empty">sin reschedules</div>
+</div>
+
 </div>
 
 <!-- ═══ MONITOR TAB ═══ -->
@@ -614,7 +737,28 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
     <div class="pl-item"><span class="pl-lbl">fechas</span><span id="lpDates" class="pl-val">--</span></div>
     <div class="pl-item"><span class="pl-lbl">mejor</span><span id="lpBest" class="pl-val">--</span></div>
     <div class="pl-item"><span class="pl-lbl">latencia</span><span id="lpMs" class="pl-val">--</span></div>
+    <div class="pl-item"><span class="pl-lbl">nodo</span><span id="lpNode" class="pl-val">--</span></div>
     <div class="pl-item"><span class="pl-lbl">resch</span><span id="lpRs" class="pl-val">--</span></div>
+    <div id="lpMotivoRow" class="pl-item" style="display:none;grid-column:1/-1;border-top:1px solid var(--border);padding-top:4px;margin-top:2px"><span class="pl-lbl">motivo</span><span id="lpMotivo" class="pl-val" style="font-size:10px;color:var(--amber);font-weight:400;white-space:normal;word-break:break-all"></span></div>
+  </div>
+</div>
+
+<div class="card" id="healthCard">
+  <div class="card-t"><span class="coll-hdr" onclick="toggle(this)">health</span><span id="healthRate" style="font-size:9px;color:var(--dim)"></span></div>
+  <div class="coll-body">
+    <div id="healthChains" style="margin-bottom:6px"></div>
+    <div id="healthAlerts"></div>
+    <div id="healthIps" style="margin-top:6px"></div>
+    <div id="healthEmpty" class="empty">cargando...</div>
+  </div>
+</div>
+
+<div class="card collapsed" id="proxyPoolCard" style="display:none">
+  <div class="card-t"><span class="coll-hdr" onclick="toggle(this)">proxy pool</span><span id="ppSummary" style="font-size:9px;color:var(--dim)"></span></div>
+  <div class="coll-body">
+    <div id="ppIps"></div>
+    <div id="ppEvents" class="pp-ev-list" style="display:none"></div>
+    <div id="ppEmpty" class="empty" style="display:none">sin datos</div>
   </div>
 </div>
 
@@ -639,7 +783,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   <div class="card-t"><span class="coll-hdr" onclick="toggle(this)">historial</span><span id="pollCount" style="font-size:9px;color:var(--dim)">0</span></div>
   <div class="coll-body">
     <table>
-      <thead><tr><th>hora</th><th>src</th><th>st</th><th>#</th><th>mejor</th><th>ms</th></tr></thead>
+      <thead><tr><th>hora</th><th>nodo</th><th>st</th><th>#</th><th>mejor</th><th>ms</th></tr></thead>
       <tbody id="pollTb"></tbody>
     </table>
     <div id="pollEmpty" class="empty" style="display:none">sin polls</div>
@@ -703,6 +847,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
     <span class="cal-mode">
       <span class="ct-btn ct-on" onclick="setCalMode(0)" id="calModeBest">mejores</span>
       <span class="ct-btn" onclick="setCalMode(1)" id="calModeAll">todos</span>
+      <span class="ct-btn" onclick="setCalMode(2)" id="calModeFlash">flash</span>
     </span>
     <span class="cal-nav">
       <span class="cal-nav-btn" id="calPollPrev" onclick="calNavPoll(-1)">&lsaquo;</span>
@@ -739,6 +884,28 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 <script>
 var BID=${botId},API='/api',TZ={timeZone:'America/Bogota'};
 var DSE=['dom','lun','mar','mie','jue','vie','sab'];
+var CMETA=${JSON.stringify(COUNTRY_META)};
+var WEBSHARE_IPS=${JSON.stringify(webshareIps)};
+var WEBSHARE_COLORS=['#F0ABFC','#C4B5FD','#93C5FD','#86EFAC','#FDE68A','#FDA4AF','#A5B4FC','#6EE7B7','#FCA5A5','#D8B4FE'];
+var IS_WEBSHARE_BOT=false;
+function fmtNode(p){
+  var ci=p.chainId,ip=p.publicIp;
+  var cPfx=ci==='cloud'
+    ?'<span style="color:var(--cyan);font-size:7px;font-weight:700">cld</span><span style="color:var(--dim);font-size:7px">:</span>'
+    :'<span style="color:var(--amber);font-size:7px;font-weight:700">dev</span><span style="color:var(--dim);font-size:7px">:</span>';
+  if(ci==='cloud')
+    return cPfx+'<span style="color:#22D3EE;font-size:8px;font-weight:700" title="Cloud Direct ('+(ip||'?')+')">CLD</span>';
+  var wIdx=WEBSHARE_IPS.indexOf(ip);
+  if(wIdx>=0){
+    var wc=WEBSHARE_COLORS[wIdx]||'#94A3B8';
+    return cPfx+'<span style="color:'+wc+';font-size:8px;font-weight:700" title="Webshare #'+(wIdx+1)+' ('+(ip||'?')+')">W'+(wIdx+1)+'</span>';
+  }
+  if(ip)
+    return IS_WEBSHARE_BOT
+      ?cPfx+'<span style="color:#94A3B8;font-size:8px;font-weight:700" title="Webshare dynamic ('+(ip||'?')+')">Wsh</span>'
+      :cPfx+'<span style="color:#FBBF24;font-size:8px;font-weight:700" title="RPi Direct ('+ip+')">RPi</span>';
+  return cPfx+'<span style="color:var(--dim);font-size:8px">?</span>';
+}
 var cd=30,timer,lastBot=null,lastPolls=null,lastSummary=null,chartMode=0;
 var calIdx=0,calMonthOffset=0,lastExclusions=null,calPollList=null,calMode=0;
 var tlData=null,tlSelDate=null,tlDots=[],tlClickBound=false;
@@ -842,22 +1009,43 @@ async function fetchJ(u){var r=await fetch(u);if(!r.ok)throw new Error(r.status+
 async function refresh(){
   cd=30;document.getElementById('cdFill').style.width='100%';
   try{
+    var bot=await fetchJ(API+'/bots/'+BID);
+    lastBot=bot;
+    var isSubOnly=bot.isSubscriber&&!bot.isScout;
+
+    /* Toggle scout vs subscriber views */
+    document.getElementById('scoutTabs').style.display=isSubOnly?'none':'';
+    document.getElementById('subscriberView').style.display=isSubOnly?'':'none';
+    for(var ti=0;ti<4;ti++){var tp=document.getElementById('t'+ti);if(tp)tp.style.display=isSubOnly?'none':''}
+
+    if(isSubOnly){
+      refreshSubscriber(bot);
+      return;
+    }
+
     var res=await Promise.all([
-      fetchJ(API+'/bots/'+BID),
       fetchJ(API+'/bots/'+BID+'/logs/polls?limit=100'),
       fetchJ(API+'/bots/'+BID+'/logs/reschedules?limit=20'),
       fetchJ(API+'/bots/'+BID+'/logs/cas-prefetch?limit=15'),
-      fetchJ(API+'/bots/'+BID+'/logs/polls/summary?hours=24')
+      fetchJ(API+'/bots/'+BID+'/logs/polls/summary?hours=24'),
+      fetchJ(API+'/bots/'+BID+'/logs/polls/cancellations?hours=24'),
+      fetchJ(API+'/bots/'+BID+'/logs/polls/health?minutes=15').catch(function(){return null})
     ]);
-    var bot=res[0],polls=res[1],rss=res[2],casLogs=res[3],summary=res[4];
-    lastBot=bot;lastPolls=polls;lastSummary=summary;
+    var polls=res[0],rss=res[1],casLogs=res[2],summary=res[3],cancelServer=res[4],health=res[5];
+    lastPolls=polls;lastSummary=summary;tlData=cancelServer;
 
     /* Country flag */
-    var CMETA=${JSON.stringify(COUNTRY_META)};
     var cc=bot.locale?bot.locale.split('-')[1]:'';
     var cm=CMETA[cc];
     document.getElementById('botFlag').textContent=cm?cm.flag:'';
     document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — '+(cm?cm.name:'');
+
+    /* Show scout strip items */
+    document.getElementById('sesAge').parentElement.style.display='';
+    document.getElementById('proxyVal').parentElement.style.display='';
+    document.getElementById('pollSrc').parentElement.style.display='';
+    var seps=document.querySelectorAll('.strip .sep');
+    for(var si=0;si<seps.length;si++)seps[si].style.display='';
 
     /* Status */
     var sc=document.getElementById('statusChip');
@@ -869,12 +1057,23 @@ async function refresh(){
     ec.textContent=bot.consecutiveErrors||'0';
     ec.style.color=bot.consecutiveErrors>0?'var(--red)':'var(--green)';
     document.getElementById('proxyVal').textContent=bot.proxyProvider||'direct';
+    IS_WEBSHARE_BOT=bot.proxyProvider==='webshare';
     /* Poll source */
     var envs=bot.pollEnvironments||['dev'];
     var srcParts=[];
     if(envs.indexOf('dev')>=0)srcParts.push(bot.activeRunId?'<span style="color:var(--green)">dev</span>':'<span style="color:var(--dim)">dev</span>');
     if(envs.indexOf('prod')>=0)srcParts.push(bot.activeCloudRunId?'<span style="color:var(--green)">cloud</span>':'<span style="color:var(--dim)">cloud</span>');
     document.getElementById('pollSrc').innerHTML=srcParts.join('+');
+
+    /* Last successful reschedule (strip) */
+    var lastRsRow=document.getElementById('lastRsRow');
+    var lastOk=rss.find(function(r){return r.success;});
+    if(lastOk){
+      lastRsRow.style.display='';
+      var rsMins=Math.round((Date.now()-new Date(lastOk.createdAt).getTime())/6e4);
+      var rsAgo=rsMins<60?rsMins+'m':rsMins<1440?Math.floor(rsMins/60)+'h':Math.floor(rsMins/1440)+'d';
+      document.getElementById('lastRsVal').innerHTML='<span style="color:var(--green)">hace '+rsAgo+'</span> <span style="color:var(--dim)">→</span> '+fmtDs(lastOk.newConsularDate);
+    }else{lastRsRow.style.display='none';}
 
     /* Appointment */
     var cd2=bot.currentConsularDate;
@@ -888,6 +1087,53 @@ async function refresh(){
       document.getElementById('casDate').innerHTML=fmtD(bot.currentCasDate)+(bot.currentCasTime?' '+bot.currentCasTime:'');
       document.getElementById('casDays').textContent=daysUntil(bot.currentCasDate);
     }
+
+    /* Target date & improvement window (P0) */
+    var targetRow=document.getElementById('targetRow');
+    var targetVal=document.getElementById('targetVal');
+    var targetWindow=document.getElementById('targetWindow');
+    if(bot.targetDateBefore){
+      targetRow.style.display='';
+      var wDays=daysUntilNum(bot.targetDateBefore);
+      var wColor=wDays<=0?'var(--red)':wDays<=14?'var(--amber)':'var(--muted)';
+      var wText=wDays<=0?'ventana cerrada':wDays+'d de ventana';
+      targetVal.innerHTML='<span style="color:var(--dim);font-size:10px">< </span>'+fmtD(bot.targetDateBefore);
+      targetVal.style.color=wDays<=0?'var(--red)':'var(--text)';
+      targetWindow.innerHTML='<span style="color:'+wColor+'">'+wText+'</span>';
+    }else{targetRow.style.display='none';}
+
+    /* Reschedule limits (P0) */
+    var rsLimitRow=document.getElementById('rsLimitRow');
+    var rsLimitVal=document.getElementById('rsLimitVal');
+    if(bot.maxReschedules!=null){
+      rsLimitRow.style.display='';
+      var used=bot.rescheduleCount||0;var mx=bot.maxReschedules;var rem=mx-used;
+      var pctU=Math.min(100,Math.round(used/mx*100));
+      var rc=rem<=0?'var(--red)':rem===1?'var(--amber)':'var(--green)';
+      var bar='<span class="limits"><span class="bar" style="max-width:48px"><span class="fill" style="width:'+pctU+'%;background:'+rc+'"></span></span></span>';
+      rsLimitVal.innerHTML='<span style="color:'+rc+';font-size:13px;font-weight:800">'+rem+'</span>'
+        +'<span style="color:var(--muted);font-size:10px"> restante'+(rem!==1?'s':'')+'</span>'
+        +' <span style="color:var(--dim);font-size:9px">('+used+'/'+mx+')</span> '+bar;
+    }else{rsLimitRow.style.display='none';}
+
+    /* Active exclusions (P1) */
+    var exclRow=document.getElementById('exclRow');
+    var excls=bot.excludedDateRanges||[];
+    if(excls.length>0){
+      var today3=new Date().toLocaleDateString('sv-SE',TZ);
+      var actEx=excls.filter(function(e){return e.endDate>=today3;});
+      if(actEx.length>0){
+        exclRow.style.display='';
+        var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">excluidos: </span>';
+        for(var ei=0;ei<Math.min(actEx.length,4);ei++){
+          var ex=actEx[ei];
+          var isNow=ex.startDate<=today3&&ex.endDate>=today3;
+          eh+='<span style="background:rgba(248,113,113,'+(isNow?'.12':'.06')+');color:'+(isNow?'var(--red)':'var(--muted)')+';padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">'+(isNow?'&#9632; ':'')+fmtDs(ex.startDate)+'→'+fmtDs(ex.endDate)+'</span>';
+        }
+        if(actEx.length>4)eh+='<span style="color:var(--dim)">+'+( actEx.length-4)+' más</span>';
+        exclRow.innerHTML=eh;
+      }else{exclRow.style.display='none';}
+    }else{exclRow.style.display='none';}
 
     /* Latest poll */
     if(polls.length>0){
@@ -909,10 +1155,23 @@ async function refresh(){
         be.style.color='var(--text)';
       }
       document.getElementById('lpMs').textContent=lp.responseTimeMs?lp.responseTimeMs+'ms':'--';
+      document.getElementById('lpNode').innerHTML=fmtNode(lp);
       document.getElementById('lpRs').innerHTML=lp.rescheduleResult?badge(lp.rescheduleResult,lp.rescheduleResult==='success'?'success':'fail'):'<span style="color:var(--dim)">--</span>';
+      /* Filtered-out reason (P1) */
+      var lpMR=document.getElementById('lpMotivoRow');
+      if(lp.status==='filtered_out'&&lp.error){
+        lpMR.style.display='';
+        document.getElementById('lpMotivo').textContent=lp.error.substring(0,100);
+      }else{lpMR.style.display='none';}
     }
 
     document.getElementById('cdPhase').textContent=polls.length>0?guessPhase():'--';
+
+    /* Health panel */
+    renderHealth(health);
+
+    /* Proxy pool panel (webshare bots only) */
+    startPoolRefresh(bot.proxyProvider==='webshare');
 
     /* Top 5 */
     var top5List=document.getElementById('top5List');
@@ -955,8 +1214,9 @@ async function refresh(){
         var pRaw=p.rawDatesCount||p.datesCount||0;
         var pFilt=p.datesCount||0;
         var datesCell=pFilt+'/'+pRaw;
-        var srcTag=p.chainId==='cloud'?'<span style="color:var(--cyan);font-size:8px">C</span>':'<span style="color:var(--muted);font-size:8px">D</span>';
-        rows+='<tr><td style="color:var(--muted)">'+fmtTime(p.createdAt)+'</td><td>'+srcTag+'</td><td>'+badge(p.status)+rb+'</td><td>'+datesCell+'</td><td style="'+bc+'">'+best+'</td><td style="color:var(--muted)">'+(p.responseTimeMs||'-')+'</td></tr>';
+        var errTip=p.error&&(p.status==='tcp_blocked'||p.status==='error'||p.status==='soft_ban'||p.status==='econnrefused')?' <span onclick="showMsgOverlay('+JSON.stringify(p.error)+')" style="font-size:8px;color:var(--muted);cursor:pointer;text-decoration:underline dotted">'+escH(p.error.substring(0,40))+(p.error.length>40?'…':'')+'</span>':'';
+        var statusBadge=p.status==='tcp_blocked'?'<span class="b b-tcp_blocked" title="IP bloqueada — retry +30min (45→60min si persiste)">tcp_blocked</span>':badge(p.status);
+        rows+='<tr><td style="color:var(--muted)">'+fmtTime(p.createdAt)+'</td><td>'+fmtNode(p)+'</td><td>'+statusBadge+errTip+rb+'</td><td>'+datesCell+'</td><td style="'+bc+'">'+best+'</td><td style="color:var(--muted)">'+(p.responseTimeMs||'-')+'</td></tr>';
       }
       tb.innerHTML=rows;
     }
@@ -982,7 +1242,7 @@ async function refresh(){
     renderCasChanges(casLogs);
     renderEvents(polls,rss,casLogs);
     lastExclusions=bot.excludedDateRanges||[];
-    calPollList=null;tlData=null;tlSelDate=null;tlDots=[];
+    calPollList=null;tlSelDate=null;tlDots=[];
     var cp=getCalPolls();
     if(cp.length>0&&calIdx<cp.length)autoScrollToEarliestDate(cp[calIdx]);
     renderCalendar();
@@ -1125,6 +1385,150 @@ function drawChart(polls,currentDate,summary,mode){
     var lx=pad.l+cW*i/(xLabels-1);
     ctx.fillText(bogStr,lx,H-pad.b+12);
   }
+}
+
+/* ── Proxy Pool Panel ── */
+// Derived from poll_logs.connectionInfo (cross-process: API server ≠ trigger worker)
+var poolRefreshInterval=null;
+function startPoolRefresh(isWebshare){
+  var card=document.getElementById('proxyPoolCard');
+  if(!isWebshare){card.style.display='none';if(poolRefreshInterval){clearInterval(poolRefreshInterval);poolRefreshInterval=null;}return;}
+  card.style.display='';
+  fetchJ(API+'/bots/'+BID+'/proxy-pool?hours=2').then(renderPool).catch(function(){});
+  if(!poolRefreshInterval)poolRefreshInterval=setInterval(function(){fetchJ(API+'/bots/'+BID+'/proxy-pool?hours=2').then(renderPool).catch(function(){});},15000);
+}
+function renderPool(state){
+  var ppEmpty=document.getElementById('ppEmpty');
+  var ppIps=document.getElementById('ppIps');
+  if(!state||!state.ips||Object.keys(state.ips).length===0){
+    ppEmpty.style.display='';ppIps.innerHTML='';
+    document.getElementById('ppSummary').textContent='sin datos ('+((state&&state.windowHours)||2)+'h)';
+    return;
+  }
+  ppEmpty.style.display='none';
+  var ips=state.ips;
+  var ipKeys=Object.keys(ips).filter(function(k){return k!=='direct';});
+  var healthyCount=ipKeys.filter(function(k){return ips[k].tcpBlockedRate<=10;}).length;
+  var badCount=ipKeys.filter(function(k){return ips[k].tcpBlockedRate>30;}).length;
+  document.getElementById('ppSummary').textContent=
+    'ok: '+healthyCount+'/'+ipKeys.length+' · '+state.totalPolls+' polls/'+state.windowHours+'h'+(badCount?' · '+badCount+' degraded':'');
+
+  var html='';
+  // Sort by tcpBlockedRate descending (worst first)
+  ipKeys.sort(function(a,b){return ips[b].tcpBlockedRate-ips[a].tcpBlockedRate;});
+  for(var i=0;i<ipKeys.length;i++){
+    var ip=ipKeys[i];
+    var h=ips[ip];
+    var wIdx=WEBSHARE_IPS.indexOf(ip);
+    var label=wIdx>=0?'W'+(wIdx+1):ip.split('.').pop();
+    var color=wIdx>=0?(WEBSHARE_COLORS[wIdx]||'#94A3B8'):'var(--text)';
+    var okPct=h.okRate;
+    var barColor=okPct>=90?'var(--green)':okPct>=70?'var(--amber)':'var(--red)';
+    var dotCls=okPct>=90?'closed':okPct>=70?'half_open':'open';
+    var latStr=h.avgLatMs?h.avgLatMs+'ms':'—';
+    var ageSec=h.lastSeen?Math.round((Date.now()-new Date(h.lastSeen).getTime())/1000):null;
+    var ageStr=ageSec===null?'—':ageSec<120?ageSec+'s ago':Math.floor(ageSec/60)+'m ago';
+    html+='<div class="pp-ip-row">';
+    html+='<span class="pp-dot '+dotCls+'"></span>';
+    html+='<span class="pp-ip-name" style="color:'+color+'">'+label+'</span>';
+    html+='<span style="font-size:9px;color:var(--muted)">blk:'+h.tcpBlockedRate+'%</span>';
+    html+='<span style="font-size:9px;color:var(--muted)">'+latStr+'</span>';
+    html+='<span style="font-size:9px;color:var(--dim)">'+h.polls+'p</span>';
+    html+='<div class="pp-bar-wrap"><div class="pp-bar"><div class="pp-bar-fill" style="width:'+okPct+'%;background:'+barColor+'"></div></div></div>';
+    html+='<span class="pp-stat">'+ageStr+'</span>';
+    html+='</div>';
+  }
+  document.getElementById('ppIps').innerHTML=html;
+  document.getElementById('ppEvents').style.display='none';
+}
+
+/* ── Health Panel ── */
+function renderHealth(h){
+  var el=document.getElementById('healthEmpty');
+  var cEl=document.getElementById('healthChains');
+  var aEl=document.getElementById('healthAlerts');
+  var iEl=document.getElementById('healthIps');
+  var rEl=document.getElementById('healthRate');
+  if(!h||!h.chains){
+    el.style.display='';el.textContent='sin datos';cEl.innerHTML='';aEl.innerHTML='';iEl.innerHTML='';rEl.textContent='';return;
+  }
+  el.style.display='none';
+  rEl.textContent=h.ratePerMin+'/min ('+h.totalPolls+' polls, '+h.windowMinutes+'min)';
+
+  // Chains
+  var ch='';
+  var chainNames=Object.keys(h.chains).sort();
+  for(var ci=0;ci<chainNames.length;ci++){
+    var cn=chainNames[ci];
+    var cv=h.chains[cn];
+    var dotColor=cv.pollsPerMin>0?'var(--green)':'var(--red)';
+    var lastAgo=Math.round((Date.now()-new Date(cv.lastPollAt).getTime())/60000);
+    var lastStr=lastAgo<1?'<1m':lastAgo+'m ago';
+    var sts='';
+    var stKeys=Object.keys(cv.statuses);
+    for(var si=0;si<stKeys.length;si++){
+      var sk=stKeys[si];var sv=cv.statuses[sk];
+      var sc=sk==='ok'?'var(--green)':sk==='filtered_out'?'var(--muted)':sk==='tcp_blocked'?'var(--red)':'var(--amber)';
+      var bold=sk==='tcp_blocked'&&sv>0?'font-weight:700;':'';
+      var tip=sk==='tcp_blocked'?(' title="retry +30min · circuit breaker: ≥3/20min → 45min cooldown"'):'';
+      sts+='<span style="color:'+sc+';'+bold+'"'+tip+'>'+sk+':'+sv+'</span> ';
+    }
+    ch+='<div class="hlth-chain">';
+    ch+='<span class="hlth-dot" style="background:'+dotColor+'"></span>';
+    ch+='<span class="hlth-lbl">'+cn+'</span>';
+    ch+='<span class="hlth-stat"><b>'+cv.pollsPerMin+'</b>/min · '+cv.avgLatencyMs+'ms · '+lastStr+'</span>';
+    ch+='<span class="hlth-stat" style="margin-left:auto">'+sts+'</span>';
+    ch+='</div>';
+  }
+  cEl.innerHTML=ch;
+
+  // Alerts
+  var ah='';
+  if(h.alerts&&h.alerts.length>0){
+    for(var ai=0;ai<h.alerts.length;ai++){
+      var al=h.alerts[ai];
+      ah+='<div class="hlth-alert hlth-alert-'+al.severity+'">'+al.message+'</div>';
+    }
+  }
+  aEl.innerHTML=ah;
+
+  // IPs table
+  var ipKeys=Object.keys(h.ips);
+  if(ipKeys.length===0){iEl.innerHTML='';return;}
+  ipKeys.sort(function(a,b){return h.ips[b].polls-h.ips[a].polls;});
+  var it='<table class="hlth-ip-tbl"><thead><tr><th>ip</th><th>chain</th><th>/min</th><th>ms</th><th>ok%</th><th title="tcp_blocked (circuit breaker: ≥3 fallos/20min → pausa 45min)">blk</th></tr></thead><tbody>';
+  for(var ii=0;ii<ipKeys.length;ii++){
+    var ik=ipKeys[ii];
+    var iv=h.ips[ik];
+    var wIdx2=WEBSHARE_IPS.indexOf(ik);
+    var ipLabel;
+    if(iv.chain==='cloud'){
+      ipLabel='<span style="color:#22D3EE;font-weight:700" title="Cloud Direct ('+ik+')">CLD</span>';
+    } else if(wIdx2>=0){
+      var wc2=WEBSHARE_COLORS[wIdx2]||'#94A3B8';
+      ipLabel='<span style="color:'+wc2+';font-weight:700" title="Webshare #'+(wIdx2+1)+' ('+ik+')">W'+(wIdx2+1)+'</span>';
+    } else {
+      ipLabel=IS_WEBSHARE_BOT
+        ?'<span style="color:#94A3B8;font-weight:700" title="Webshare dynamic ('+ik+')">Wsh</span>'
+        :'<span style="color:#FBBF24;font-weight:700" title="RPi Direct ('+ik+')">RPi</span>';
+    }
+    var okPct=iv.successRate;
+    var okColor=okPct>=90?'var(--green)':okPct>=70?'var(--amber)':'var(--red)';
+    var blkCount=iv.tcpBlockedCount||0;
+    var blkRate=iv.tcpBlockedRate||0;
+    var blkColor=blkCount===0?'var(--muted)':blkRate>15?'var(--red)':blkRate>5?'var(--amber)':'var(--dim)';
+    var blkTip=blkCount>=3?'circuit breaker activo (pausa 45min en efecto)':'tcp_blocked: '+blkCount+' polls';
+    it+='<tr>';
+    it+='<td>'+ipLabel+'</td>';
+    it+='<td style="color:var(--muted)">'+iv.chain+'</td>';
+    it+='<td><b>'+iv.pollsPerMin+'</b></td>';
+    it+='<td>'+iv.avgLatencyMs+'</td>';
+    it+='<td><div class="hlth-bar"><div class="hlth-bar-fill" style="width:'+okPct+'%;background:'+okColor+'"></div></div><span style="color:'+okColor+'">'+okPct+'%</span></td>';
+    it+='<td style="color:'+blkColor+'" title="'+blkTip+'">'+blkCount+(blkRate>0?'<span style="color:var(--muted);font-size:8px"> '+blkRate+'%</span>':'')+'</td>';
+    it+='</tr>';
+  }
+  it+='</tbody></table>';
+  iEl.innerHTML=it;
 }
 
 /* ── CAS Heatmap ── */
@@ -1323,6 +1727,23 @@ function renderCasChanges(logs){
 /* ── Events Timeline ── */
 function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
+function showMsgOverlay(msg){
+  var ov=document.getElementById('msgOverlay');
+  if(!ov){
+    ov=document.createElement('div');
+    ov.id='msgOverlay';
+    ov.style.cssText='position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.7);padding:20px;cursor:pointer';
+    ov.onclick=function(){ov.remove()};
+    document.body.appendChild(ov);
+  }
+  ov.innerHTML='<div style="background:var(--card,#1a1a1a);border:1px solid var(--border,#333);border-radius:6px;padding:16px 20px;max-width:560px;width:100%;position:relative" onclick="event.stopPropagation()">'+
+    '<div style="font-size:9px;color:var(--muted,#666);margin-bottom:8px;text-transform:uppercase;letter-spacing:.08em">Mensaje completo</div>'+
+    '<pre style="font-family:monospace;font-size:11px;color:var(--text,#e5e5e5);white-space:pre-wrap;word-break:break-all;margin:0">'+escH(msg)+'</pre>'+
+    '<div style="margin-top:12px;font-size:9px;color:var(--muted,#666);text-align:right">tap fuera para cerrar</div>'+
+    '</div>';
+  if(!document.getElementById('msgOverlay'))document.body.appendChild(ov);
+}
+
 /* ── Event filter state ── */
 var evFilterState={all:true,reschedule:true,error:true,session:true,cas:true};
 var lastEvData=null;
@@ -1391,8 +1812,8 @@ function renderEvents(polls,rss,casLogs){
     /* TCP block */
     if(p.status==='tcp_blocked'||p.status==='econnrefused'){
       events.push({t:p.createdAt,type:'tcp_blocked',cat:'error',label:'TCP BLOCK',
-        sum:escH((p.error||'ECONNREFUSED').substring(0,80)),
-        body:p.error?'<div class="ev-err">'+escH(p.error)+'</div>':''});
+        sum:escH((p.error||'ECONNREFUSED').substring(0,80))+'<span style="color:var(--muted);font-size:8px"> · retry +30m</span>',
+        body:(p.error?'<div class="ev-err">'+escH(p.error)+'</div>':'')+'<div style="font-size:8px;color:var(--muted);margin-top:4px">Backoff: 1°→30min · 2°→45min · 3°+→60min. Circuit breaker: ≥3 en 20min → IP excluida 45min.</div>'});
     }
     /* Generic errors (not already covered) */
     if(p.error&&p.status!=='session_expired'&&p.status!=='tcp_blocked'&&p.status!=='econnrefused'&&p.status!=='soft_ban'&&p.status!=='ok'){
@@ -1530,6 +1951,7 @@ function setCalMode(m){
   calMode=m;
   document.getElementById('calModeBest').className='ct-btn'+(m===0?' ct-on':'');
   document.getElementById('calModeAll').className='ct-btn'+(m===1?' ct-on':'');
+  document.getElementById('calModeFlash').className='ct-btn'+(m===2?' ct-on':'');
   calIdx=0;calPollList=null;
   var list=getCalPolls();
   if(list.length>0)autoScrollToEarliestDate(list[0]);
@@ -1552,6 +1974,39 @@ function getCalPolls(){
     calPollList=[];
     for(var i=0;i<withDates.length;i++){
       if(new Date(withDates[i].createdAt).getTime()>weekAgo)calPollList.push(withDates[i]);
+    }
+    return calPollList;
+  }
+
+  /* Mode "flash": synthetic polls from cancellations events (48h) */
+  if(calMode===2){
+    calPollList=[];
+    if(tlData&&tlData.events){
+      var byDate={};
+      for(var i=0;i<tlData.events.length;i++){
+        var ev=tlData.events[i];
+        if(!byDate[ev.date])byDate[ev.date]={date:ev.date,count:0,firstSeen:ev.time,lastSeen:ev.time,totalDur:0};
+        byDate[ev.date].count++;
+        byDate[ev.date].totalDur+=ev.dur||0;
+        if(ev.time<byDate[ev.date].firstSeen)byDate[ev.date].firstSeen=ev.time;
+        if(ev.time>byDate[ev.date].lastSeen)byDate[ev.date].lastSeen=ev.time;
+      }
+      var sorted=[];for(var k in byDate)sorted.push(byDate[k]);
+      sorted.sort(function(a,b){return a.date<b.date?-1:a.date>b.date?1:0});
+      for(var i=0;i<sorted.length;i++){
+        var fd=sorted[i];
+        calPollList.push({
+          _flash:true,
+          topDates:[fd.date],
+          allDates:[{date:fd.date}],
+          earliestDate:fd.date,
+          datesCount:1,rawDatesCount:fd.count,
+          status:'flash',
+          createdAt:new Date(fd.lastSeen).toISOString(),
+          dateChanges:{appeared:[fd.date],disappeared:[]},
+          _flashMeta:{count:fd.count,totalDur:fd.totalDur,firstSeen:fd.firstSeen,lastSeen:fd.lastSeen}
+        });
+      }
     }
     return calPollList;
   }
@@ -1678,6 +2133,15 @@ function renderCalendar(){
   nextBtn.classList.toggle('dis',calIdx===list.length-1);
 
   /* Poll meta — enriched */
+  if(poll._flash){
+    var fm=poll._flashMeta;
+    var pBest=poll.earliestDate;
+    var daysToBest=daysUntil(pBest);
+    var dateColor=closenessColor(pBest);
+    var avgDur=fm.count>0?Math.round(fm.totalDur/fm.count/1000):0;
+    var lastT=fmtTime(new Date(fm.lastSeen).toISOString());
+    metaEl.innerHTML='<b style="color:'+dateColor+'">'+fmtD(pBest)+'</b> <span style="font-size:9px;color:'+dateColor+'">'+daysToBest+'</span> &middot; '+fm.count+'x visto &middot; dur prom '+avgDur+'s &middot; ultimo: '+lastT+' &middot; <span style="color:var(--cyan);font-size:9px;font-weight:700">FLASH</span>';
+  }else{
   var pTime=fmtTime(poll.createdAt);
   var pDates=poll.allDates?poll.allDates.length:(poll.rawDatesCount||poll.datesCount||0);
   var pFiltered=poll.datesCount||0;
@@ -1694,6 +2158,7 @@ function renderCalendar(){
   var datesLabel=pFiltered!==pDates&&pDates>0?pFiltered+'/'+pDates+' fechas':(pFiltered||pDates)+' fechas';
   var bestLabel=poll.earliestDate?fmtD(pBest):(pBest?fmtD(pBest)+' <span style="font-size:9px;color:var(--muted)">(raw)</span>':'--');
   metaEl.innerHTML='<b>'+pTime+'</b> &middot; '+datesLabel+' &middot; mejor: <b style="color:'+dateColor+'">'+bestLabel+'</b> <span style="font-size:9px;color:'+dateColor+'">'+daysToBest+'</span>'+chgInline+' &middot; '+badge(poll.status);
+  }
 
   /* Build lookup sets — use allDates if available (loaded on-demand), fallback to topDates */
   var availSet={};
@@ -1817,84 +2282,8 @@ function renderCalendar(){
 }
 
 /* ── Cancelaciones scatter ── */
+/* tlData is set from server response (cancellations endpoint) during refresh */
 function buildCancelData(){
-  if(tlData)return tlData;
-  if(!lastPolls||lastPolls.length<2)return null;
-
-  var now=new Date();var bog=new Date(now.toLocaleString('en-US',TZ));
-  var todayMs=new Date(bog.getFullYear(),bog.getMonth(),bog.getDate()).getTime();
-  function daysFr(ds){
-    var q=ds.split('-').map(Number);
-    return Math.round((new Date(q[0],q[1]-1,q[2]).getTime()-todayMs)/864e5);
-  }
-
-  /* Build disappearance lookup: date → [{time, pollIdx}] */
-  var disMap={};
-  for(var i=0;i<lastPolls.length;i++){
-    var p=lastPolls[i];
-    var dc=p.dateChanges;
-    if(!dc||!dc.disappeared||dc.disappeared.length===0)continue;
-    var time=new Date(p.createdAt).getTime();
-    for(var j=0;j<dc.disappeared.length;j++){
-      var dd=dc.disappeared[j];
-      if(!disMap[dd])disMap[dd]=[];
-      disMap[dd].push(time);
-    }
-  }
-  /* Sort each disappearance list ascending */
-  for(var dd in disMap)disMap[dd].sort(function(a,b){return a-b});
-
-  var events=[];
-  var uniq={};
-  var burstMap={};
-
-  for(var i=0;i<lastPolls.length;i++){
-    var p=lastPolls[i];
-    var dc=p.dateChanges;
-    if(!dc||!dc.appeared||dc.appeared.length===0)continue;
-    /* Skip false bursts from soft_ban recovery (>30 dates at once) */
-    if(dc.appeared.length>30)continue;
-    var time=new Date(p.createdAt).getTime();
-    var timeKey=String(time);
-    if(!burstMap[timeKey])burstMap[timeKey]={time:time,count:0,best:99999};
-
-    for(var j=0;j<dc.appeared.length;j++){
-      var date=dc.appeared[j];
-      var days=daysFr(date);
-      /* Find nearest disappearance AFTER this appearance */
-      var goneAt=null,dur=null;
-      var disList=disMap[date];
-      if(disList){
-        for(var k=0;k<disList.length;k++){
-          if(disList[k]>time){goneAt=disList[k];dur=goneAt-time;break}
-        }
-      }
-      events.push({time:time,date:date,days:days,goneAt:goneAt,dur:dur});
-      uniq[date]=true;
-      burstMap[timeKey].count++;
-      if(days<burstMap[timeKey].best)burstMap[timeKey].best=days;
-    }
-  }
-
-  if(events.length===0)return null;
-
-  var tMin=new Date(lastPolls[lastPolls.length-1].createdAt).getTime();
-  var tMax=new Date(lastPolls[0].createdAt).getTime();
-  if(tMin===tMax)tMax=tMin+1;
-
-  /* Top bursts (>1 date) */
-  var bursts=[];
-  for(var k in burstMap){
-    if(burstMap[k].count>1)bursts.push(burstMap[k]);
-  }
-  bursts.sort(function(a,b){return b.count-a.count});
-
-  /* Count close events */
-  var closeCount=0;
-  for(var i=0;i<events.length;i++){if(events[i].days<60)closeCount++}
-
-  tlData={events:events,tMin:tMin,tMax:tMax,bursts:bursts.slice(0,3),
-    totalEvents:events.length,uniqueDates:Object.keys(uniq).length,closeCount:closeCount};
   return tlData;
 }
 
@@ -2133,6 +2522,142 @@ function renderTimelines(){
   html+='</div>';
 
   detEl.innerHTML=html;
+}
+
+/* ── Subscriber refresh ── */
+async function refreshSubscriber(bot){
+  /* Country flag */
+  var cc=bot.locale?bot.locale.split('-')[1]:'';
+  var cm=CMETA[cc];
+  document.getElementById('botFlag').textContent=cm?cm.flag:'';
+  document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — subscriber';
+
+  /* Status chip */
+  var sc=document.getElementById('statusChip');
+  sc.textContent=bot.status;sc.className='chip chip-'+bot.status;
+  renderActions(bot.status);
+
+  /* Hide scout-only strip items */
+  document.getElementById('sesAge').parentElement.style.display='none';
+  document.getElementById('proxyVal').parentElement.style.display='none';
+  document.getElementById('pollSrc').parentElement.style.display='none';
+  /* Hide separators after status chip — keep first one for err */
+  var seps=document.querySelectorAll('.strip .sep');
+  if(seps[0])seps[0].style.display='';
+  for(var si=1;si<seps.length;si++)seps[si].style.display='none';
+  var ec=document.getElementById('errCount');
+  ec.textContent=bot.consecutiveErrors||'0';
+  ec.style.color=bot.consecutiveErrors>0?'var(--red)':'var(--green)';
+
+  /* Countdown phase */
+  document.getElementById('cdPhase').textContent='SUBSCRIBER';
+
+  /* Appointment */
+  var cd2=bot.currentConsularDate;
+  document.getElementById('conDate').innerHTML=fmtD(cd2)+(bot.currentConsularTime?' '+bot.currentConsularTime:'');
+  document.getElementById('conDays').textContent=daysUntil(cd2);
+  var hasCas=bot.ascFacilityId&&bot.ascFacilityId!=='';
+  document.getElementById('casRow').style.display=hasCas?'':'none';
+  if(hasCas){
+    document.getElementById('casDate').innerHTML=fmtD(bot.currentCasDate)+(bot.currentCasTime?' '+bot.currentCasTime:'');
+    document.getElementById('casDays').textContent=daysUntil(bot.currentCasDate);
+  }
+
+  /* Config card */
+  var cfgHtml='';
+  cfgHtml+='<div class="sub-kv"><span class="sub-k">locale</span><span class="sub-v">'+(bot.locale||'es-co')+'</span></div>';
+  cfgHtml+='<div class="sub-kv"><span class="sub-k">facility</span><span class="sub-v">'+(bot.consularFacilityId||'--')+(hasCas?' + ASC '+(bot.ascFacilityId||''):'')+'</span></div>';
+  if(bot.targetDateBefore){
+    cfgHtml+='<div class="sub-kv"><span class="sub-k">target</span><span class="sub-v" style="color:var(--amber)">antes de '+fmtD(bot.targetDateBefore)+'</span></div>';
+  }
+  if(bot.maxReschedules!=null){
+    var pct=Math.min(100,Math.round((bot.rescheduleCount||0)/bot.maxReschedules*100));
+    var barColor=pct>=100?'var(--red)':pct>=50?'var(--amber)':'var(--green)';
+    var atLimit=pct>=100;
+    cfgHtml+='<div class="sub-kv"><span class="sub-k">reschedules</span><span class="sub-v"><span class="sub-limits">'
+      +(bot.rescheduleCount||0)+'/'+bot.maxReschedules
+      +(atLimit?' <span style="color:var(--red);font-size:9px">LIMITE</span>':'')
+      +' <span class="sub-limits-bar"><span class="sub-limits-fill" style="width:'+pct+'%;background:'+barColor+'"></span></span>'
+      +'</span></span></div>';
+  }
+  var exRanges=bot.excludedDateRanges||[];
+  if(exRanges.length>0){
+    var exStr=exRanges.map(function(r){return fmtD(r.startDate)+' - '+fmtD(r.endDate)}).join(', ');
+    cfgHtml+='<div class="sub-kv"><span class="sub-k">exclusiones</span><span class="sub-v" style="font-size:10px;font-weight:400">'+exStr+'</span></div>';
+  }
+  document.getElementById('subConfig').innerHTML=cfgHtml;
+
+  /* Scout status */
+  var scoutEl=document.getElementById('subScout');
+  if(bot.scoutInfo){
+    var si=bot.scoutInfo;
+    var scoutAlive=si.status==='active';
+    var scoutAgo=si.lastPollAt?sesStr(si.lastPollAt):'nunca';
+    var dotColor=scoutAlive?'var(--green)':'var(--red)';
+    var scoutHtml='<div class="sub-scout-status">';
+    scoutHtml+='<span class="sub-scout-dot" style="background:'+dotColor+'"></span>';
+    scoutHtml+='<span style="font-weight:700;color:var(--bright)">Bot #'+si.id+'</span>';
+    scoutHtml+='<span class="chip chip-'+si.status+'" style="font-size:8px">'+si.status+'</span>';
+    scoutHtml+='</div>';
+    scoutHtml+='<div style="font-size:10px;color:var(--muted)">ultimo poll: <span style="color:'+(scoutAlive?'var(--green)':'var(--red)')+'">'+scoutAgo+'</span></div>';
+    scoutEl.innerHTML=scoutHtml;
+  }else{
+    scoutEl.innerHTML='<div style="color:var(--red);font-size:11px">sin scout activo para facility '+(bot.consularFacilityId||'?')+'</div>';
+  }
+
+  /* Fetch subscriber-specific data */
+  var subRes=await Promise.all([
+    fetchJ(API+'/bots/'+BID+'/logs/reschedules?limit=20'),
+    fetchJ(API+'/bots/'+BID+'/logs/dispatches/received?limit=20')
+  ]);
+  var rss=subRes[0],dispatches=subRes[1];
+
+  /* Dispatches */
+  var dEl=document.getElementById('subDispatches');
+  var dEmpty=document.getElementById('subDispEmpty');
+  if(dispatches.length===0){dEl.innerHTML='';dEmpty.style.display=''}
+  else{
+    dEmpty.style.display='none';
+    var dh='';
+    for(var i=0;i<dispatches.length;i++){
+      var dp=dispatches[i];var dt=dp.detail;
+      var resColor=dt.result==='success'?'var(--green)':dt.result==='failed'?'var(--red)':'var(--muted)';
+      var actionLabel=dt.action==='attempted'?(dt.result||'--'):(dt.action||'--');
+      dh+='<div class="sub-disp-item">';
+      dh+='<div style="display:flex;justify-content:space-between;align-items:center">';
+      dh+='<span style="color:var(--bright)">'+fmtTime(dp.createdAt)+'</span>';
+      dh+='<span>'+badge(actionLabel,dt.result==='success'?'success':dt.action==='attempted'?'fail':'filtered_out')+'</span>';
+      dh+='</div>';
+      if(dp.availableDates&&dp.availableDates.length>0){
+        dh+='<div class="sub-disp-dates">fechas: '+dp.availableDates.slice(0,3).map(function(d){return fmtDs(d)}).join(', ')+(dp.availableDates.length>3?' +'+( dp.availableDates.length-3)+' mas':'')+'</div>';
+      }
+      var timingParts=[];
+      if(dt.loginMs)timingParts.push('login '+dt.loginMs+'ms');
+      if(dt.rescheduleMs)timingParts.push('reschedule '+dt.rescheduleMs+'ms');
+      if(dt.newDate)timingParts.push(fmtDs(dt.currentDate)+' → '+fmtDs(dt.newDate));
+      if(dt.failReason)timingParts.push('<span style="color:var(--red)">'+dt.failReason+'</span>');
+      if(timingParts.length>0)dh+='<div class="sub-disp-timing">'+timingParts.join(' · ')+'</div>';
+      dh+='</div>';
+    }
+    dEl.innerHTML=dh;
+  }
+
+  /* Reschedules */
+  var rl=document.getElementById('subReschedules');
+  var re=document.getElementById('subRsEmpty');
+  if(rss.length===0){rl.innerHTML='';re.style.display=''}
+  else{
+    re.style.display='none';
+    var rh='';
+    for(var i=0;i<rss.length;i++){
+      var r=rss[i];var ok=r.success;
+      rh+='<div class="rs-item"><div class="rs-dates">'+fmtDs(r.oldConsularDate)+' '+(r.oldConsularTime||'')+
+        '<span class="rs-arrow">&rarr;</span><span style="color:'+(ok?'var(--green)':'var(--red)')+';font-weight:700">'
+        +fmtDs(r.newConsularDate)+' '+r.newConsularTime+'</span> '+badge(ok?'OK':'FAIL',ok?'success':'fail')+
+        '</div><div class="rs-meta">'+fmt(r.createdAt)+(ok&&r.error?' &mdash; <span style="color:var(--accent)">'+r.error.substring(0,60)+'</span>':!ok&&r.error?' &mdash; <span class="rs-err">'+r.error.substring(0,60)+'</span>':'')+'</div></div>';
+    }
+    rl.innerHTML=rh;
+  }
 }
 
 tickClock();refresh();
