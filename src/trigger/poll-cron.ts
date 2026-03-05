@@ -1,14 +1,15 @@
 import { schedules, logger, runs } from '@trigger.dev/sdk/v3';
 import { db } from '../db/client.js';
 import { bots } from '../db/schema.js';
-import { eq, inArray, and } from 'drizzle-orm';
+import { eq, inArray, and, lte } from 'drizzle-orm';
 import { calculatePriority } from '../services/scheduling.js';
+import { visaPollingPerBotQueue } from './queues.js';
 
 type Source = 'dev' | 'cloud';
 
 /**
  * Trigger poll-visa for all eligible bots that should be polled from this source.
- * Eligible = active/error scouts whose pollEnvironments includes this source.
+ * Eligible = active/error bots whose pollEnvironments includes this source.
  */
 async function triggerEligibleBots(source: Source): Promise<void> {
   // SELECT only columns needed for cron eligibility — omit casCacheJson, creds, etc.
@@ -18,12 +19,7 @@ async function triggerEligibleBots(source: Source): Promise<void> {
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     activatedAt: bots.activatedAt,
   }).from(bots)
-    .where(
-      and(
-        inArray(bots.status, ['active', 'error']),
-        eq(bots.isScout, true),
-      ),
-    );
+    .where(inArray(bots.status, ['active', 'error']));
 
   if (activeBots.length === 0) {
     logger.info(`poll-cron-${source}: no eligible bots`);
@@ -82,9 +78,9 @@ async function triggerEligibleBots(source: Source): Promise<void> {
         {
           botId: bot.id,
           ...(isCloud ? { chainId: 'cloud' as const } : {}),
-          cronTriggered: true,
         },
         {
+          queue: 'visa-polling-per-bot',
           concurrencyKey,
           priority: calculatePriority(bot.activatedAt),
           tags: [`bot:${bot.id}`, ...(isCloud ? ['cloud'] : []), 'cron'],
@@ -109,6 +105,41 @@ async function triggerEligibleBots(source: Source): Promise<void> {
         botId: bot.id,
         error: e instanceof Error ? e.message : String(e),
       });
+    }
+  }
+
+  // Auto-retry bots stuck in login_required (transient network failures, e.g. RPi offline)
+  const stuckBots = await db.select({
+    id: bots.id,
+    pollEnvironments: bots.pollEnvironments,
+    updatedAt: bots.updatedAt,
+  }).from(bots)
+    .where(and(
+      eq(bots.status, 'login_required'),
+      lte(bots.updatedAt, new Date(Date.now() - 5 * 60_000)),
+    ));
+
+  if (stuckBots.length > 0) {
+    const { loginVisaTask } = await import('./login-visa.js');
+    for (const bot of stuckBots) {
+      const envs = (bot.pollEnvironments as string[] | null) ?? ['dev'];
+      const chainId = envs.includes('dev') ? 'dev' : 'cloud';
+      try {
+        await loginVisaTask.trigger(
+          { botId: bot.id, chainId: chainId as 'dev' | 'cloud' },
+          {
+            idempotencyKey: `login-retry-${bot.id}-${Math.floor(Date.now() / 300_000)}`,
+            tags: [`bot:${bot.id}`, 'login-retry'],
+          },
+        );
+        logger.info('poll-cron: triggered login-retry for stuck bot', {
+          botId: bot.id, chainId, stuckMinutes: Math.round((Date.now() - bot.updatedAt.getTime()) / 60_000),
+        });
+      } catch (e) {
+        logger.error('poll-cron: failed to trigger login-retry', {
+          botId: bot.id, error: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   }
 }

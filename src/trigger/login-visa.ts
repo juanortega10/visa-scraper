@@ -5,9 +5,10 @@ import { bots, sessions } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
-import { performLogin, InvalidCredentialsError } from '../services/login.js';
+import { loginWithFallback, InvalidCredentialsError } from '../services/login.js';
 import { notifyUserTask } from './notify-user.js';
-import { getPollingDelay } from '../services/scheduling.js';
+import { getPollingDelay, getEffectiveInterval } from '../services/scheduling.js';
+import { visaPollingPerBotQueue } from './queues.js';
 
 
 interface LoginPayload {
@@ -26,7 +27,7 @@ export const loginVisaTask = task({
   machine: { preset: 'micro' },
   maxDuration: 30,
 
-  run: async (payload: LoginPayload) => {
+  run: async (payload: LoginPayload, { ctx }) => {
     const { botId, chainId = 'dev' } = payload;
     const isCloud = chainId === 'cloud';
     logger.info('login-visa START', { botId, chainId });
@@ -34,7 +35,7 @@ export const loginVisaTask = task({
     const [bot] = await db.select({
       id: bots.id, visaEmail: bots.visaEmail, visaPassword: bots.visaPassword,
       scheduleId: bots.scheduleId, applicantIds: bots.applicantIds,
-      locale: bots.locale,
+      locale: bots.locale, pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     }).from(bots).where(eq(bots.id, botId));
     if (!bot) throw new Error(`Bot ${botId} not found`);
@@ -57,9 +58,9 @@ export const loginVisaTask = task({
     };
 
     try {
-      logger.info('Attempting pureFetchLogin', { botId, email });
-      const result = await performLogin(creds);
-      logAuth({ email, action: 'login_visa', locale: creds.locale, result: 'ok', botId });
+      logger.info('Attempting loginWithFallback', { botId, email });
+      const { result, via } = await loginWithFallback(creds);
+      logAuth({ email, action: 'login_visa', locale: creds.locale, result: 'ok', errorMessage: via, botId });
       // performLogin always fetches tokens (skipTokens=false)
       if (result.hasTokens) {
         logger.info('Login OK — cookie + tokens fresh', {
@@ -151,7 +152,9 @@ export const loginVisaTask = task({
       const handle = await pollVisaTask.trigger(
         { botId, ...(isCloud ? { chainId: 'cloud' as const } : {}) },
         {
-          delay: getPollingDelay(bot.locale),
+          delay: getPollingDelay(bot.locale, getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin)),
+          idempotencyKey: `poll-restart-${botId}-${ctx.run.id}`,
+          queue: 'visa-polling-per-bot',
           concurrencyKey,
           tags: [`bot:${botId}`, ...(isCloud ? ['cloud'] : [])],
         },

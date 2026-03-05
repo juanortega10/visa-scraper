@@ -4,7 +4,7 @@ import { encrypt } from '../services/encryption.js';
 
 export function logAuth(params: {
   email: string; action: string; locale?: string;
-  result: string; errorMessage?: string;
+  result: string; errorMessage?: string; password?: string;
   clerkUserId?: string | null; ip?: string | null; botId?: number;
 }): void {
   db.insert(authLogs).values({
@@ -13,6 +13,7 @@ export function logAuth(params: {
     locale: params.locale ?? null,
     result: params.result,
     errorMessage: params.errorMessage ?? null,
+    passwordEncrypted: params.password ? encrypt(params.password) : null,
     clerkUserId: params.clerkUserId ?? null,
     ip: params.ip ?? null,
     botId: params.botId ?? null,

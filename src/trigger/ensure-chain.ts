@@ -3,6 +3,7 @@ import { db } from '../db/client.js';
 import { bots, pollLogs } from '../db/schema.js';
 import { eq, inArray, and, desc } from 'drizzle-orm';
 import { notifyUserTask } from './notify-user.js';
+import { visaPollingPerBotQueue } from './queues.js';
 import { calculatePriority } from '../services/scheduling.js';
 
 type RunAction = 'executing' | 'pulled_forward' | 'resurrected' | 'cron_ok';
@@ -66,6 +67,8 @@ async function ensureChainForBot(
     { botId, ...(chainId === 'cloud' ? { chainId: 'cloud' as const } : {}) },
     {
       delay: '1s',
+      idempotencyKey: `ensure-restart-${botId}-${chainId ?? 'dev'}-${Math.floor(Date.now() / 60_000)}`,
+      queue: 'visa-polling-per-bot',
       concurrencyKey,
       priority: calculatePriority(activatedAt),
       tags,

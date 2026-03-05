@@ -112,10 +112,21 @@ interface PrefetchBot {
   casCacheJson: CasCacheData | null;
 }
 
-async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
+export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
   const botId = bot.id;
   const startMs = Date.now();
+  let requestCount = 0; // declare early so logAndReturn can capture it
   logger.info('prefetch-cas bot START', { botId });
+
+  /** Write a failure log entry and return the result. */
+  const logAndReturn = async (reason: string): Promise<PrefetchResult> => {
+    const durationMs = Date.now() - startMs;
+    await db.insert(casPrefetchLogs).values({
+      botId, totalDates: 0, fullDates: 0, lowDates: 0,
+      durationMs, requestCount, error: reason,
+    }).catch((e) => logger.warn('Failed to write prefetch failure log', { botId, error: String(e) }));
+    return { updated: false, reason };
+  };
 
   // Dedup: skip if cache was refreshed recently (another run or manual trigger)
   const existingCache = bot.casCacheJson as CasCacheData | null;
@@ -123,7 +134,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
     const cacheAgeMin = (Date.now() - new Date(existingCache.refreshedAt).getTime()) / 60000;
     if (cacheAgeMin < 10) {
       logger.info('Cache fresh, skipping', { botId, cacheAgeMin: Math.round(cacheAgeMin) });
-      return { updated: true }; // cache is fine, no alert needed
+      return { updated: true }; // cache is fine, no alert needed — don't log as failure
     }
   }
 
@@ -135,7 +146,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
   }).from(sessions).where(eq(sessions.botId, botId));
   if (!session) {
     logger.warn('No session, skipping', { botId });
-    return { updated: false, reason: 'no_session' };
+    return logAndReturn('no_session');
   }
 
   let cookie: string;
@@ -143,7 +154,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
     cookie = decrypt(session.yatriCookie);
   } catch (e) {
     logger.error('Failed to decrypt session', { botId, error: String(e) });
-    return { updated: false, reason: 'decrypt_failed' };
+    return logAndReturn('decrypt_failed');
   }
 
   // Pre-emptive re-login: if session > 44 min, login inline from cloud
@@ -158,7 +169,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
         password = decrypt(bot.visaPassword);
       } catch (e) {
         logger.error('Failed to decrypt credentials', { botId, error: String(e) });
-        return { updated: false, reason: 'decrypt_creds_failed' };
+        return logAndReturn('decrypt_creds_failed');
       }
 
       const creds = {
@@ -191,7 +202,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
     } catch (e) {
       if (e instanceof InvalidCredentialsError) {
         logger.error('Invalid credentials during prefetch re-login', { botId });
-        return { updated: false, reason: 'invalid_credentials' };
+        return logAndReturn('invalid_credentials');
       }
       logger.warn('Inline re-login failed, continuing with existing session', {
         botId,
@@ -213,7 +224,8 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
       applicantIds: bot.applicantIds,
       consularFacilityId: bot.consularFacilityId,
       ascFacilityId: bot.ascFacilityId,
-      proxyProvider: (bot.proxyProvider as import('../services/proxy-fetch.js').ProxyProvider) || 'direct',
+      // prefetch-cas always runs from cloud — force direct regardless of bot config
+      proxyProvider: 'direct',
       userId: bot.userId,
       locale: bot.locale,
     },
@@ -225,7 +237,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
   const MAX_REQUESTS = 45;
 
   const entries: CasCacheEntry[] = [];
-  let requestCount = 0;
+  // requestCount declared at top of function (needed by logAndReturn)
   let errorCount = 0;
   const failedProbes: string[] = [];
   const failedTimeFetches: string[] = [];
@@ -238,10 +250,11 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
   } catch (err) {
     if (err instanceof SessionExpiredError) {
       logger.error('Session expired fetching consular days', { botId });
-      return { updated: false, reason: 'session_expired' };
+      return logAndReturn('session_expired');
     }
-    logger.error('Failed to fetch consular days', { botId, error: String(err) });
-    return { updated: false, reason: `fetch_error: ${err instanceof Error ? err.message : String(err)}` };
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error('Failed to fetch consular days', { botId, error: errMsg });
+    return logAndReturn(`fetch_error: ${errMsg}`);
   }
 
   logger.info('Consular days', { botId, total: consularDays.length, first: consularDays[0]?.date });
@@ -260,7 +273,7 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
       requestCount++;
       if (err instanceof SessionExpiredError) {
         logger.error('Session expired fetching consular times', { botId });
-        return { updated: false, reason: 'session_expired' };
+        return logAndReturn('session_expired_times');
       }
       logger.warn('getConsularTimes failed', { botId, date: cd.date, error: String(err) });
     }
@@ -268,8 +281,8 @@ async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
   }
 
   if (!sampleTime) {
-    logger.warn('No consular times available, aborting', { botId });
-    return { updated: false, reason: 'no_consular_times' };
+    logger.warn('No consular times available, aborting', { botId, consularDaysCount: consularDays.length });
+    return logAndReturn('no_consular_times');
   }
 
   // -- Phase 2: Generate probe dates for CAS discovery --
