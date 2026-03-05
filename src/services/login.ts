@@ -1,6 +1,8 @@
-import { USER_AGENT, getBaseUrl, getLocaleTexts } from '../utils/constants.js';
+import { ProxyAgent } from 'undici';
+import { USER_AGENT, BROWSER_HEADERS, getBaseUrl, getLocaleTexts } from '../utils/constants.js';
 import type { VisaSession } from './visa-client.js';
 import { logAuth } from '../utils/auth-logger.js';
+import { getEffectiveWebshareUrls } from './proxy-fetch.js';
 import {
   extractScheduleId,
   extractApplicantIdsFromGroups,
@@ -8,7 +10,9 @@ import {
   extractApplicantNames,
   extractAppointments,
   extractFacilityIds,
+  extractGroups,
 } from './html-parsers.js';
+export type { GroupInfo as GroupResult } from './html-parsers.js';
 
 export interface LoginCredentials {
   email: string;
@@ -35,6 +39,8 @@ interface PureFetchLoginOptions {
   skipTokens?: boolean;
   /** Which sign_in page to use for initial cookie. IV is less trafficked. */
   visaType?: 'iv' | 'niv';
+  /** Optional proxy URL (e.g. webshare) — routes all fetch calls through this proxy */
+  proxyUrl?: string;
 }
 
 /**
@@ -50,20 +56,26 @@ export async function pureFetchLogin(
   creds: LoginCredentials,
   opts: PureFetchLoginOptions = {},
 ): Promise<LoginResult> {
-  const { skipTokens = false, visaType = 'iv' } = opts;
+  const { skipTokens = false, visaType = 'iv', proxyUrl } = opts;
   const locale = creds.locale ?? 'es-co';
   const nivBaseUrl = getBaseUrl(locale);
   const texts = getLocaleTexts(locale);
   const cookieSourceUrl = `https://ais.usvisa-info.com/${locale}/${visaType}/users/sign_in`;
   const nivSignInUrl = `${nivBaseUrl}/users/sign_in`;
+  const dispatcher = proxyUrl
+    ? new ProxyAgent({ uri: proxyUrl, connectTimeout: 10_000, headersTimeout: 12_000 })
+    : undefined;
 
   // Step 1: GET sign_in page to get _yatri_session cookie + CSRF
   const getResp = await fetch(cookieSourceUrl, {
     headers: {
       'User-Agent': USER_AGENT,
-      'Accept': 'text/html',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      ...BROWSER_HEADERS,
     },
     redirect: 'follow',
+    // @ts-expect-error undici dispatcher
+    ...(dispatcher ? { dispatcher } : {}),
   });
 
   if (!getResp.ok) {
@@ -106,6 +118,7 @@ export async function pureFetchLogin(
       'User-Agent': USER_AGENT,
       'X-CSRF-Token': initialCsrf,
       'X-Requested-With': 'XMLHttpRequest',
+      ...BROWSER_HEADERS,
     },
     body: new URLSearchParams({
       'user[email]': creds.email,
@@ -114,6 +127,8 @@ export async function pureFetchLogin(
       'commit': commitText,
     }).toString(),
     redirect: 'manual',
+    // @ts-expect-error undici dispatcher
+    ...(dispatcher ? { dispatcher } : {}),
   });
 
   // Check for invalid credentials
@@ -165,8 +180,11 @@ export async function pureFetchLogin(
         'User-Agent': USER_AGENT,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Upgrade-Insecure-Requests': '1',
+        ...BROWSER_HEADERS,
       },
       redirect: 'manual',
+      // @ts-expect-error undici dispatcher
+      ...(dispatcher ? { dispatcher } : {}),
     });
   } catch (fetchErr) {
     const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -226,6 +244,7 @@ export interface DiscoverResult {
   ascFacilityId: string;
   collectsBiometrics: boolean;
   cookie: string;
+  groups: import('./html-parsers.js').GroupInfo[];
 }
 
 /**
@@ -241,13 +260,18 @@ export async function discoverAccount(
   email: string,
   password: string,
   locale: string = 'es-co',
+  opts: { proxyUrl?: string } = {},
 ): Promise<DiscoverResult> {
   const baseUrl = getBaseUrl(locale);
+  const { proxyUrl } = opts;
+  const dispatcher = proxyUrl
+    ? new ProxyAgent({ uri: proxyUrl, connectTimeout: 10_000, headersTimeout: 12_000 })
+    : undefined;
 
   // Step 1: Login via pureFetchLogin (skipTokens) — we only need the cookie
   const loginResult = await pureFetchLogin(
     { email, password, scheduleId: '', applicantIds: [], locale },
-    { skipTokens: true },
+    { skipTokens: true, proxyUrl },
   );
   let cookie = loginResult.cookie;
 
@@ -263,6 +287,8 @@ export async function discoverAccount(
   const accountResp = await fetch(accountUrl, {
     headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
     redirect: 'follow',
+    // @ts-expect-error undici dispatcher
+    ...(dispatcher ? { dispatcher } : {}),
   });
   if (accountResp.status !== 200) throw new Error(`Account page returned HTTP ${accountResp.status}`);
   updateCookie(accountResp);
@@ -280,7 +306,10 @@ export async function discoverAccount(
   const scheduleId = extractScheduleId(groupsHtml);
   if (!scheduleId) throw new Error('Could not find scheduleId in groups page');
 
-  // Extract current appointments
+  // Extract all groups (multi-schedule accounts have one group per applicant/family unit)
+  const groups = extractGroups(groupsHtml);
+
+  // Extract current appointments (primary group — first in page)
   const { currentConsularDate, currentConsularTime, currentCasDate, currentCasTime } = extractAppointments(groupsHtml);
 
   // Pre-extract applicant IDs from groups page (needed in appointment URL)
@@ -302,6 +331,8 @@ export async function discoverAccount(
   const apptResp = await fetch(appointmentUrl, {
     headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
     redirect: 'follow',
+    // @ts-expect-error undici dispatcher
+    ...(dispatcher ? { dispatcher } : {}),
   });
   updateCookie(apptResp);
 
@@ -324,13 +355,15 @@ export async function discoverAccount(
     try {
       const fullLogin = await pureFetchLogin(
         { email, password, scheduleId, applicantIds: [], locale },
-        { skipTokens: false },
+        { skipTokens: false, proxyUrl },
       );
       cookie = fullLogin.cookie;
 
       const retryResp = await fetch(appointmentUrl, {
         headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
         redirect: 'follow',
+        // @ts-expect-error undici dispatcher
+        ...(dispatcher ? { dispatcher } : {}),
       });
       updateCookie(retryResp);
 
@@ -376,6 +409,7 @@ export async function discoverAccount(
     ascFacilityId,
     collectsBiometrics,
     cookie,
+    groups,
   };
 }
 
@@ -399,4 +433,80 @@ export async function performLogin(creds: LoginCredentials): Promise<LoginResult
   const result = await pureFetchLogin(creds, { visaType: 'niv' });
   console.log(`[login] NIV succeeded — cookie=${result.cookie.length}chars hasTokens=${result.hasTokens} csrf=${result.csrfToken?.substring(0, 10) || '(none)'}`);
   return result;
+}
+
+function classifyLoginError(e: unknown): string {
+  if (!(e instanceof Error)) return `unknown:${String(e)}`;
+  const msg = e.message ?? '';
+  const cause = e.cause instanceof Error ? e.cause.message : String(e.cause ?? '');
+  if (cause.includes('other side closed') || cause.includes('bytesRead: 0')) return 'embassy_tcp_block';
+  if (cause.includes('ECONNREFUSED') || cause.includes('Request was cancelled') || msg.includes('Request was cancelled')) return 'proxy_unreachable';
+  if (cause.includes('AggregateError') || cause.includes('getaddrinfo')) return 'dns_or_all_failed';
+  if (cause.includes('ETIMEDOUT') || cause.includes('connect timeout') || cause.includes('headersTimeout')) return 'timeout';
+  return 'network';
+}
+
+/**
+ * performLogin with Webshare fallback.
+ * On network error (not InvalidCredentialsError), tries up to 4 Webshare IPs.
+ * Returns { result, via } where via is a compact attempt chain (e.g. "direct:ok",
+ * "direct[dns_or_all_failed] → ws:64.137.96.74[ok]"). Suitable for logging.
+ */
+export async function loginWithFallback(
+  creds: LoginCredentials,
+): Promise<{ result: LoginResult; via: string }> {
+  const attempts: string[] = [];
+
+  try {
+    const result = await performLogin(creds);
+    return { result, via: 'direct:ok' };
+  } catch (e) {
+    if (e instanceof InvalidCredentialsError) throw e;
+    const label = classifyLoginError(e);
+    attempts.push(`direct[${label}]`);
+    console.warn(`[login] Direct failed [${label}]: ${e instanceof Error ? e.message : e}`);
+  }
+
+  let webshareUrls: string[];
+  try {
+    webshareUrls = await getEffectiveWebshareUrls();
+  } catch (apiErr) {
+    const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+    console.warn(`[login] Webshare API load failed: ${msg}`);
+    attempts.push(`ws_api_error[${msg}]`);
+    throw new Error(attempts.join(' → '));
+  }
+  if (webshareUrls.length === 0) {
+    attempts.push('ws_no_ips');
+    throw new Error(attempts.join(' → '));
+  }
+
+  const candidates = webshareUrls.slice(0, 4);
+  const ips = candidates.map(u => { try { return new URL(u).hostname; } catch { return u; } });
+  console.log(`[login] Webshare fallback — trying: ${ips.join(', ')}`);
+
+  let lastRawErr: unknown;
+  for (let i = 0; i < candidates.length; i++) {
+    const proxyUrl = candidates[i];
+    const ip = ips[i];
+    try {
+      console.log(`[login] → ws:${ip}`);
+      const result = await pureFetchLogin(creds, { proxyUrl });
+      attempts.push(`ws:${ip}[ok]`);
+      console.log(`[login] ✓ ws:${ip} succeeded`);
+      return { result, via: attempts.join(' → ') };
+    } catch (e2) {
+      if (e2 instanceof InvalidCredentialsError) throw e2;
+      const label = classifyLoginError(e2);
+      attempts.push(`ws:${ip}[${label}]`);
+      console.warn(`[login] ✗ ws:${ip} [${label}]: ${e2 instanceof Error ? e2.message : e2}`);
+      lastRawErr = e2;
+    }
+  }
+
+  const chain = attempts.join(' → ');
+  console.warn(`[login] All attempts failed: ${chain}`);
+  const err = new Error(chain);
+  if (lastRawErr instanceof Error) err.cause = lastRawErr.cause;
+  throw err;
 }
