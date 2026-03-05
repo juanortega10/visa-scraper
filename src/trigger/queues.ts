@@ -5,9 +5,21 @@ export const visaPollingQueue = queue({
   concurrencyLimit: 10,
 });
 
+/** Per-bot polling queue: concurrencyLimit=1 so each concurrencyKey (poll-{botId}) runs 1 at a time. */
+export const visaPollingPerBotQueue = queue({
+  name: 'visa-polling-per-bot',
+  concurrencyLimit: 1,
+});
+
 export const visaRescheduleQueue = queue({
   name: 'visa-reschedule',
   concurrencyLimit: 3,
+});
+
+/** Per-bot reschedule queue: serializes reschedules per bot (concurrencyKey = reschedule-{botId}). */
+export const visaReschedulePerBotQueue = queue({
+  name: 'visa-reschedule-per-bot',
+  concurrencyLimit: 1,
 });
 
 export const visaLoginQueue = queue({

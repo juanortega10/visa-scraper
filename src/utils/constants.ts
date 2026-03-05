@@ -32,8 +32,6 @@ export const BROWSER_HEADERS: Record<string, string> = {
   'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
 };
 
-/** Max scouts (isScout=true) allowed per facility. Enforced at bot creation + set-bot-role. */
-export const MAX_SCOUTS_PER_FACILITY = 1;
 
 export const FACILITY = {
   BOGOTA_CONSULAR: '25',

@@ -1,15 +1,25 @@
-/** Default polling interval outside drop windows (20s).
+/** Default polling interval (9s). Universal — no per-phase overrides.
  * Exp 9 confirmed 20/min/IP on days.json with zero blocks.
- * With 3 Webshare IPs + dual-env = ~0.5/min/IP — well within safe limits. */
-export const DEFAULT_POLL_INTERVAL_S = 20;
+ * 9s → ~7 fetches/min target (well within 20/min/IP limit). */
+export const DEFAULT_POLL_INTERVAL_S = 9;
 
-/** Per-locale override for the normal polling interval. */
-const LOCALE_POLL_INTERVALS: Record<string, number> = {
-  'es-pe': 10,
-};
+/** Per-locale override for the normal polling interval. Empty by default — all locales use 10s. */
+const LOCALE_POLL_INTERVALS: Record<string, number> = {};
 
-export function getNormalInterval(locale?: string): number {
+export function getNormalInterval(locale?: string, override?: number): number {
+  if (override != null && override > 0) return override;
   return LOCALE_POLL_INTERVALS[locale ?? ''] ?? DEFAULT_POLL_INTERVAL_S;
+}
+
+/**
+ * Resolves the effective poll interval seconds, giving priority to:
+ * 1. targetPollsPerMin (raw conversion: 60/rate)
+ * 2. pollIntervalSeconds (direct override)
+ * 3. locale default (DEFAULT_POLL_INTERVAL_S)
+ */
+export function getEffectiveInterval(locale?: string, pollIntervalSeconds?: number | null, targetPollsPerMin?: number | null): number {
+  if (targetPollsPerMin != null && targetPollsPerMin > 0) return Math.max(2, Math.round(60 / targetPollsPerMin));
+  return getNormalInterval(locale, pollIntervalSeconds ?? undefined);
 }
 
 // ── Drop schedule per locale ──────────────────────────────────
@@ -37,74 +47,11 @@ function toLocalDate(timezone: string, date: Date = new Date()): Date {
 }
 
 /** Minutes since midnight in the locale's timezone. */
-function localMinutes(timezone: string): { day: number; t: number; secondsInDay: number } {
+function localMinutes(timezone: string): { day: number; t: number } {
   const d = toLocalDate(timezone);
   const day = d.getDay();
   const t = d.getHours() * 60 + d.getMinutes();
-  const secondsInDay = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
-  return { day, t, secondsInDay };
-}
-
-// ── Phase computation ──────────────────────────────────────────
-
-/**
- * Budget-aware polling schedule anchored to the locale's drop time.
- *
- * Windows are relative to drop time (D):
- *   D - 4h  → D - 10m  : early (10 min interval)
- *   D - 10m → D - 2m   : pre-warm (30s)
- *   D - 2m  → D + 8m   : super-critical (1s, continuous loop)
- *   D + 8m  → D + 60m  : burst (10s)
- *   D + 60m → D + 2h   : tail (5 min)
- *   rest                : normal (1.5 min)
- *
- * All intervals include ±5% jitter except super-critical.
- */
-export function getCurrentPhase(locale?: string): { seconds: number; label: string; phase: string } {
-  const drop = getDropSchedule(locale);
-  const { day, t } = localMinutes(drop.timezone);
-
-  if (day === drop.day) {
-    const dropMin = drop.hour * 60 + drop.minute;
-    const rel = t - dropMin; // minutes relative to drop
-
-    if (rel >= -2  && rel < 8)   return { seconds: 1,   label: '1s',  phase: 'super-critical' };
-    if (rel >= 8   && rel < 60)  return { seconds: 10,  label: '10s', phase: 'burst' };
-    if (rel >= -10 && rel < -2)  return { seconds: 30,  label: '30s', phase: 'pre-warm' };
-    if (rel >= 60  && rel < 120) return { seconds: 300, label: '5m',  phase: 'tail' };
-    if (rel >= -240 && rel < -10) return { seconds: 600, label: '10m', phase: 'early' };
-  }
-
-  const normalSeconds = getNormalInterval(locale);
-  const normalLabel = normalSeconds >= 60 ? `${(normalSeconds / 60).toFixed(1).replace(/\.0$/, '')}m` : `${normalSeconds}s`;
-  return { seconds: normalSeconds, label: normalLabel, phase: 'normal' };
-}
-
-export function getPollingDelay(locale?: string, healthyIpsCount?: number): string {
-  const { seconds, phase } = getCurrentPhase(locale);
-  if (phase === 'super-critical') return '1s';
-  if (phase !== 'normal' || !healthyIpsCount || healthyIpsCount <= 1) return jitter(seconds);
-  // Floor: 2s (webshare rotates IPs so per-IP rate stays well under 20/min/IP even at 2s)
-  const MIN_INTERVAL_SECONDS = 2;
-  const dynamicSeconds = Math.max(MIN_INTERVAL_SECONDS, Math.ceil(seconds / healthyIpsCount));
-  return jitter(dynamicSeconds);
-}
-
-/** Adds ±5% jitter to a base delay in seconds, returns Trigger.dev delay string. */
-function jitter(baseSeconds: number): string {
-  const factor = 0.95 + Math.random() * 0.1; // 0.95–1.05
-  const seconds = Math.round(baseSeconds * factor);
-  return `${seconds}s`;
-}
-
-/** Returns true during the burst window (drop - 2min → drop + 60min). */
-export function isInBurstWindow(locale?: string): boolean {
-  const drop = getDropSchedule(locale);
-  const { day, t } = localMinutes(drop.timezone);
-  if (day !== drop.day) return false;
-  const dropMin = drop.hour * 60 + drop.minute;
-  const rel = t - dropMin;
-  return rel >= -2 && rel < 60;
+  return { day, t };
 }
 
 /** Returns true during the super-critical window (drop - 2min → drop + 8min). */
@@ -118,31 +65,21 @@ export function isInSuperCriticalWindow(locale?: string): boolean {
 }
 
 /**
- * Returns ms to wait until the exact drop second.
- * Active within 30s before the drop. Returns 0 outside the sniper window.
+ * Resolves the self-trigger delay between runs.
+ * override: effective interval in seconds (from getEffectiveInterval or bot.pollIntervalSeconds).
+ * Falls back to LOCALE_POLL_INTERVALS lookup → DEFAULT_POLL_INTERVAL_S.
  */
-export function getSniperWaitMs(locale?: string): number {
-  const drop = getDropSchedule(locale);
-  const { day, secondsInDay } = localMinutes(drop.timezone);
-  if (day !== drop.day) return 0;
-  const dropSeconds = drop.hour * 3600 + drop.minute * 60;
-  if (secondsInDay >= dropSeconds - 30 && secondsInDay < dropSeconds) {
-    return (dropSeconds - secondsInDay) * 1000;
-  }
-  return 0;
+export function getPollingDelay(locale?: string, override?: number): string {
+  if (override != null && override > 0) return jitter(override);
+  const base = LOCALE_POLL_INTERVALS[locale ?? ''] ?? DEFAULT_POLL_INTERVAL_S;
+  return jitter(base);
 }
 
-/**
- * Returns true during pre-drop warmup (drop - 4min → drop - 2min).
- * Forces a session refresh to guarantee fresh session for super-critical.
- */
-export function isPreDropWarmup(locale?: string): boolean {
-  const drop = getDropSchedule(locale);
-  const { day, t } = localMinutes(drop.timezone);
-  if (day !== drop.day) return false;
-  const dropMin = drop.hour * 60 + drop.minute;
-  const rel = t - dropMin;
-  return rel >= -4 && rel < -2;
+/** Adds ±5% jitter to a base delay in seconds, returns Trigger.dev delay string. */
+function jitter(baseSeconds: number): string {
+  const factor = 0.95 + Math.random() * 0.1; // 0.95–1.05
+  const seconds = Math.round(baseSeconds * factor);
+  return `${seconds}s`;
 }
 
 /**
