@@ -1,5 +1,5 @@
 import { task, logger } from '@trigger.dev/sdk/v3';
-import { visaRescheduleQueue } from './queues.js';
+import { visaReschedulePerBotQueue } from './queues.js';
 import { db } from '../db/client.js';
 import { bots, sessions, excludedDates, excludedTimes } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
@@ -16,7 +16,7 @@ interface ReschedulePayload {
 
 export const rescheduleVisaTask = task({
   id: 'reschedule-visa',
-  queue: visaRescheduleQueue,
+  queue: visaReschedulePerBotQueue,
   machine: { preset: 'micro' },
   maxDuration: 120,
   retry: { maxAttempts: 2 },
@@ -37,14 +37,6 @@ export const rescheduleVisaTask = task({
     }).from(bots).where(eq(bots.id, botId));
     if (!bot) throw new Error(`Bot ${botId} not found`);
     logger.info('Bot loaded', { botId, locale: bot.locale, consularFacility: bot.consularFacilityId, ascFacility: bot.ascFacilityId });
-
-    // Guard: respect maxReschedules limit (critical for Peru with max=2)
-    if (bot.maxReschedules != null && bot.rescheduleCount >= bot.maxReschedules) {
-      logger.warn('Reschedule BLOCKED — max reschedule limit reached', {
-        botId, rescheduleCount: bot.rescheduleCount, maxReschedules: bot.maxReschedules,
-      });
-      return { success: false, reason: 'max_reschedules_reached' };
-    }
 
     const [session] = await db.select({
       yatriCookie: sessions.yatriCookie,

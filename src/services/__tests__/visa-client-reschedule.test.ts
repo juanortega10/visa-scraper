@@ -6,8 +6,13 @@ import { join } from 'path';
 
 const mockProxyFetch = vi.fn();
 
+const DEFAULT_META = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0 };
+
 vi.mock('../proxy-fetch.js', () => ({
-  proxyFetch: (...args: any[]) => mockProxyFetch(...args),
+  proxyFetch: async (...args: any[]) => {
+    const result = await mockProxyFetch(...args);
+    return result instanceof Response ? { response: result, meta: DEFAULT_META } : result;
+  },
 }));
 
 vi.mock('../html-parsers.js', async () => {

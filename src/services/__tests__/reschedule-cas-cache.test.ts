@@ -38,6 +38,10 @@ vi.mock('../../db/schema.js', () => ({
 vi.mock('drizzle-orm', () => ({
   eq: (...args: any[]) => ({ _op: 'eq', args }),
   sql: (strings: TemplateStringsArray, ...vals: any[]) => `sql:${strings.join('')}`,
+  or: (...args: any[]) => ({ _op: 'or', args }),
+  lt: (...args: any[]) => ({ _op: 'lt', args }),
+  isNull: (...args: any[]) => ({ _op: 'isNull', args }),
+  and: (...args: any[]) => ({ _op: 'and', args }),
 }));
 
 vi.mock('@trigger.dev/sdk/v3', () => ({
@@ -64,6 +68,7 @@ function makeClient(overrides: Record<string, any> = {}) {
     getCurrentAppointment: vi.fn().mockResolvedValue(null),
     getSession: vi.fn().mockReturnValue({ cookie: 'c', csrfToken: 't', authenticityToken: 'a' }),
     updateSession: vi.fn(),
+    refreshTokens: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   } as any;
 }
@@ -99,8 +104,11 @@ function setupDbMocks(currentDate = '2026-11-19') {
   mockDbSelect.mockReturnValue(chain([{ currentConsularDate: currentDate }]));
   // DB insert for reschedule_logs
   mockDbInsert.mockReturnValue(chain([]));
-  // DB update for bots (reschedule success)
-  mockDbUpdate.mockReturnValue(chain([]));
+  // First update call = claimSlot() → must return 1 row (claimed)
+  // Subsequent calls = success update / releaseSlot → return []
+  mockDbUpdate
+    .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))  // claimSlot: claimed
+    .mockReturnValue(chain([]));                            // success update / release
 }
 
 const preFetchedDays: DaySlot[] = [
@@ -485,5 +493,218 @@ describe('executeReschedule — CAS cache', () => {
     if (result.success && result.casDate) {
       expect(result.casDate).toBe('2026-06-02');
     }
+  });
+});
+
+// ── No-CAS atomic claimSlot tests (Peru-style bots) ──
+
+const PERU_BOT: RescheduleBot = {
+  currentConsularDate: '2027-07-16',
+  currentConsularTime: '08:00',
+  currentCasDate: null,
+  currentCasTime: null,
+  ascFacilityId: '',  // no CAS
+};
+
+const peruDays: DaySlot[] = [
+  { date: '2026-05-10', business_day: true },
+];
+
+describe('executeReschedule — atomic claimSlot (no-CAS)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  it('aborts immediately when claimSlot returns 0 rows (limit reached)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00', '09:00'] }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate.mockReturnValue(chain([]));  // 0 rows → limit reached
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 2, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('max_reschedules_reached');
+    expect(client.reschedule).not.toHaveBeenCalled();
+    // Only 1 DB update call (claimSlot), no release needed
+    expect(mockDbUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases slot when POST returns false', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockResolvedValue(false),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))  // claimSlot: claimed
+      .mockReturnValue(chain([]));                            // releaseSlot
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(false);
+    expect(client.reschedule).toHaveBeenCalledTimes(1);
+    // claim + release = 2 update calls
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases slot when POST succeeds but verification shows false positive', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      // Appointment unchanged → false positive
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2027-07-16', consularTime: '08:00' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(false);
+    expect(client.reschedule).toHaveBeenCalledTimes(1);
+    // claim + release = 2
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it('success — slot stays claimed, no extra increment', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2026-05-10', consularTime: '08:00' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))  // claimSlot
+      .mockReturnValue(chain([]));                            // success update (no rescheduleCount field)
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.date).toBe('2026-05-10');
+    // claim + success update + session update = 3 calls (no rescheduleCount re-increment)
+    expect(mockDbUpdate).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not release slot when POST throws but appointment actually changed', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockRejectedValue(new Error('network timeout')),
+      // Appointment DID change despite the error
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2026-05-10', consularTime: '08:00' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))  // claimSlot
+      .mockReturnValue(chain([]));                            // success recovery update
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(true);
+    // claim + recovery success update = 2 calls (no release, no re-increment)
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases slot when POST throws and appointment unchanged', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockRejectedValue(new Error('connection reset')),
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2027-07-16', consularTime: '08:00' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client, botId: 15, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: 1,
+    });
+
+    expect(result.success).toBe(false);
+    // claim + release = 2 calls
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it('unlimited bot: claimSlot always succeeds (maxReschedules = null)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2026-05-10' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2027-07-16' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 99 }]))  // claimSlot: high count, still ok
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client, botId: 6, bot: PERU_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: peruDays,
+      dryRun: false, maxAttempts: 1, pending: [],
+      maxReschedules: null,  // unlimited
+    });
+
+    expect(result.success).toBe(true);
+    // claim + success update + session update = 3 calls
+    expect(mockDbUpdate).toHaveBeenCalledTimes(3);
   });
 });

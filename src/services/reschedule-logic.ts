@@ -1,7 +1,7 @@
 import { logger } from '@trigger.dev/sdk/v3';
 import { db } from '../db/client.js';
 import { bots, sessions, rescheduleLogs } from '../db/schema.js';
-import { eq, sql } from 'drizzle-orm';
+import { eq, sql, or, lt, isNull, and } from 'drizzle-orm';
 import { encrypt } from './encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js';
 import { filterDates, filterTimes, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
@@ -258,6 +258,31 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     }
   };
 
+  // Atomic slot claim: UPDATE +1 WHERE rescheduleCount < maxReschedules (or unlimited).
+  // Returns false if limit already reached — prevents TOCTOU race between workers.
+  const claimSlot = async (): Promise<boolean> => {
+    const rows = await db.update(bots)
+      .set({ rescheduleCount: sql`${bots.rescheduleCount} + 1` })
+      .where(and(
+        eq(bots.id, botId),
+        or(isNull(bots.maxReschedules), lt(bots.rescheduleCount, bots.maxReschedules)),
+      ))
+      .returning({ rescheduleCount: bots.rescheduleCount });
+    if (maxReschedules != null && rows.length === 0) {
+      logger.warn('claimSlot: limit reached (atomic)', { botId, maxReschedules });
+      return false;
+    }
+    return true;
+  };
+
+  // Release a previously claimed slot on POST failure. Uses GREATEST to prevent underflow.
+  const releaseSlot = async (reason: string): Promise<void> => {
+    await db.update(bots)
+      .set({ rescheduleCount: sql`GREATEST(${bots.rescheduleCount} - 1, 0)` })
+      .where(eq(bots.id, botId));
+    logger.info('releaseSlot', { botId, reason });
+  };
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // Attempt 1: use preFetchedDays if available (skip re-fetch, save ~1s)
     // Attempts 2+: always fetch fresh
@@ -340,17 +365,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
       // ── No-CAS path (e.g. Peru): skip CAS, POST with consular only ──
       if (!needsCas) {
+        // Claim slot ONCE before trying any consular time for this date.
+        // This prevents concurrent workers from each claiming separate slots simultaneously.
+        const claimed = await claimSlot();
+        if (!claimed) {
+          if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+          return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+        }
         let postAttempted = false;
         for (const consularTime of consularTimes) {
-          // maxReschedules guard: re-read from DB to get accurate count (other workers may have incremented)
-          if (maxReschedules != null) {
-            const [fresh] = await db.select({ rescheduleCount: bots.rescheduleCount }).from(bots).where(eq(bots.id, botId));
-            if (fresh && fresh.rescheduleCount >= maxReschedules) {
-              logger.warn('maxReschedules reached mid-loop — aborting', { botId, rescheduleCount: fresh.rescheduleCount, maxReschedules, successfulPosts });
-              if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-              return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-            }
-          }
           currentStep = 'post_reschedule';
           logger.info('POSTING reschedule (no CAS)', {
             botId,
@@ -372,7 +395,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
             );
             failedAttempts.push({ date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
-            continue;
+            continue; // slot still claimed, try next consular time
           }
 
           // POST redirect chain indicated success — verify synchronously before committing
@@ -406,7 +429,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             });
           }
 
-          if (!verified) continue; // Try next time/date
+          if (!verified) {
+            continue; // Try next time/date (slot still claimed for this date)
+          }
 
           const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}`;
           pending.push(
@@ -422,7 +447,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           await db.update(bots).set({
             currentConsularDate: candidate.date,
             currentConsularTime: consularTime,
-            rescheduleCount: sql`${bots.rescheduleCount} + 1`,
             updatedAt: new Date(),
           }).where(eq(bots.id, botId));
           successfulPosts++;
@@ -467,6 +491,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           break;
         }
 
+        // Release slot if no consular time succeeded for this date
+        if (securedResult?.date !== candidate.date) {
+          await releaseSlot('all_times_failed_for_date');
+        }
         if (securedResult?.date === candidate.date) continue;
         exhaustedDates.add(candidate.date);
         if (!postAttempted) {
@@ -538,6 +566,14 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         }
       }
 
+      // Claim slot ONCE before trying any consular time for this date.
+      // This prevents concurrent workers from each claiming separate slots simultaneously.
+      const claimed = await claimSlot();
+      if (!claimed) {
+        if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+        return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+      }
+
       // Process results sequentially (best time first)
       let postAttempted = false;
       for (const { time: consularTime, casDays } of casResults) {
@@ -572,15 +608,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         }
         const casTime = casTimes[0]!;
 
-        // maxReschedules guard: re-read from DB to get accurate count
-        if (maxReschedules != null) {
-          const [fresh] = await db.select({ rescheduleCount: bots.rescheduleCount }).from(bots).where(eq(bots.id, botId));
-          if (fresh && fresh.rescheduleCount >= maxReschedules) {
-            logger.warn('maxReschedules reached mid-loop — aborting', { botId, rescheduleCount: fresh.rescheduleCount, maxReschedules, successfulPosts });
-            if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-            return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-          }
-        }
         currentStep = 'post_reschedule';
         logger.info('POSTING reschedule', {
           botId,
@@ -604,7 +631,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
           );
           failedAttempts.push({ date: candidate.date, consularTime, casDate, casTime, failReason: 'post_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
-          continue; // POST failure may be slot-specific, try next consular time
+          continue; // slot still claimed, try next consular time
         }
 
         // POST redirect chain indicated success — verify synchronously before committing
@@ -637,7 +664,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           });
         }
 
-        if (!verified) break; // Break inner loop, outer loop will try next date
+        if (!verified) {
+          break; // Break inner loop (slot release handled after the loop)
+        }
 
         const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}`;
         pending.push(
@@ -660,7 +689,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             currentConsularTime: consularTime,
             currentCasDate: casDate,
             currentCasTime: casTime,
-            rescheduleCount: sql`${bots.rescheduleCount} + 1`,
             updatedAt: new Date(),
           })
           .where(eq(bots.id, botId));
@@ -722,6 +750,11 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         break; // break inner loop (consular times), outer loop will try better date
       }
 
+      // Release slot if no consular time succeeded for this date
+      if (securedResult?.date !== candidate.date) {
+        await releaseSlot('all_times_failed_for_date');
+      }
+
       // If this date was secured, skip exhaustion logic — outer loop will try better dates
       if (securedResult?.date === candidate.date) continue;
 
@@ -759,7 +792,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           }
           const verifyAppt = await client.getCurrentAppointment();
           if (verifyAppt && verifyAppt.consularDate !== prevConsularDate) {
-            logger.warn('POST error but appointment CHANGED — incrementing rescheduleCount', {
+            // Slot was already claimed via claimSlot() — do NOT re-increment.
+            // Just update the date fields to reflect the actual appointment.
+            logger.warn('POST error but appointment CHANGED — slot already claimed, updating dates only', {
               botId, expected: candidate.date, actual: verifyAppt.consularDate,
               prevDate: prevConsularDate, error: errorMsg,
             });
@@ -768,7 +803,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               currentConsularTime: verifyAppt.consularTime,
               currentCasDate: verifyAppt.casDate,
               currentCasTime: verifyAppt.casTime,
-              rescheduleCount: sql`${bots.rescheduleCount} + 1`,
               updatedAt: new Date(),
             }).where(eq(bots.id, botId));
             pending.push(
@@ -808,6 +842,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             // Don't throw/break — continue improving if possible
             continue;
           }
+          // Appointment unchanged → POST actually failed, release the claimed slot
+          await releaseSlot('post_error_no_change');
         } catch (verifyErr) {
           logger.warn('Post-error verification failed — cannot confirm appointment state', {
             botId, error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
