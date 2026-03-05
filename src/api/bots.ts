@@ -1,17 +1,22 @@
 import { Hono } from 'hono';
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
-import { bots, excludedDates, excludedTimes, sessions, pollLogs, authLogs } from '../db/schema.js';
+import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, inArray, sql } from 'drizzle-orm';
+import { eq, and, desc, gte } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
 import type { DiscoverResult } from '../services/login.js';
+import { getEffectiveWebshareUrls } from '../services/proxy-fetch.js';
 import { pollVisaTask } from '../trigger/poll-visa.js';
+import { notifyUserTask } from '../trigger/notify-user.js';
 import { getPollingDelay } from '../services/scheduling.js';
 import { clerkAuth } from '../middleware/clerk-auth.js';
-import { isValidLocale, VALID_LOCALES, resolveLocale, MAX_SCOUTS_PER_FACILITY } from '../utils/constants.js';
+import { createClerkClient } from '@clerk/backend';
+
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+import { isValidLocale, VALID_LOCALES, resolveLocale } from '../utils/constants.js';
 import { runs } from '@trigger.dev/sdk/v3';
 
 export const botsRouter = new Hono();
@@ -149,8 +154,7 @@ botsRouter.get('/', async (c) => {
       id: bots.id,
       locale: bots.locale,
       status: bots.status,
-      isScout: bots.isScout,
-      isSubscriber: bots.isSubscriber,
+      ownerEmail: bots.ownerEmail,
       currentConsularDate: bots.currentConsularDate,
       currentConsularTime: bots.currentConsularTime,
       currentCasDate: bots.currentCasDate,
@@ -174,8 +178,6 @@ botsRouter.get('/me', clerkAuth({ required: true }), async (c) => {
     .select({
       id: bots.id,
       status: bots.status,
-      isScout: bots.isScout,
-      isSubscriber: bots.isSubscriber,
       visaEmail: bots.visaEmail,
       scheduleId: bots.scheduleId,
       consularFacilityId: bots.consularFacilityId,
@@ -212,6 +214,37 @@ botsRouter.get('/countries', (c) => {
   return c.json(countries);
 });
 
+// Recent events — reschedule activity last 24h, grouped by botId
+botsRouter.get('/recent-events', async (c) => {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const logs = await db
+    .select({
+      botId: rescheduleLogs.botId,
+      success: rescheduleLogs.success,
+      newConsularDate: rescheduleLogs.newConsularDate,
+      newConsularTime: rescheduleLogs.newConsularTime,
+      createdAt: rescheduleLogs.createdAt,
+    })
+    .from(rescheduleLogs)
+    .where(gte(rescheduleLogs.createdAt, since))
+    .orderBy(desc(rescheduleLogs.createdAt));
+
+  const result: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
+  for (const log of logs) {
+    if (!result[log.botId]) result[log.botId] = { successes: [], failedCount: 0 };
+    if (log.success) {
+      result[log.botId].successes.push({
+        date: log.newConsularDate,
+        time: log.newConsularTime,
+        at: log.createdAt.toISOString(),
+      });
+    } else {
+      result[log.botId].failedCount++;
+    }
+  }
+  return c.json(result);
+});
+
 // Create bot
 botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   const body = await c.req.json();
@@ -234,7 +267,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     excludedTimeRanges = [],
     webhookUrl,
     notificationEmail,
-    ownerEmail,
+    ownerEmail: ownerEmailFromBody,
     locale = 'es-co',
     clerkUserId,
     discoveryToken,
@@ -277,14 +310,25 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     }
   }
 
-  // Auto-assign scout: if facility has fewer scouts than MAX, become scout
-  const scoutCount = await db.select({ count: sql<number>`count(*)::int` }).from(bots)
-    .where(and(
-      eq(bots.consularFacilityId, consularFacilityId),
-      eq(bots.isScout, true),
-      inArray(bots.status, ['active', 'login_required', 'paused']),
-    ));
-  const autoScout = (scoutCount[0]?.count ?? 0) < MAX_SCOUTS_PER_FACILITY;
+  // Frontend users (clerkUserId) only get reschedule emails — stored in ownerEmail.
+  // Admin always gets all events via ADMIN_NOTIFICATION_EMAIL.
+  let finalOwnerEmail = ownerEmailFromBody ?? null;
+  let finalNotificationEmail = notificationEmail ?? null;
+  if (clerkUser?.clerkUserId) {
+    // ownerEmail from body = what the user wants for reschedule alerts.
+    // If not sent, fall back to Clerk account email.
+    finalOwnerEmail = ownerEmailFromBody ?? null;
+    if (!finalOwnerEmail) {
+      try {
+        const user = await clerkClient.users.getUser(clerkUser.clerkUserId);
+        finalOwnerEmail = user.emailAddresses[0]?.emailAddress ?? null;
+      } catch (e) {
+        console.warn(`[create-bot] Could not fetch Clerk email for ${clerkUser.clerkUserId}:`, e);
+      }
+    }
+    finalNotificationEmail = process.env.ADMIN_NOTIFICATION_EMAIL ?? null;
+  }
+
   const [bot] = await db
     .insert(bots)
     .values({
@@ -302,15 +346,11 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       currentCasDate,
       currentCasTime,
       webhookUrl,
-      notificationEmail,
-      ownerEmail,
-      proxyProvider: 'direct',
-      isScout: autoScout,
-      isSubscriber: true,  // All new bots receive dispatches by default
+      notificationEmail: finalNotificationEmail,
+      ownerEmail: finalOwnerEmail,
+      proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
-      // Scouts need login_required to start their poll chain
-      // Pure subscribers are active immediately (no poll chain needed, dispatch handles them)
-      status: autoScout ? 'login_required' : 'active',
+      status: 'login_required',
       activatedAt: new Date(),
     })
     .returning();
@@ -343,41 +383,35 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   }
 
   // ── Auto-activate ────────────────────────────────────────
-  // Scouts need a poll chain — start it automatically.
-  // Pure subscribers are already active (no poll chain needed).
-  if (autoScout) {
-    let runId: string | undefined;
+  let runId: string | undefined;
 
-    if (cachedDiscovery) {
-      // Reuse session from discover-account → activate immediately + start poll chain
-      await db.insert(sessions).values({
-        botId: bot.id,
-        yatriCookie: encrypt(cachedDiscovery.result.cookie),
-      });
-      await db.update(bots)
-        .set({ status: 'active', updatedAt: new Date() })
-        .where(eq(bots.id, bot.id));
+  if (cachedDiscovery) {
+    // Reuse session from discover-account → activate immediately + start poll chain
+    await db.insert(sessions).values({
+      botId: bot.id,
+      yatriCookie: encrypt(cachedDiscovery.result.cookie),
+    });
+    await db.update(bots)
+      .set({ status: 'active', updatedAt: new Date() })
+      .where(eq(bots.id, bot.id));
 
-      const handle = await pollVisaTask.trigger(
-        { botId: bot.id },
-        { delay: '3s', concurrencyKey: `poll-${bot.id}`, tags: [`bot:${bot.id}`] },
-      );
-      runId = handle.id;
-      await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, bot.id));
+    const handle = await pollVisaTask.trigger(
+      { botId: bot.id },
+      { delay: '3s', queue: 'visa-polling-per-bot', concurrencyKey: `poll-${bot.id}`, tags: [`bot:${bot.id}`] },
+    );
+    runId = handle.id;
+    await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, bot.id));
 
-      return c.json({ id: bot.id, status: 'active', isScout: bot.isScout, isSubscriber: bot.isSubscriber, runId }, 201);
-    } else {
-      // No cached session → trigger login-visa to login from cloud + start poll chain
-      const { loginVisaTask } = await import('../trigger/login-visa.js');
-      const handle = await loginVisaTask.trigger({ botId: bot.id }, { tags: [`bot:${bot.id}`] });
-      runId = handle.id;
-      await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, bot.id));
+    return c.json({ id: bot.id, status: 'active', runId }, 201);
+  } else {
+    // No cached session → trigger login-visa to login from cloud + start poll chain
+    const { loginVisaTask } = await import('../trigger/login-visa.js');
+    const handle = await loginVisaTask.trigger({ botId: bot.id }, { tags: [`bot:${bot.id}`] });
+    runId = handle.id;
+    await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, bot.id));
 
-      return c.json({ id: bot.id, status: bot.status as string, isScout: bot.isScout, isSubscriber: bot.isSubscriber, runId }, 201);
-    }
+    return c.json({ id: bot.id, status: bot.status as string, runId }, 201);
   }
-
-  return c.json({ id: bot.id, status: bot.status as string, isScout: bot.isScout, isSubscriber: bot.isSubscriber }, 201);
 });
 
 // Validate credentials (must be before /:id routes)
@@ -421,6 +455,103 @@ botsRouter.post('/validate-credentials', async (c) => {
 });
 
 // Discover account details (login + extract scheduleId, applicants, etc.)
+/**
+ * Classifies a fetch error to distinguish proxy connectivity issues from
+ * embassy-level blocks. Returns a short label + detail string.
+ */
+function classifyFetchError(e: unknown): { label: string; detail: string } {
+  if (!(e instanceof Error)) return { label: 'unknown', detail: String(e) };
+  const msg = e.message ?? '';
+  const cause = e.cause instanceof Error ? e.cause.message : String(e.cause ?? '');
+  const full = `${msg}${cause ? ` cause=${cause}` : ''}`;
+
+  // Embassy TCP block: server closed connection after establishing it
+  if (cause.includes('other side closed') || cause.includes('bytesRead: 0')) {
+    return { label: 'embassy_tcp_block', detail: full };
+  }
+  // Proxy itself unreachable: connection refused or cancelled before connecting
+  if (
+    cause.includes('ECONNREFUSED') ||
+    cause.includes('Request was cancelled') ||
+    msg.includes('Request was cancelled')
+  ) {
+    return { label: 'proxy_unreachable', detail: full };
+  }
+  // DNS / all-connections-failed (direct or proxy)
+  if (cause.includes('AggregateError') || cause.includes('getaddrinfo')) {
+    return { label: 'dns_or_all_failed', detail: full };
+  }
+  // Proxy or network timeout
+  if (cause.includes('ETIMEDOUT') || cause.includes('connect timeout') || cause.includes('headersTimeout')) {
+    return { label: 'timeout', detail: full };
+  }
+  return { label: 'network', detail: full };
+}
+
+/** Tries discoverAccount direct, then up to 4 Webshare IPs (from WEBSHARE_API_KEY) on network error.
+ *  Returns the result plus a compact `via` string summarising all attempts (persisted in auth_logs). */
+async function discoverWithFallback(
+  email: string, password: string, locale: string,
+): Promise<{ result: DiscoverResult; via: string }> {
+  const attempts: string[] = [];
+
+  // ── Direct attempt ────────────────────────────────────────────────────────
+  try {
+    const result = await discoverAccount(email, password, locale);
+    return { result, via: 'direct:ok' };
+  } catch (e) {
+    if (e instanceof InvalidCredentialsError) throw e;
+    const { label, detail } = classifyFetchError(e);
+    attempts.push(`direct[${label}]`);
+    console.warn(`[discover] Direct failed [${label}]: ${detail}`);
+  }
+
+  // ── Webshare fallback ─────────────────────────────────────────────────────
+  let webshareUrls: string[];
+  try {
+    webshareUrls = await getEffectiveWebshareUrls();
+  } catch (apiErr) {
+    const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+    console.warn(`[discover] Webshare API load failed: ${msg}`);
+    attempts.push(`ws_api_error[${msg}]`);
+    throw new Error(attempts.join(' → '));
+  }
+  if (webshareUrls.length === 0) {
+    attempts.push('ws_no_ips');
+    throw new Error(attempts.join(' → '));
+  }
+
+  const candidates = webshareUrls.slice(0, 4);
+  const candidateIps = candidates.map(u => { try { return new URL(u).hostname; } catch { return u; } });
+  console.log(`[discover] Webshare fallback — trying: ${candidateIps.join(', ')}`);
+
+  let lastRawErr: unknown;
+  for (let i = 0; i < candidates.length; i++) {
+    const proxyUrl = candidates[i];
+    const ip = candidateIps[i];
+    try {
+      console.log(`[discover] → ws:${ip}`);
+      const result = await discoverAccount(email, password, locale, { proxyUrl });
+      attempts.push(`ws:${ip}[ok]`);
+      console.log(`[discover] ✓ ws:${ip} succeeded`);
+      return { result, via: attempts.join(' → ') };
+    } catch (e2) {
+      if (e2 instanceof InvalidCredentialsError) throw e2;
+      const { label, detail } = classifyFetchError(e2);
+      attempts.push(`ws:${ip}[${label}]`);
+      console.warn(`[discover] ✗ ws:${ip} [${label}]: ${detail}`);
+      lastRawErr = e2;
+    }
+  }
+
+  // All attempts exhausted — throw with full chain as message (saved to auth_logs)
+  const chain = attempts.join(' → ');
+  console.warn(`[discover] All attempts failed: ${chain}`);
+  const err = new Error(chain);
+  if (lastRawErr instanceof Error) err.cause = lastRawErr.cause;
+  throw err;
+}
+
 botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) => {
   const body = await c.req.json();
   const { email, password, country } = body;
@@ -442,12 +573,12 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
   const clerkUser = c.get('clerkUser');
   console.log(`[discover-account] email=${email} country=${country} locale=${locale} clerk=${clerkUser?.clerkUserId ?? 'anon'}`);
   try {
-    const result = await discoverAccount(email, password, locale);
+    const { result, via } = await discoverWithFallback(email, password, locale);
 
     // Store discovery result with a token for session reuse when creating bot
     cleanExpiredTokens();
-    console.log(`[discover-account] OK email=${email} schedule=${result.scheduleId} applicants=${result.applicantIds.length} consular=${result.currentConsularDate}`);
-    logAuth({ email, action: 'discover', locale, result: 'ok', clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+    console.log(`[discover-account] OK email=${email} schedule=${result.scheduleId} applicants=${result.applicantIds.length} consular=${result.currentConsularDate} via=${via}`);
+    logAuth({ email, action: 'discover', locale, result: 'ok', errorMessage: via, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
     const discoveryToken = randomUUID();
     discoveryTokens.set(discoveryToken, {
       result,
@@ -468,15 +599,19 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
       consularFacilityId: result.consularFacilityId,
       ascFacilityId: result.ascFacilityId,
       collectsBiometrics: result.collectsBiometrics,
+      groups: result.groups,
     });
   } catch (e) {
     if (e instanceof InvalidCredentialsError) {
       console.log(`[discover-account] INVALID email=${email}`);
-      logAuth({ email, action: 'discover', locale, result: 'invalid', clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+      logAuth({ email, action: 'discover', locale, result: 'invalid', password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
       return c.json({ error: 'invalid_credentials' }, 401);
     }
-    console.error(`[discover-account] ERROR email=${email}`, e);
-    logAuth({ email, action: 'discover', locale, result: 'error', errorMessage: e instanceof Error ? e.message : String(e), clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+    const errMsg = e instanceof Error ? e.message : String(e);
+    const cause = e instanceof Error && e.cause ? String(e.cause) : undefined;
+    const errorMessage = `${errMsg}${cause ? ` cause=${cause}` : ''}`;
+    console.error(`[discover-account] ERROR email=${email} ${errorMessage}`, e);
+    logAuth({ email, action: 'discover', locale, result: 'error', errorMessage, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
     return c.json({ error: 'discovery_failed', message: e instanceof Error ? e.message : 'Unknown error' }, 503);
   }
 });
@@ -506,15 +641,18 @@ botsRouter.get('/:id', async (c) => {
   // SELECT specific — casCacheJson loaded separately below for summary
   const [bot] = await db.select({
     id: bots.id, scheduleId: bots.scheduleId, locale: bots.locale,
-    status: bots.status, isScout: bots.isScout, isSubscriber: bots.isSubscriber, proxyProvider: bots.proxyProvider,
+    status: bots.status, proxyProvider: bots.proxyProvider,
     consularFacilityId: bots.consularFacilityId, ascFacilityId: bots.ascFacilityId,
     currentConsularDate: bots.currentConsularDate, currentConsularTime: bots.currentConsularTime,
     currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
     targetDateBefore: bots.targetDateBefore,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
+    pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     consecutiveErrors: bots.consecutiveErrors,
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
+    notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail,
+    webhookUrl: bots.webhookUrl,
     activatedAt: bots.activatedAt, createdAt: bots.createdAt, updatedAt: bots.updatedAt,
     casCacheJson: bots.casCacheJson,
   }).from(bots).where(eq(bots.id, id));
@@ -532,46 +670,11 @@ botsRouter.get('/:id', async (c) => {
     endDate: excludedDates.endDate,
   }).from(excludedDates).where(eq(excludedDates.botId, id));
 
-  // Scout info for subscriber-only bots
-  let scoutInfo: { id: number; status: string; lastPollAt: string | null } | null = null;
-  if (bot.isSubscriber && !bot.isScout) {
-    const [scout] = await db
-      .select({
-        id: bots.id,
-        status: bots.status,
-      })
-      .from(bots)
-      .where(
-        and(
-          eq(bots.isScout, true),
-          eq(bots.consularFacilityId, bot.consularFacilityId!),
-          inArray(bots.status, ['active', 'login_required', 'paused']),
-        ),
-      )
-      .limit(1);
-
-    if (scout) {
-      const [lastPoll] = await db
-        .select({ createdAt: pollLogs.createdAt })
-        .from(pollLogs)
-        .where(eq(pollLogs.botId, scout.id))
-        .orderBy(desc(pollLogs.createdAt))
-        .limit(1);
-      scoutInfo = {
-        id: scout.id,
-        status: scout.status as string,
-        lastPollAt: lastPoll?.createdAt ? new Date(lastPoll.createdAt).toISOString() : null,
-      };
-    }
-  }
-
   return c.json({
     id: bot.id,
     scheduleId: bot.scheduleId,
     locale: bot.locale,
     status: bot.status,
-    isScout: bot.isScout,
-    isSubscriber: bot.isSubscriber,
     proxyProvider: bot.proxyProvider,
     consularFacilityId: bot.consularFacilityId,
     ascFacilityId: bot.ascFacilityId,
@@ -582,6 +685,10 @@ botsRouter.get('/:id', async (c) => {
     targetDateBefore: bot.targetDateBefore,
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
+    pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
+    targetPollsPerMin: bot.targetPollsPerMin ?? null,
+    notificationEmail: bot.notificationEmail ?? null,
+    ownerEmail: bot.ownerEmail ?? null,
     consecutiveErrors: bot.consecutiveErrors,
     activeRunId: bot.activeRunId,
     activeCloudRunId: bot.activeCloudRunId,
@@ -592,7 +699,6 @@ botsRouter.get('/:id', async (c) => {
     updatedAt: bot.updatedAt,
     sessionCreatedAt: session?.createdAt ?? null,
     excludedDateRanges: exDates,
-    scoutInfo,
     casCache: (() => {
       const cache = bot.casCacheJson as CasCacheData | null;
       if (!cache) return null;
@@ -636,7 +742,8 @@ botsRouter.put('/:id', async (c) => {
   if (body.pollEnvironments !== undefined) updates.pollEnvironments = body.pollEnvironments;
   if (body.targetDateBefore !== undefined) updates.targetDateBefore = body.targetDateBefore;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
-
+  if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
+  if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;
   await db.update(bots).set(updates).where(eq(bots.id, id));
 
   // Replace exclusions if provided
@@ -670,25 +777,17 @@ botsRouter.put('/:id', async (c) => {
   return c.json({ success: true });
 });
 
-// Activate bot — subscribers just go active, scouts get login + poll chain
+// Activate bot — login + poll chain
 botsRouter.post('/:id/activate', async (c) => {
   const id = parseInt(c.req.param('id'));
-  const [bot] = await db.select({ id: bots.id, status: bots.status, isScout: bots.isScout, isSubscriber: bots.isSubscriber }).from(bots).where(eq(bots.id, id));
+  const [bot] = await db.select({ id: bots.id, status: bots.status }).from(bots).where(eq(bots.id, id));
   if (!bot) return c.json({ error: 'Not found' }, 404);
 
   if (bot.status !== 'created' && bot.status !== 'error' && bot.status !== 'login_required' && bot.status !== 'paused') {
     return c.json({ error: `Cannot activate bot in '${bot.status}' state` }, 409);
   }
 
-  // Pure subscribers (not scouts): just mark active (no poll chain — dispatch handles them)
-  if (!bot.isScout) {
-    await db.update(bots)
-      .set({ status: 'active', consecutiveErrors: 0, activatedAt: new Date(), updatedAt: new Date() })
-      .where(eq(bots.id, id));
-    return c.json({ status: 'active', message: 'Subscriber activated (no poll chain)' });
-  }
-
-  // Scout: full login + poll chain activation
+  // Full login + poll chain activation
   // If bot already has a working session, skip login and go straight to active + poll
   if (bot.status === 'login_required') {
     const [session] = await db.select({ createdAt: sessions.createdAt }).from(sessions).where(eq(sessions.botId, id));
@@ -701,7 +800,7 @@ botsRouter.post('/:id/activate', async (c) => {
 
       const handle = await pollVisaTask.trigger(
         { botId: id },
-        { delay: '3s', concurrencyKey: `poll-${id}`, tags: [`bot:${id}`] },
+        { delay: '3s', queue: 'visa-polling-per-bot', concurrencyKey: `poll-${id}`, tags: [`bot:${id}`] },
       );
 
       await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, id));
@@ -739,12 +838,65 @@ botsRouter.post('/:id/activate-cloud', async (c) => {
   return c.json({ success: true, message: 'cloudEnabled set. Trigger cloud chain via MCP prod: poll-visa { botId, chainId: "cloud" }' });
 });
 
+// Force login — triggers login-visa regardless of current status
+botsRouter.post('/:id/force-login', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  const [bot] = await db.select({
+    id: bots.id, status: bots.status, pollEnvironments: bots.pollEnvironments,
+  }).from(bots).where(eq(bots.id, id));
+  if (!bot) return c.json({ error: 'Not found' }, 404);
+
+  const envs = (bot.pollEnvironments as string[] | null) ?? ['dev'];
+  const chainId = envs.includes('dev') ? 'dev' : 'cloud';
+
+  await db.update(bots)
+    .set({ status: 'login_required', updatedAt: new Date() })
+    .where(eq(bots.id, id));
+
+  const { loginVisaTask } = await import('../trigger/login-visa.js');
+  const handle = await loginVisaTask.trigger(
+    { botId: id, chainId: chainId as 'dev' | 'cloud' },
+    { tags: [`bot:${id}`, 'force-login'] },
+  );
+
+  return c.json({ status: 'login_required', loginRunId: handle.id });
+});
+
+// Restart poll chain — cancel active run(s) and trigger new chain
+botsRouter.post('/:id/restart-chain', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  const [bot] = await db.select({
+    id: bots.id, status: bots.status,
+    activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
+  }).from(bots).where(eq(bots.id, id));
+  if (!bot) return c.json({ error: 'Not found' }, 404);
+
+  for (const runId of [bot.activeRunId, bot.activeCloudRunId]) {
+    if (runId) { try { await runs.cancel(runId); } catch { /* already gone */ } }
+  }
+
+  await db.update(bots)
+    .set({ status: 'active', activeRunId: null, activeCloudRunId: null, updatedAt: new Date() })
+    .where(eq(bots.id, id));
+
+  const handle = await pollVisaTask.trigger(
+    { botId: id },
+    { delay: '3s', queue: 'visa-polling-per-bot', concurrencyKey: `poll-${id}`, tags: [`bot:${id}`, 'restart-chain'] },
+  );
+
+  await db.update(bots).set({ activeRunId: handle.id, updatedAt: new Date() }).where(eq(bots.id, id));
+
+  return c.json({ status: 'active', pollRunId: handle.id });
+});
+
 // Pause bot
 botsRouter.post('/:id/pause', async (c) => {
   const id = parseInt(c.req.param('id'));
   const [bot] = await db.select({
     id: bots.id, status: bots.status,
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
+    notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail, webhookUrl: bots.webhookUrl,
+    scheduleId: bots.scheduleId, locale: bots.locale,
   }).from(bots).where(eq(bots.id, id));
   if (!bot) return c.json({ error: 'Not found' }, 404);
 
@@ -764,6 +916,11 @@ botsRouter.post('/:id/pause', async (c) => {
     .update(bots)
     .set({ status: 'paused', activeRunId: null, activeCloudRunId: null, cloudEnabled: false, updatedAt: new Date() })
     .where(eq(bots.id, id));
+
+  notifyUserTask.trigger({
+    botId: id, event: 'bot_paused',
+    data: { botId: id, reason: 'manual', scheduleId: bot.scheduleId, locale: bot.locale },
+  }).catch(() => {});
 
   return c.json({ success: true });
 });
@@ -787,6 +944,7 @@ botsRouter.post('/:id/resume', async (c) => {
     { botId: id },
     {
       delay: getPollingDelay(),
+      queue: 'visa-polling-per-bot',
       concurrencyKey: `poll-${id}`,
       tags: [`bot:${id}`],
     },

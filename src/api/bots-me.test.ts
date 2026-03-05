@@ -14,6 +14,9 @@ const { mockVerifyToken } = vi.hoisted(() => {
 
 vi.mock('@clerk/backend', () => ({
   verifyToken: mockVerifyToken,
+  createClerkClient: () => ({
+    users: { getUser: vi.fn().mockResolvedValue({ emailAddresses: [{ emailAddress: 'test@example.com' }] }) },
+  }),
 }));
 
 vi.mock('../db/client.js', () => {
@@ -60,6 +63,10 @@ vi.mock('../trigger/poll-visa.js', () => ({
 
 vi.mock('../trigger/login-visa.js', () => ({
   loginVisaTask: { trigger: vi.fn(async () => ({ id: 'run_mock' })) },
+}));
+
+vi.mock('../trigger/notify-user.js', () => ({
+  notifyUserTask: { trigger: vi.fn(async () => ({ id: 'run_mock' })) },
 }));
 
 vi.mock('@trigger.dev/sdk/v3', () => ({
