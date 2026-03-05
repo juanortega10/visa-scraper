@@ -5,10 +5,24 @@ import { eq, desc, and, gte, sql } from 'drizzle-orm';
 
 export const logsRouter = new Hono();
 
+// In-memory cache to reduce Neon egress for heavy 24h full-scan endpoints
+const resultCache = new Map<string, { data: unknown; expiresAt: number }>();
+function getCached(key: string) {
+  const e = resultCache.get(key);
+  if (e && Date.now() < e.expiresAt) return e.data;
+  return null;
+}
+function setCached(key: string, data: unknown, ttlMs = 5 * 60_000) {
+  resultCache.set(key, { data, expiresAt: Date.now() + ttlMs });
+}
+
 // Poll summary (24h buckets + top 5)
 logsRouter.get('/bots/:id/logs/polls/summary', async (c) => {
   const botId = parseInt(c.req.param('id'));
   const hours = parseInt(c.req.query('hours') || '24');
+  const cacheKey = `summ-${botId}-${hours}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
   const since = new Date(Date.now() - hours * 3600_000);
 
   // Omit allDates (~10-50 KB/row) — use earliestDate + topDates fallback
@@ -70,13 +84,18 @@ logsRouter.get('/bots/:id/logs/polls/summary', async (c) => {
   const totalOkPolls = rows.filter((r) => r.status === 'ok').length;
   const totalFilteredOutPolls = rows.filter((r) => r.status === 'filtered_out').length;
 
-  return c.json({ buckets, top5, totalPolls: rows.length, totalOkPolls, totalFilteredOutPolls, windowHours: hours });
+  const result = { buckets, top5, totalPolls: rows.length, totalOkPolls, totalFilteredOutPolls, windowHours: hours };
+  setCached(cacheKey, result);
+  return c.json(result);
 });
 
 // Cancellations (server-side computation over full 24h window)
 logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
   const botId = parseInt(c.req.param('id'));
   const hours = parseInt(c.req.query('hours') || '24');
+  const cacheKey = `canc-${botId}-${hours}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
   const since = new Date(Date.now() - hours * 3600_000);
 
   const rows = await db
@@ -163,7 +182,10 @@ logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
     }
   }
 
-  if (events.length === 0) return c.json(null);
+  if (events.length === 0) {
+    setCached(cacheKey, null);
+    return c.json(null);
+  }
 
   const tMin = rows.length > 0 ? new Date(rows[rows.length - 1].createdAt!).getTime() : 0;
   let tMax = rows.length > 0 ? new Date(rows[0].createdAt!).getTime() : 1;
@@ -177,10 +199,12 @@ logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
   let closeCount = 0;
   for (const e of events) if (e.days < 60) closeCount++;
 
-  return c.json({
+  const result = {
     events, tMin, tMax, bursts,
     totalEvents: events.length, uniqueDates: uniq.size, closeCount,
-  });
+  };
+  setCached(cacheKey, result);
+  return c.json(result);
 });
 
 // Poll health (chain + IP aggregation)
@@ -345,6 +369,8 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
       reloginHappened: pollLogs.reloginHappened,
       dateChanges: pollLogs.dateChanges,
       publicIp: pollLogs.publicIp,
+      runId: pollLogs.runId,
+      connectionInfo: pollLogs.connectionInfo,
       createdAt: pollLogs.createdAt,
     })
     .from(pollLogs)
@@ -519,6 +545,7 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
   const ipData: Record<string, {
     polls: number; tcpBlocked: number; ok: number;
     latencies: number[]; lastSeen: string; lastStatus: string;
+    embassyBlock: number; proxyInfra: number; proxyQuota: number;
   }> = {};
 
   for (const r of rows) {
@@ -527,13 +554,18 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
     const fallback = !!(ci?.fallbackHappened);
     const isTcp = r.status === 'tcp_blocked' || fallback;
 
-    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '' };
+    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '', embassyBlock: 0, proxyInfra: 0, proxyQuota: 0 };
     const d = ipData[ip]!;
     d.polls++;
     d.lastSeen = r.createdAt?.toISOString() ?? '';
     d.lastStatus = r.status ?? '';
-    if (isTcp) d.tcpBlocked++;
-    else {
+    if (isTcp) {
+      d.tcpBlocked++;
+      const errorSource = ci?.errorSource as string | undefined;
+      if (errorSource === 'embassy_block') d.embassyBlock++;
+      else if (errorSource === 'proxy_infra') d.proxyInfra++;
+      else if (errorSource === 'proxy_quota') d.proxyQuota++;
+    } else {
       d.ok++;
       if (r.responseTimeMs) d.latencies.push(r.responseTimeMs);
     }
@@ -560,6 +592,12 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
         avgLatMs,
         lastSeen: d.lastSeen || null,
         lastStatus: d.lastStatus || null,
+        tcpBreakdown: {
+          embassyBlock: d.embassyBlock,
+          proxyInfra: d.proxyInfra,
+          proxyQuota: d.proxyQuota,
+          unknown: d.tcpBlocked - d.embassyBlock - d.proxyInfra - d.proxyQuota,
+        },
         // Webshare metadata (null for direct/non-webshare IPs)
         wsValid: ws?.valid ?? null,
         wsCountry: ws?.country ?? null,
@@ -568,11 +606,18 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
     })
   );
 
+  const recentTcp = rows.filter((r) => r.status === 'tcp_blocked');
+  const recentQuota = recentTcp.filter((r) =>
+    ((r.connectionInfo as Record<string, unknown> | null)?.errorSource) === 'proxy_quota'
+  );
+  const quotaExhausted = recentTcp.length >= 3 && recentTcp.length === recentQuota.length;
+
   return c.json({
     ips,
     websharePoolSize: websharePool.length,
     windowHours,
     totalPolls: rows.length,
+    quotaExhausted,
   });
 });
 

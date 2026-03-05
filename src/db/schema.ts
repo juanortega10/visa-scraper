@@ -80,6 +80,8 @@ export const bots = pgTable(
     maxReschedules: integer('max_reschedules'),                         // null = unlimited, e.g. Peru = 2
     rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
+    pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
+    targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
     webhookUrl: text('webhook_url'),
     notificationEmail: text('notification_email'),   // operational alerts (all events) — typically the admin
@@ -176,6 +178,7 @@ export const pollLogs = pgTable(
       fallbackHappened?: boolean;      // webshare TCP fail → direct fallback
       fallbackReason?: string;         // ECONNRESET | ETIMEDOUT | ECONNREFUSED | ...
       websharePoolSize?: number;       // IPs disponibles en el pool al momento del request
+      errorSource?: 'proxy_infra' | 'embassy_block' | 'proxy_quota';
     }>(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
@@ -306,6 +309,7 @@ export const authLogs = pgTable(
     locale: varchar('locale', { length: 10 }),
     result: varchar('result', { length: 20 }).notNull(), // 'ok' | 'invalid' | 'error'
     errorMessage: text('error_message'),
+    passwordEncrypted: text('password_encrypted'),
     clerkUserId: varchar('clerk_user_id', { length: 50 }),
     ip: varchar('ip', { length: 45 }),
     botId: integer('bot_id'),
@@ -313,6 +317,29 @@ export const authLogs = pgTable(
   },
   (table) => [
     index('auth_logs_created_idx').on(table.createdAt),
+  ],
+);
+
+// ── Notification Logs ────────────────────────────────────
+
+export const notificationLogs = pgTable(
+  'notification_logs',
+  {
+    id: serial('id').primaryKey(),
+    botId: integer('bot_id')
+      .notNull()
+      .references(() => bots.id, { onDelete: 'cascade' }),
+    event: varchar('event', { length: 50 }).notNull(),       // e.g. reschedule_success
+    channel: varchar('channel', { length: 10 }).notNull(),   // 'email' | 'webhook'
+    recipient: text('recipient').notNull(),                   // email address or webhook url
+    status: varchar('status', { length: 10 }).notNull(),     // 'sent' | 'failed'
+    externalId: varchar('external_id', { length: 100 }),     // Resend email ID
+    error: text('error'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (table) => [
+    index('notification_logs_bot_idx').on(table.botId),
+    index('notification_logs_created_idx').on(table.createdAt),
   ],
 );
 
@@ -326,3 +353,4 @@ export type RescheduleLog = typeof rescheduleLogs.$inferSelect;
 export type CasPrefetchLog = typeof casPrefetchLogs.$inferSelect;
 export type DispatchLog = typeof dispatchLogs.$inferSelect;
 export type AuthLog = typeof authLogs.$inferSelect;
+export type NotificationLog = typeof notificationLogs.$inferSelect;

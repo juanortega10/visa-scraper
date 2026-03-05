@@ -113,6 +113,11 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .bot-appt{font-size:13px;font-weight:700;color:var(--bright);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bot-appt-none{color:var(--dim);font-style:italic;font-weight:400}
 .bot-meta{font-size:9px;color:var(--muted);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
+.bot-events{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.ev-pill{font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;letter-spacing:.2px;white-space:nowrap}
+.ev-ok{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.2)}
+.ev-fail{background:rgba(252,211,77,.08);color:var(--amber);border:1px solid rgba(252,211,77,.2)}
+.ev-err{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 
 .chip{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:4px;flex-shrink:0}
 .chip-active{background:rgba(74,222,128,.1);color:var(--green)}
@@ -184,6 +189,13 @@ function daysUntil(d){
   return days;
 }
 
+function fmtEvDate(d){
+  if(!d)return '';
+  var p=d.split('-');
+  var MONTHS=['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  return parseInt(p[2])+' '+MONTHS[parseInt(p[1])-1];
+}
+
 function limitBar(count,max){
   if(max==null)return '';
   var pct=Math.min(100,Math.round(count/max*100));
@@ -193,7 +205,9 @@ function limitBar(count,max){
 
 async function load(){
   try{
-    var bots=await (await fetch('/api/bots')).json();
+    var res=await Promise.all([fetch('/api/bots'),fetch('/api/bots/recent-events')]);
+    var bots=await res[0].json();
+    var evts=res[1].ok?await res[1].json():{};
     if(!Array.isArray(bots)||bots.length===0){
       document.getElementById('content').innerHTML='<div class="empty-msg">no hay bots configurados</div>';
       document.getElementById('summary').innerHTML='';
@@ -237,20 +251,35 @@ async function load(){
         var daysColor=days<=7?'var(--red)':days<=30?'var(--amber)':'var(--bright)';
         var apptStr=b.currentConsularDate?fmtD(b.currentConsularDate)+(b.currentConsularTime?' '+b.currentConsularTime:''):'';
         var metaParts=[];
-        var roles=[];
-        if(b.isScout)roles.push('scout');
-        if(b.isSubscriber)roles.push('subscriber');
-        metaParts.push(roles.join('+')||'none');
+        var envs=(b.pollEnvironments||['dev']);
+        metaParts.push(envs.join('+'));
+        if(b.ownerEmail){var em=b.ownerEmail.split('@');var short=em[0].length>10?em[0].substring(0,10)+'\u2026':em[0];metaParts.unshift('<span style="color:var(--accent);font-size:9px">'+short+'</span>');}
         if(b.consecutiveErrors>0)metaParts.push('<span style="color:var(--red)">'+b.consecutiveErrors+' err</span>');
         if(b.targetDateBefore)metaParts.push('target &lt; '+fmtD(b.targetDateBefore));
         var limitsHtml=limitBar(b.rescheduleCount,b.maxReschedules);
         if(limitsHtml)metaParts.push(limitsHtml);
+
+        var evData=evts[b.id];
+        var evPills='';
+        if(evData){
+          if(evData.successes&&evData.successes.length>0){
+            var lastOk=evData.successes[0];
+            evPills+='<span class="ev-pill ev-ok">\u2713 \u2192 '+fmtEvDate(lastOk.date)+(lastOk.time?' '+lastOk.time:'')+'</span>';
+          }
+          if(evData.failedCount>0){
+            evPills+='<span class="ev-pill ev-fail">\u26a1 '+evData.failedCount+(evData.failedCount===1?' intento fallido':' intentos fallidos')+'</span>';
+          }
+        }
+        if(b.consecutiveErrors>=3){
+          evPills+='<span class="ev-pill ev-err">\u2717 '+b.consecutiveErrors+' errores</span>';
+        }
 
         html+='<a class="bot-card" href="/dashboard/'+b.id+'">';
         html+='<span class="bot-id">#'+b.id+'</span>';
         html+='<span class="bot-info">';
         html+='<div class="bot-appt">'+(apptStr||'<span class="bot-appt-none">sin cita</span>')+'</div>';
         html+='<div class="bot-meta">'+metaParts.join(' <span style="color:var(--dim)">&middot;</span> ')+'</div>';
+        if(evPills)html+='<div class="bot-events">'+evPills+'</div>';
         html+='</span>';
         html+='<span class="chip chip-'+b.status+'">'+b.status+'</span>';
         if(b.currentConsularDate){
@@ -271,7 +300,7 @@ async function load(){
 
 tickClock();load();
 setInterval(tickClock,1000);
-setInterval(load,30000);
+setInterval(load,60000);
 </script>
 </body>
 </html>`;
@@ -367,6 +396,9 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 .b-filtered_out{background:rgba(255,255,255,.04);color:var(--muted)}
 .b-soft_ban{background:rgba(252,211,77,.1);color:var(--amber)}
 .b-tcp_blocked,.b-econnrefused{background:rgba(248,113,113,.1);color:var(--red)}
+.b-tcp_embassy{background:rgba(248,113,113,.1);color:var(--red)}
+.b-tcp_quota{background:rgba(252,211,77,.12);color:var(--amber)}
+.b-tcp_infra{background:rgba(251,146,60,.1);color:#f97316}
 .b-error,.b-session_expired{background:rgba(248,113,113,.08);color:var(--red)}
 .b-success{background:rgba(74,222,128,.1);color:var(--green)}
 .b-fail{background:rgba(248,113,113,.1);color:var(--red)}
@@ -401,6 +433,8 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 .btn-g{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .btn-r{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 .btn-c{background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.2)}
+.btn-w{background:rgba(252,211,77,.08);color:var(--amber);border:1px solid rgba(252,211,77,.2)}
+.emerg-lbl{font-size:8px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;width:100%;margin-top:2px}
 
 /* ── CAS Heatmap ── */
 .hm{margin:4px 0}
@@ -510,20 +544,6 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   -webkit-tap-highlight-color:transparent;transition:all .15s}
 .ct-btn.ct-on{background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border)}
 
-/* ── Subscriber view ── */
-.sub-kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)}
-.sub-kv:last-child{border-bottom:none}
-.sub-k{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
-.sub-v{font-weight:700;font-size:11px}
-.sub-scout-status{display:flex;align-items:center;gap:8px;padding:6px 0}
-.sub-scout-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.sub-disp-item{padding:6px 0;border-bottom:1px solid var(--border);font-size:11px}
-.sub-disp-item:last-child{border-bottom:none}
-.sub-disp-dates{font-size:10px;color:var(--muted);margin-top:2px}
-.sub-disp-timing{font-size:9px;color:var(--dim);margin-top:1px}
-.sub-limits{display:flex;align-items:center;gap:6px}
-.sub-limits-bar{flex:1;max-width:80px;height:6px;background:var(--dim);border-radius:3px;overflow:hidden}
-.sub-limits-fill{height:100%;border-radius:3px}
 
 .empty{color:var(--muted);text-align:center;padding:14px;font-size:11px}
 .sk{background:linear-gradient(90deg,var(--surface) 25%,var(--surface2) 50%,var(--surface) 75%);
@@ -651,7 +671,15 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   <span class="sep">&middot;</span>
   <span><span class="strip-lbl">poll</span><span id="pollSrc" class="strip-val" style="font-size:10px">--</span></span>
   <span id="lastRsRow" style="display:none"><span class="sep">&middot;</span><span class="strip-lbl">resch</span><span id="lastRsVal" class="strip-val" style="font-size:10px">--</span></span>
+  <span id="ownerEmailRow" style="display:none"><span class="sep">&middot;</span><span class="strip-lbl">owner</span><span id="ownerEmailVal" class="strip-val" style="font-size:9px;color:var(--accent)">--</span></span>
   <div id="actions" class="actions" style="display:none;width:100%;margin-top:4px"></div>
+  <div id="emergDiv" style="display:none;width:100%;margin-top:2px">
+    <div class="emerg-lbl">emergencia</div>
+    <div class="actions">
+      <button class="btn btn-w" onclick="emergAct(\'force-login\')">forzar login</button>
+      <button class="btn btn-w" onclick="emergAct(\'restart-chain\')">restart cadena</button>
+    </div>
+  </div>
 </div>
 
 <!-- Appointment -->
@@ -678,40 +706,13 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   </div>
 </div>
 
-<!-- Tabs (hidden for subscribers) -->
-<div class="tabs" id="scoutTabs">
+<div class="tabs">
   <div class="tab on" onclick="switchTab(0)">monitor</div>
   <div id="casTabBtn" class="tab" onclick="switchTab(1)">cas map</div>
   <div class="tab" onclick="switchTab(2)">eventos</div>
   <div class="tab" onclick="switchTab(3)">calendario</div>
 </div>
 
-<!-- ═══ SUBSCRIBER VIEW (hidden for scouts) ═══ -->
-<div id="subscriberView" style="display:none">
-
-<div class="card">
-  <div class="card-t">configuracion</div>
-  <div id="subConfig" style="font-size:11px;line-height:2"></div>
-</div>
-
-<div class="card">
-  <div class="card-t">scout</div>
-  <div id="subScout" style="font-size:11px"></div>
-</div>
-
-<div class="card">
-  <div class="card-t">dispatches recibidos</div>
-  <div id="subDispatches"></div>
-  <div id="subDispEmpty" class="empty">sin dispatches</div>
-</div>
-
-<div class="card">
-  <div class="card-t">reagendamientos</div>
-  <div id="subReschedules"></div>
-  <div id="subRsEmpty" class="empty">sin reschedules</div>
-</div>
-
-</div>
 
 <!-- ═══ MONITOR TAB ═══ -->
 <div id="t0" class="tab-c on">
@@ -739,6 +740,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
     <div class="pl-item"><span class="pl-lbl">latencia</span><span id="lpMs" class="pl-val">--</span></div>
     <div class="pl-item"><span class="pl-lbl">nodo</span><span id="lpNode" class="pl-val">--</span></div>
     <div class="pl-item"><span class="pl-lbl">resch</span><span id="lpRs" class="pl-val">--</span></div>
+    <div id="lpConnRow" class="pl-item" style="display:none"><span class="pl-lbl">proxy</span><span id="lpConn" class="pl-val" style="font-size:10px;font-weight:400">--</span></div>
     <div id="lpMotivoRow" class="pl-item" style="display:none;grid-column:1/-1;border-top:1px solid var(--border);padding-top:4px;margin-top:2px"><span class="pl-lbl">motivo</span><span id="lpMotivo" class="pl-val" style="font-size:10px;color:var(--amber);font-weight:400;white-space:normal;word-break:break-all"></span></div>
   </div>
 </div>
@@ -877,7 +879,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 
 </div>
 
-<div class="foot">tap header to refresh &middot; auto 30s</div>
+<div class="foot">tap header to refresh &middot; auto 60s</div>
 
 <div id="toast" class="toast"></div>
 
@@ -906,9 +908,10 @@ function fmtNode(p){
       :cPfx+'<span style="color:#FBBF24;font-size:8px;font-weight:700" title="RPi Direct ('+ip+')">RPi</span>';
   return cPfx+'<span style="color:var(--dim);font-size:8px">?</span>';
 }
-var cd=30,timer,lastBot=null,lastPolls=null,lastSummary=null,chartMode=0;
+var cd=60,timer,lastBot=null,lastPolls=null,lastSummary=null,chartMode=0;
 var calIdx=0,calMonthOffset=0,lastExclusions=null,calPollList=null,calMode=0;
 var tlData=null,tlSelDate=null,tlDots=[],tlClickBound=false;
+var slowCd=0,lastRss=null,lastCasLogs=null; /* slow refresh: reschedules/cas/summary/cancellations every 5×60s=5min */
 
 function switchTab(n){
   var tabs=document.querySelectorAll('.tab');
@@ -998,7 +1001,7 @@ function tickClock(){
 /* ── Countdown ── */
 function tickCd(){
   cd--;
-  document.getElementById('cdFill').style.width=Math.max(0,cd/30*100)+'%';
+  document.getElementById('cdFill').style.width=Math.max(0,cd/60*100)+'%';
   document.getElementById('cdTime').textContent=cd+'s';
   if(cd<=0)refresh();
 }
@@ -1007,45 +1010,36 @@ async function fetchJ(u){var r=await fetch(u);if(!r.ok)throw new Error(r.status+
 
 /* ── Main refresh ── */
 async function refresh(){
-  cd=30;document.getElementById('cdFill').style.width='100%';
+  cd=60;document.getElementById('cdFill').style.width='100%';
   try{
     var bot=await fetchJ(API+'/bots/'+BID);
     lastBot=bot;
-    var isSubOnly=bot.isSubscriber&&!bot.isScout;
 
-    /* Toggle scout vs subscriber views */
-    document.getElementById('scoutTabs').style.display=isSubOnly?'none':'';
-    document.getElementById('subscriberView').style.display=isSubOnly?'':'none';
-    for(var ti=0;ti<4;ti++){var tp=document.getElementById('t'+ti);if(tp)tp.style.display=isSubOnly?'none':''}
+    /* Fast: live data every 60s */
+    var polls=await fetchJ(API+'/bots/'+BID+'/logs/polls?limit=100');
+    lastPolls=polls;
+    var health=computeHealth(polls,15);
 
-    if(isSubOnly){
-      refreshSubscriber(bot);
-      return;
+    /* Slow: historical data every 5min (5×60s). slowCd=0 on first load to fetch all immediately. */
+    var rss=lastRss,casLogs=lastCasLogs,summary=lastSummary,cancelServer=tlData;
+    if(slowCd<=0){
+      slowCd=5;
+      var slowRes=await Promise.all([
+        fetchJ(API+'/bots/'+BID+'/logs/reschedules?limit=20'),
+        fetchJ(API+'/bots/'+BID+'/logs/cas-prefetch?limit=15'),
+        fetchJ(API+'/bots/'+BID+'/logs/polls/summary?hours=24'),
+        fetchJ(API+'/bots/'+BID+'/logs/polls/cancellations?hours=24'),
+      ]);
+      rss=slowRes[0];casLogs=slowRes[1];summary=slowRes[2];cancelServer=slowRes[3];
+      lastRss=rss;lastCasLogs=casLogs;lastSummary=summary;tlData=cancelServer;
     }
-
-    var res=await Promise.all([
-      fetchJ(API+'/bots/'+BID+'/logs/polls?limit=100'),
-      fetchJ(API+'/bots/'+BID+'/logs/reschedules?limit=20'),
-      fetchJ(API+'/bots/'+BID+'/logs/cas-prefetch?limit=15'),
-      fetchJ(API+'/bots/'+BID+'/logs/polls/summary?hours=24'),
-      fetchJ(API+'/bots/'+BID+'/logs/polls/cancellations?hours=24'),
-      fetchJ(API+'/bots/'+BID+'/logs/polls/health?minutes=15').catch(function(){return null})
-    ]);
-    var polls=res[0],rss=res[1],casLogs=res[2],summary=res[3],cancelServer=res[4],health=res[5];
-    lastPolls=polls;lastSummary=summary;tlData=cancelServer;
+    slowCd--;
 
     /* Country flag */
     var cc=bot.locale?bot.locale.split('-')[1]:'';
     var cm=CMETA[cc];
     document.getElementById('botFlag').textContent=cm?cm.flag:'';
     document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — '+(cm?cm.name:'');
-
-    /* Show scout strip items */
-    document.getElementById('sesAge').parentElement.style.display='';
-    document.getElementById('proxyVal').parentElement.style.display='';
-    document.getElementById('pollSrc').parentElement.style.display='';
-    var seps=document.querySelectorAll('.strip .sep');
-    for(var si=0;si<seps.length;si++)seps[si].style.display='';
 
     /* Status */
     var sc=document.getElementById('statusChip');
@@ -1064,6 +1058,10 @@ async function refresh(){
     if(envs.indexOf('dev')>=0)srcParts.push(bot.activeRunId?'<span style="color:var(--green)">dev</span>':'<span style="color:var(--dim)">dev</span>');
     if(envs.indexOf('prod')>=0)srcParts.push(bot.activeCloudRunId?'<span style="color:var(--green)">cloud</span>':'<span style="color:var(--dim)">cloud</span>');
     document.getElementById('pollSrc').innerHTML=srcParts.join('+');
+
+    /* Owner email (strip) */
+    var ownerRow=document.getElementById('ownerEmailRow');
+    if(bot.ownerEmail){ownerRow.style.display='';var em2=bot.ownerEmail.split('@');var short2=em2[0].length>12?em2[0].substring(0,12)+'\u2026':em2[0];document.getElementById('ownerEmailVal').textContent=short2+'@\u2026';}else{ownerRow.style.display='none';}
 
     /* Last successful reschedule (strip) */
     var lastRsRow=document.getElementById('lastRsRow');
@@ -1157,6 +1155,24 @@ async function refresh(){
       document.getElementById('lpMs').textContent=lp.responseTimeMs?lp.responseTimeMs+'ms':'--';
       document.getElementById('lpNode').innerHTML=fmtNode(lp);
       document.getElementById('lpRs').innerHTML=lp.rescheduleResult?badge(lp.rescheduleResult,lp.rescheduleResult==='success'?'success':'fail'):'<span style="color:var(--dim)">--</span>';
+      /* Connection info (proxy attempt) */
+      var lpConnRow=document.getElementById('lpConnRow');
+      var lpConn=document.getElementById('lpConn');
+      var ci=lp.connectionInfo;
+      if(ci&&IS_WEBSHARE_BOT){
+        lpConnRow.style.display='';
+        var wIdx=WEBSHARE_IPS.indexOf(ci.proxyAttemptIp);
+        var ipLabel=wIdx>=0?'W'+(wIdx+1):(ci.proxyAttemptIp?ci.proxyAttemptIp.split('.').slice(-1)[0]:'?');
+        var ipColor=wIdx>=0?(WEBSHARE_COLORS[wIdx]||'#94A3B8'):'var(--muted)';
+        var connHtml='<span style="color:'+ipColor+';font-weight:700">'+ipLabel+'</span>';
+        if(ci.websharePoolSize){connHtml+='<span style="color:var(--dim)"> ·'+ci.websharePoolSize+'IPs</span>';}
+        if(ci.errorSource&&ci.errorSource!=='embassy_block'){
+          var srcLabel=ci.errorSource==='proxy_quota'?'quota':'infra';
+          var srcColor=ci.errorSource==='proxy_quota'?'var(--amber)':'#f97316';
+          connHtml+='<span style="color:'+srcColor+';font-size:8px;margin-left:4px;font-weight:700">'+srcLabel+'</span>';
+        }
+        lpConn.innerHTML=connHtml;
+      }else{lpConnRow.style.display='none';}
       /* Filtered-out reason (P1) */
       var lpMR=document.getElementById('lpMotivoRow');
       if(lp.status==='filtered_out'&&lp.error){
@@ -1214,8 +1230,21 @@ async function refresh(){
         var pRaw=p.rawDatesCount||p.datesCount||0;
         var pFilt=p.datesCount||0;
         var datesCell=pFilt+'/'+pRaw;
-        var errTip=p.error&&(p.status==='tcp_blocked'||p.status==='error'||p.status==='soft_ban'||p.status==='econnrefused')?' <span onclick="showMsgOverlay('+JSON.stringify(p.error)+')" style="font-size:8px;color:var(--muted);cursor:pointer;text-decoration:underline dotted">'+escH(p.error.substring(0,40))+(p.error.length>40?'…':'')+'</span>':'';
-        var statusBadge=p.status==='tcp_blocked'?'<span class="b b-tcp_blocked" title="IP bloqueada — retry +30min (45→60min si persiste)">tcp_blocked</span>':badge(p.status);
+        var errTip=p.error&&(p.status==='tcp_blocked'||p.status==='error'||p.status==='soft_ban'||p.status==='econnrefused')?' <span onclick="showMsgOverlay('+JSON.stringify(p.error).replace(/"/g,'&quot;')+')" style="font-size:8px;color:var(--muted);cursor:pointer;text-decoration:underline dotted">'+escH(p.error.substring(0,40))+(p.error.length>40?'…':'')+'</span>':'';
+        var statusBadge;
+        if(p.status==='tcp_blocked'){
+          var es=p.connectionInfo&&p.connectionInfo.errorSource;
+          if(es==='proxy_quota')
+            statusBadge='<span class="b b-tcp_quota" title="Webshare bandwidth agotado (402 Payment Required)">tcp·quota</span>';
+          else if(es==='proxy_infra')
+            statusBadge='<span class="b b-tcp_infra" title="Proxy inalcanzable (ECONNREFUSED / tunnel caído)">tcp·infra</span>';
+          else if(es==='embassy_block')
+            statusBadge='<span class="b b-tcp_embassy" title="IP baneada por la embajada — retry +30min">tcp·embassy</span>';
+          else
+            statusBadge='<span class="b b-tcp_blocked" title="TCP bloqueado — causa desconocida (log histórico)">tcp_blocked</span>';
+        }else{
+          statusBadge=badge(p.status);
+        }
         rows+='<tr><td style="color:var(--muted)">'+fmtTime(p.createdAt)+'</td><td>'+fmtNode(p)+'</td><td>'+statusBadge+errTip+rb+'</td><td>'+datesCell+'</td><td style="'+bc+'">'+best+'</td><td style="color:var(--muted)">'+(p.responseTimeMs||'-')+'</td></tr>';
       }
       tb.innerHTML=rows;
@@ -1410,8 +1439,11 @@ function renderPool(state){
   var ipKeys=Object.keys(ips).filter(function(k){return k!=='direct';});
   var healthyCount=ipKeys.filter(function(k){return ips[k].tcpBlockedRate<=10;}).length;
   var badCount=ipKeys.filter(function(k){return ips[k].tcpBlockedRate>30;}).length;
-  document.getElementById('ppSummary').textContent=
-    'ok: '+healthyCount+'/'+ipKeys.length+' · '+state.totalPolls+' polls/'+state.windowHours+'h'+(badCount?' · '+badCount+' degraded':'');
+  if(state.quotaExhausted){
+    document.getElementById('ppSummary').innerHTML='<span style="color:var(--amber);font-weight:700">⚠ QUOTA AGOTADA (402)</span>';
+  }else{
+    document.getElementById('ppSummary').textContent='ok: '+healthyCount+'/'+ipKeys.length+' · '+state.totalPolls+' polls/'+state.windowHours+'h'+(badCount?' · '+badCount+' degraded':'');
+  }
 
   var html='';
   // Sort by tcpBlockedRate descending (worst first)
@@ -1431,7 +1463,19 @@ function renderPool(state){
     html+='<div class="pp-ip-row">';
     html+='<span class="pp-dot '+dotCls+'"></span>';
     html+='<span class="pp-ip-name" style="color:'+color+'">'+label+'</span>';
-    html+='<span style="font-size:9px;color:var(--muted)">blk:'+h.tcpBlockedRate+'%</span>';
+    var blkHtml='';
+    var tb=h.tcpBreakdown;
+    if(tb&&h.tcpBlocked>0){
+      if(tb.proxyQuota>0)blkHtml+='<span style="color:var(--amber);font-weight:700" title="Bandwidth agotado">quota:'+tb.proxyQuota+'</span> ';
+      if(tb.embassyBlock>0)blkHtml+='<span style="color:var(--red)" title="IP baneada por embajada">emb:'+tb.embassyBlock+'</span> ';
+      if(tb.proxyInfra>0)blkHtml+='<span style="color:#f97316" title="Proxy caído">infra:'+tb.proxyInfra+'</span> ';
+      if(tb.unknown>0)blkHtml+='<span style="color:var(--muted)">?:'+tb.unknown+'</span>';
+      blkHtml=blkHtml.trim()||('<span style="color:var(--muted)">blk:'+h.tcpBlockedRate+'%</span>');
+    }else if(h.tcpBlocked>0){
+      blkHtml='<span style="color:var(--muted)">blk:'+h.tcpBlockedRate+'%</span>';
+    }
+    if(blkHtml)html+='<span style="font-size:9px">'+blkHtml+'</span>';
+    else html+='<span style="font-size:9px;color:var(--muted)">blk:0%</span>';
     html+='<span style="font-size:9px;color:var(--muted)">'+latStr+'</span>';
     html+='<span style="font-size:9px;color:var(--dim)">'+h.polls+'p</span>';
     html+='<div class="pp-bar-wrap"><div class="pp-bar"><div class="pp-bar-fill" style="width:'+okPct+'%;background:'+barColor+'"></div></div></div>';
@@ -1443,6 +1487,76 @@ function renderPool(state){
 }
 
 /* ── Health Panel ── */
+/* Compute health client-side from polls array (eliminates /health endpoint DB query) */
+function computeHealth(polls,windowMinutes){
+  if(!polls||polls.length===0)return null;
+  var cutoff=Date.now()-windowMinutes*60000;
+  var recent=polls.filter(function(p){return new Date(p.createdAt).getTime()>=cutoff;});
+  if(recent.length===0)return null;
+  var windowMs=windowMinutes*60000;
+  var chainMap={},ipMap={};
+  for(var i=0;i<recent.length;i++){
+    var p=recent[i];
+    var chain=p.chainId||'unknown';
+    var ip=p.publicIp||'unknown';
+    var latency=p.responseTimeMs||0;
+    var status=p.status||'unknown';
+    var ts=new Date(p.createdAt).toISOString();
+    var isSuccess=status==='ok'||status==='filtered_out';
+    /* chain */
+    if(!chainMap[chain])chainMap[chain]={polls:0,latencySum:0,latencyCount:0,lastPollAt:ts,statuses:{}};
+    var ch=chainMap[chain];
+    ch.polls++;
+    if(latency>0){ch.latencySum+=latency;ch.latencyCount++;}
+    ch.statuses[status]=(ch.statuses[status]||0)+1;
+    /* ip */
+    if(!ipMap[ip])ipMap[ip]={polls:0,latencySum:0,latencyCount:0,chain:chain,successCount:0,tcpBlockedCount:0,lastSeenAt:ts,provider:p.provider||'unknown'};
+    var ip2=ipMap[ip];
+    ip2.polls++;
+    if(latency>0){ip2.latencySum+=latency;ip2.latencyCount++;}
+    if(isSuccess)ip2.successCount++;
+    if(status==='tcp_blocked')ip2.tcpBlockedCount++;
+  }
+  /* build chains */
+  var chains={};
+  var chainKeys=Object.keys(chainMap);
+  for(var ci=0;ci<chainKeys.length;ci++){
+    var cn=chainKeys[ci];var cv=chainMap[cn];
+    chains[cn]={polls:cv.polls,pollsPerMin:+(cv.polls/(windowMs/60000)).toFixed(1),avgLatencyMs:cv.latencyCount>0?Math.round(cv.latencySum/cv.latencyCount):0,lastPollAt:cv.lastPollAt,statuses:cv.statuses};
+  }
+  /* build ips */
+  var ips={};
+  var ipKeys2=Object.keys(ipMap);
+  for(var ii=0;ii<ipKeys2.length;ii++){
+    var ik=ipKeys2[ii];var iv=ipMap[ik];
+    ips[ik]={polls:iv.polls,pollsPerMin:+(iv.polls/(windowMs/60000)).toFixed(1),avgLatencyMs:iv.latencyCount>0?Math.round(iv.latencySum/iv.latencyCount):0,successRate:iv.polls>0?+(iv.successCount/iv.polls*100).toFixed(0):0,tcpBlockedCount:iv.tcpBlockedCount,tcpBlockedRate:iv.polls>0?+(iv.tcpBlockedCount/iv.polls*100).toFixed(1):0,chain:iv.chain,lastSeenAt:iv.lastSeenAt,provider:iv.provider};
+  }
+  /* alerts */
+  var alerts=[];
+  var threeMinAgo=Date.now()-3*60000;
+  for(var ai=0;ai<chainKeys.length;ai++){
+    var an=chainKeys[ai];var av=chainMap[an];
+    if(new Date(av.lastPollAt).getTime()<threeMinAgo){
+      var mins=Math.round((Date.now()-new Date(av.lastPollAt).getTime())/60000);
+      alerts.push({type:'chain_silent',message:an+' chain: no polls in '+mins+'min',severity:'warning'});
+    }
+  }
+  for(var ri=0;ri<ipKeys2.length;ri++){
+    var rk=ipKeys2[ri];var rv=ipMap[rk];
+    var rate=rv.polls/(windowMs/60000);
+    if(rate>15)alerts.push({type:'rate_high',message:rk+': '+rate.toFixed(1)+' req/min (limit ~20)',severity:rate>18?'critical':'warning'});
+    if(rv.tcpBlockedCount>0){
+      var br=rv.tcpBlockedCount/rv.polls;
+      if(rv.tcpBlockedCount>=3||br>0.05){
+        var pct=(br*100).toFixed(0);
+        var lbl=rv.tcpBlockedCount>=3?'circuit breaker active':pct+'% bloqueo';
+        alerts.push({type:'ip_block_rate_high',message:rk+': '+rv.tcpBlockedCount+' tcp_blocked/'+rv.polls+' polls ('+pct+'%) — '+lbl,severity:br>0.15?'critical':'warning'});
+      }
+    }
+  }
+  return{windowMinutes:windowMinutes,totalPolls:recent.length,ratePerMin:+(recent.length/(windowMs/60000)).toFixed(1),chains:chains,ips:ips,alerts:alerts};
+}
+
 function renderHealth(h){
   var el=document.getElementById('healthEmpty');
   var cEl=document.getElementById('healthChains');
@@ -1629,6 +1743,7 @@ function guessPhase(){
 
 function renderActions(st){
   var el=document.getElementById('actions');
+  var ed=document.getElementById('emergDiv');
   if(st==='active'){
     el.style.display='flex';
     el.innerHTML='<button class="btn btn-r" onclick="botAct(\\'pause\\')">pausar</button>';
@@ -1638,7 +1753,22 @@ function renderActions(st){
   }else if(st==='error'||st==='login_required'||st==='created'){
     el.style.display='flex';
     el.innerHTML='<button class="btn btn-c" onclick="botAct(\\'activate\\')">activar</button>';
-  }else{el.style.display='none'}
+  }else{el.style.display='none';}
+  ed.style.display=(st==='active'||st==='error'||st==='login_required')?'':'none';
+}
+
+async function emergAct(a){
+  var labels={'force-login':'forzar login (dispara login-visa)','restart-chain':'restart cadena de polling'};
+  if(!confirm('\\u00bfEjecutar: '+labels[a]+'?'))return;
+  var btns=document.querySelectorAll('#emergDiv .btn');
+  for(var i=0;i<btns.length;i++){btns[i].disabled=true;}
+  try{
+    var r=await fetch(API+'/bots/'+BID+'/'+a,{method:'POST'});
+    var d=await r.json();
+    if(r.ok)showToast(a==='force-login'?'login iniciado':'cadena reiniciada',true);
+    else showToast(d.error||'error '+r.status,false);
+  }catch(e){showToast('error de red',false);}
+  setTimeout(refresh,1500);
 }
 
 async function botAct(a){
@@ -2524,146 +2654,10 @@ function renderTimelines(){
   detEl.innerHTML=html;
 }
 
-/* ── Subscriber refresh ── */
-async function refreshSubscriber(bot){
-  /* Country flag */
-  var cc=bot.locale?bot.locale.split('-')[1]:'';
-  var cm=CMETA[cc];
-  document.getElementById('botFlag').textContent=cm?cm.flag:'';
-  document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — subscriber';
-
-  /* Status chip */
-  var sc=document.getElementById('statusChip');
-  sc.textContent=bot.status;sc.className='chip chip-'+bot.status;
-  renderActions(bot.status);
-
-  /* Hide scout-only strip items */
-  document.getElementById('sesAge').parentElement.style.display='none';
-  document.getElementById('proxyVal').parentElement.style.display='none';
-  document.getElementById('pollSrc').parentElement.style.display='none';
-  /* Hide separators after status chip — keep first one for err */
-  var seps=document.querySelectorAll('.strip .sep');
-  if(seps[0])seps[0].style.display='';
-  for(var si=1;si<seps.length;si++)seps[si].style.display='none';
-  var ec=document.getElementById('errCount');
-  ec.textContent=bot.consecutiveErrors||'0';
-  ec.style.color=bot.consecutiveErrors>0?'var(--red)':'var(--green)';
-
-  /* Countdown phase */
-  document.getElementById('cdPhase').textContent='SUBSCRIBER';
-
-  /* Appointment */
-  var cd2=bot.currentConsularDate;
-  document.getElementById('conDate').innerHTML=fmtD(cd2)+(bot.currentConsularTime?' '+bot.currentConsularTime:'');
-  document.getElementById('conDays').textContent=daysUntil(cd2);
-  var hasCas=bot.ascFacilityId&&bot.ascFacilityId!=='';
-  document.getElementById('casRow').style.display=hasCas?'':'none';
-  if(hasCas){
-    document.getElementById('casDate').innerHTML=fmtD(bot.currentCasDate)+(bot.currentCasTime?' '+bot.currentCasTime:'');
-    document.getElementById('casDays').textContent=daysUntil(bot.currentCasDate);
-  }
-
-  /* Config card */
-  var cfgHtml='';
-  cfgHtml+='<div class="sub-kv"><span class="sub-k">locale</span><span class="sub-v">'+(bot.locale||'es-co')+'</span></div>';
-  cfgHtml+='<div class="sub-kv"><span class="sub-k">facility</span><span class="sub-v">'+(bot.consularFacilityId||'--')+(hasCas?' + ASC '+(bot.ascFacilityId||''):'')+'</span></div>';
-  if(bot.targetDateBefore){
-    cfgHtml+='<div class="sub-kv"><span class="sub-k">target</span><span class="sub-v" style="color:var(--amber)">antes de '+fmtD(bot.targetDateBefore)+'</span></div>';
-  }
-  if(bot.maxReschedules!=null){
-    var pct=Math.min(100,Math.round((bot.rescheduleCount||0)/bot.maxReschedules*100));
-    var barColor=pct>=100?'var(--red)':pct>=50?'var(--amber)':'var(--green)';
-    var atLimit=pct>=100;
-    cfgHtml+='<div class="sub-kv"><span class="sub-k">reschedules</span><span class="sub-v"><span class="sub-limits">'
-      +(bot.rescheduleCount||0)+'/'+bot.maxReschedules
-      +(atLimit?' <span style="color:var(--red);font-size:9px">LIMITE</span>':'')
-      +' <span class="sub-limits-bar"><span class="sub-limits-fill" style="width:'+pct+'%;background:'+barColor+'"></span></span>'
-      +'</span></span></div>';
-  }
-  var exRanges=bot.excludedDateRanges||[];
-  if(exRanges.length>0){
-    var exStr=exRanges.map(function(r){return fmtD(r.startDate)+' - '+fmtD(r.endDate)}).join(', ');
-    cfgHtml+='<div class="sub-kv"><span class="sub-k">exclusiones</span><span class="sub-v" style="font-size:10px;font-weight:400">'+exStr+'</span></div>';
-  }
-  document.getElementById('subConfig').innerHTML=cfgHtml;
-
-  /* Scout status */
-  var scoutEl=document.getElementById('subScout');
-  if(bot.scoutInfo){
-    var si=bot.scoutInfo;
-    var scoutAlive=si.status==='active';
-    var scoutAgo=si.lastPollAt?sesStr(si.lastPollAt):'nunca';
-    var dotColor=scoutAlive?'var(--green)':'var(--red)';
-    var scoutHtml='<div class="sub-scout-status">';
-    scoutHtml+='<span class="sub-scout-dot" style="background:'+dotColor+'"></span>';
-    scoutHtml+='<span style="font-weight:700;color:var(--bright)">Bot #'+si.id+'</span>';
-    scoutHtml+='<span class="chip chip-'+si.status+'" style="font-size:8px">'+si.status+'</span>';
-    scoutHtml+='</div>';
-    scoutHtml+='<div style="font-size:10px;color:var(--muted)">ultimo poll: <span style="color:'+(scoutAlive?'var(--green)':'var(--red)')+'">'+scoutAgo+'</span></div>';
-    scoutEl.innerHTML=scoutHtml;
-  }else{
-    scoutEl.innerHTML='<div style="color:var(--red);font-size:11px">sin scout activo para facility '+(bot.consularFacilityId||'?')+'</div>';
-  }
-
-  /* Fetch subscriber-specific data */
-  var subRes=await Promise.all([
-    fetchJ(API+'/bots/'+BID+'/logs/reschedules?limit=20'),
-    fetchJ(API+'/bots/'+BID+'/logs/dispatches/received?limit=20')
-  ]);
-  var rss=subRes[0],dispatches=subRes[1];
-
-  /* Dispatches */
-  var dEl=document.getElementById('subDispatches');
-  var dEmpty=document.getElementById('subDispEmpty');
-  if(dispatches.length===0){dEl.innerHTML='';dEmpty.style.display=''}
-  else{
-    dEmpty.style.display='none';
-    var dh='';
-    for(var i=0;i<dispatches.length;i++){
-      var dp=dispatches[i];var dt=dp.detail;
-      var resColor=dt.result==='success'?'var(--green)':dt.result==='failed'?'var(--red)':'var(--muted)';
-      var actionLabel=dt.action==='attempted'?(dt.result||'--'):(dt.action||'--');
-      dh+='<div class="sub-disp-item">';
-      dh+='<div style="display:flex;justify-content:space-between;align-items:center">';
-      dh+='<span style="color:var(--bright)">'+fmtTime(dp.createdAt)+'</span>';
-      dh+='<span>'+badge(actionLabel,dt.result==='success'?'success':dt.action==='attempted'?'fail':'filtered_out')+'</span>';
-      dh+='</div>';
-      if(dp.availableDates&&dp.availableDates.length>0){
-        dh+='<div class="sub-disp-dates">fechas: '+dp.availableDates.slice(0,3).map(function(d){return fmtDs(d)}).join(', ')+(dp.availableDates.length>3?' +'+( dp.availableDates.length-3)+' mas':'')+'</div>';
-      }
-      var timingParts=[];
-      if(dt.loginMs)timingParts.push('login '+dt.loginMs+'ms');
-      if(dt.rescheduleMs)timingParts.push('reschedule '+dt.rescheduleMs+'ms');
-      if(dt.newDate)timingParts.push(fmtDs(dt.currentDate)+' → '+fmtDs(dt.newDate));
-      if(dt.failReason)timingParts.push('<span style="color:var(--red)">'+dt.failReason+'</span>');
-      if(timingParts.length>0)dh+='<div class="sub-disp-timing">'+timingParts.join(' · ')+'</div>';
-      dh+='</div>';
-    }
-    dEl.innerHTML=dh;
-  }
-
-  /* Reschedules */
-  var rl=document.getElementById('subReschedules');
-  var re=document.getElementById('subRsEmpty');
-  if(rss.length===0){rl.innerHTML='';re.style.display=''}
-  else{
-    re.style.display='none';
-    var rh='';
-    for(var i=0;i<rss.length;i++){
-      var r=rss[i];var ok=r.success;
-      rh+='<div class="rs-item"><div class="rs-dates">'+fmtDs(r.oldConsularDate)+' '+(r.oldConsularTime||'')+
-        '<span class="rs-arrow">&rarr;</span><span style="color:'+(ok?'var(--green)':'var(--red)')+';font-weight:700">'
-        +fmtDs(r.newConsularDate)+' '+r.newConsularTime+'</span> '+badge(ok?'OK':'FAIL',ok?'success':'fail')+
-        '</div><div class="rs-meta">'+fmt(r.createdAt)+(ok&&r.error?' &mdash; <span style="color:var(--accent)">'+r.error.substring(0,60)+'</span>':!ok&&r.error?' &mdash; <span class="rs-err">'+r.error.substring(0,60)+'</span>':'')+'</div></div>';
-    }
-    rl.innerHTML=rh;
-  }
-}
-
 tickClock();refresh();
 setInterval(tickClock,1000);
 setInterval(tickCd,1000);
-setInterval(refresh,30000);
+setInterval(refresh,60000);
 document.querySelector('.hdr').addEventListener('click',function(){refresh()});
 window.addEventListener('resize',function(){
   if(lastPolls&&lastBot)drawChart(lastPolls,lastBot.currentConsularDate,lastSummary,chartMode);
