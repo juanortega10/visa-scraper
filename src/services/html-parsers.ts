@@ -141,6 +141,55 @@ export function extractAppointments(groupsHtml: string): ExtractedAppointments {
   return { currentConsularDate, currentConsularTime, currentCasDate, currentCasTime };
 }
 
+export interface GroupInfo {
+  scheduleId: string;
+  applicantIds: string[];
+  applicantNames: string[];
+  currentConsularDate: string | null;
+  currentConsularTime: string | null;
+  currentCasDate: string | null;
+  currentCasTime: string | null;
+}
+
+/**
+ * Parse all schedule groups from the /groups/{userId} page.
+ * Splits HTML by the first occurrence of each unique schedule ID,
+ * then extracts applicant IDs and dates from each section.
+ */
+export function extractGroups(groupsHtml: string): GroupInfo[] {
+  // Collect the first occurrence position of each unique schedule ID.
+  const seen = new Set<string>();
+  const boundaries: Array<{ id: string; start: number }> = [];
+
+  for (const m of groupsHtml.matchAll(/\/schedule\/(\d+)\//g)) {
+    if (!seen.has(m[1]!)) {
+      seen.add(m[1]!);
+      boundaries.push({ id: m[1]!, start: m.index! });
+    }
+  }
+
+  if (boundaries.length === 0) return [];
+
+  return boundaries.map(({ id, start }, i) => {
+    const end = boundaries[i + 1]?.start ?? groupsHtml.length;
+    const section = groupsHtml.slice(start, end);
+
+    const applicantIds: string[] = [];
+    const apptSeen = new Set<string>();
+    for (const m of section.matchAll(/\/applicants\/(\d+)/g)) {
+      if (!apptSeen.has(m[1]!)) { apptSeen.add(m[1]!); applicantIds.push(m[1]!); }
+    }
+
+    const { currentConsularDate, currentConsularTime, currentCasDate, currentCasTime } =
+      extractAppointments(section);
+
+    // Pass apptPageOk=false so it uses the <td> fallback on the section HTML
+    const applicantNames = extractApplicantNames(section, '', false);
+
+    return { scheduleId: id, applicantIds, applicantNames, currentConsularDate, currentConsularTime, currentCasDate, currentCasTime };
+  });
+}
+
 export interface ExtractedFacilities {
   consularFacilityId: string;
   ascFacilityId: string;

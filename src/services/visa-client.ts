@@ -1,7 +1,7 @@
 import { logger } from '@trigger.dev/sdk/v3';
 import { USER_AGENT, BROWSER_HEADERS, getBaseUrl, getLocaleTexts, type LocaleTexts } from '../utils/constants.js';
-import { proxyFetch, type ProxyProvider } from './proxy-fetch.js';
-import { extractAppointments } from './html-parsers.js';
+import { proxyFetch, type ProxyProvider, type ProxyFetchMeta } from './proxy-fetch.js';
+import { extractAppointments, extractGroups } from './html-parsers.js';
 
 export class SessionExpiredError extends Error {
   constructor(detail?: string) {
@@ -53,6 +53,7 @@ export class VisaClient {
   private texts: LocaleTexts;
   private extractedAscFacilityId: string | null = null;
   private capturedPages = new Map<string, string>();
+  private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null };
 
   constructor(session: VisaSession, config: VisaClientConfig) {
     this.session = { ...session };
@@ -77,6 +78,10 @@ export class VisaClient {
 
   getExtractedAscFacilityId(): string | null {
     return this.extractedAscFacilityId;
+  }
+
+  getLastProxyMeta(): ProxyFetchMeta {
+    return this.lastProxyMeta;
   }
 
   getCapturedPages(): Map<string, string> {
@@ -115,9 +120,16 @@ export class VisaClient {
   }
 
   private async doFetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const resp = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls);
-    this.updateCookieFromResponse(resp);
-    return resp;
+    try {
+      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls);
+      this.lastProxyMeta = meta;
+      this.updateCookieFromResponse(response);
+      return response;
+    } catch (err) {
+      const proxyMeta = (err as { proxyMeta?: ProxyFetchMeta }).proxyMeta;
+      if (proxyMeta) this.lastProxyMeta = proxyMeta;
+      throw err;
+    }
   }
 
   /** Wraps doFetch with retry on 5xx errors (2 retries, 300ms/600ms backoff). */
@@ -135,9 +147,10 @@ export class VisaClient {
 
   /** Always uses direct fetch — Bright Data proxy returns 402 on POST to gov sites */
   private async doDirectFetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const resp = await proxyFetch(url, options, 'direct');
-    this.updateCookieFromResponse(resp);
-    return resp;
+    const { response, meta } = await proxyFetch(url, options, 'direct');
+    this.lastProxyMeta = meta;
+    this.updateCookieFromResponse(response);
+    return response;
   }
 
   private assertOk(resp: Response, label: string): void {
@@ -237,14 +250,15 @@ export class VisaClient {
     const html = await resp.text();
     if (this.config.captureHtml) this.capturedPages.set('groups-page', html);
 
-    const extracted = extractAppointments(html);
-    if (!extracted.currentConsularDate || !extracted.currentConsularTime) return null;
+    const groups = extractGroups(html);
+    const myGroup = groups.find(g => g.scheduleId === String(this.config.scheduleId));
+    if (!myGroup || !myGroup.currentConsularDate || !myGroup.currentConsularTime) return null;
 
     return {
-      consularDate: extracted.currentConsularDate,
-      consularTime: extracted.currentConsularTime,
-      casDate: extracted.currentCasDate,
-      casTime: extracted.currentCasTime,
+      consularDate: myGroup.currentConsularDate,
+      consularTime: myGroup.currentConsularTime,
+      casDate: myGroup.currentCasDate,
+      casTime: myGroup.currentCasTime,
     };
   }
 

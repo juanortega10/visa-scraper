@@ -4,8 +4,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mockProxyFetch = vi.fn();
 
+const DEFAULT_META = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0 };
+
 vi.mock('../proxy-fetch.js', () => ({
-  proxyFetch: (...args: any[]) => mockProxyFetch(...args),
+  proxyFetch: async (...args: any[]) => {
+    const result = await mockProxyFetch(...args);
+    return result instanceof Response ? { response: result, meta: DEFAULT_META } : result;
+  },
 }));
 
 vi.mock('../html-parsers.js', async () => {
@@ -26,6 +31,7 @@ import { VisaClient } from '../visa-client.js';
 
 const GROUPS_CO = `
 <html><body>
+<a href="/es-co/niv/schedule/99999/appointment">Reagendar</a>
 <p class='consular-appt'>
   <strong>Cita Consular:</strong>
   9 marzo, 2026, 08:15 Bogota Hora Local at Bogota
@@ -38,6 +44,7 @@ const GROUPS_CO = `
 
 const GROUPS_PE = `
 <html><body>
+<a href="/es-pe/niv/schedule/99999/appointment">Reagendar</a>
 <p class='consular-appt'>
   <strong>Consular Appointment:</strong>
   20 april, 2026, 10:00 Lima Local Time at Lima
@@ -46,6 +53,7 @@ const GROUPS_PE = `
 
 const GROUPS_DOUBLE_QUOTES = `
 <html><body>
+<a href="/en-ca/niv/schedule/99999/appointment">Reschedule</a>
 <p class="consular-appt">
   <strong>Consular Appointment:</strong>
   3 january, 2027, 14:30 Ottawa Local Time at Ottawa
@@ -80,18 +88,19 @@ function makeClient(userId: string | null = '12345') {
 const GROUPS_REAL_CO = `
 <html><body>
 <div class='card'>
+<a href="/es-co/niv/schedule/99999/appointment">Reagendar</a>
 <p class='consular-appt'>
 <strong>Cita Consular<span>&#58;</span></strong>
 12 noviembre, 2026, 09:00 Bogota Hora Local at Bogota
  &mdash;
-<a href="/es-co/niv/schedule/71075235/addresses/consulate"><span class='fas fa-map-marker-alt'></span>
+<a href="/es-co/niv/schedule/99999/addresses/consulate"><span class='fas fa-map-marker-alt'></span>
 Cómo llegar
 </a></p>
 <p class='asc-appt'>
 <strong>Cita CAS<span>&#58;</span></strong>
  3 noviembre, 2026, 08:00 BOGOTA Hora Local at Bogota ASC
  &mdash;
-<a href="/es-co/niv/schedule/71075235/addresses/asc"><span class='fas fa-map-marker-alt'></span>
+<a href="/es-co/niv/schedule/99999/addresses/asc"><span class='fas fa-map-marker-alt'></span>
 Cómo llegar
 </a></p>
 </div>
