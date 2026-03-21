@@ -784,7 +784,23 @@ logsRouter.get('/bots/:id/ban-status', async (c) => {
   let estimatedRecoveryMin = null;
   if (openBan) {
     const durationSoFarMin = Math.round((Date.now() - openBan.startedAt.getTime()) / 60000);
-    const clsStats = historicalStats[openBan.classification];
+    let clsStats = historicalStats[openBan.classification];
+
+    // Fallback to global stats if this bot has <3 episodes of this classification
+    if (!clsStats || clsStats.count < 3) {
+      const globalStats = await db.execute<{ median_min: string; p90_min: string; count: string }>(sql`
+        SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_min))::text as median_min,
+          ROUND(PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY duration_min))::text as p90_min,
+          COUNT(*)::text as count
+        FROM ban_episodes WHERE ended_at IS NOT NULL AND duration_min IS NOT NULL
+          AND classification = ${openBan.classification}
+      `);
+      const g = globalStats.rows[0];
+      if (g && parseInt(g.count) > 0) {
+        clsStats = { count: parseInt(g.count), avgMin: 0, medianMin: parseInt(g.median_min), p90Min: parseInt(g.p90_min) };
+      }
+    }
+
     estimatedRecoveryMin = clsStats ? Math.max(0, clsStats.medianMin - durationSoFarMin) : null;
     currentBan = {
       startedAt: openBan.startedAt, durationSoFarMin, classification: openBan.classification,
@@ -1009,20 +1025,34 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
   const tcpBlocked = parseInt(overall.rows[0]?.tcp_blocked ?? '0');
   const softBan = parseInt(overall.rows[0]?.soft_ban ?? '0');
 
+  // Rate vs ban: exclude polls DURING active bans (backoff polls contaminate low-rate buckets).
+  // Only count the transition: the poll that TRIGGERS the ban (prev was ok, this is blocked).
+  // A poll at rate X that resulted in tcp_blocked = "rate X caused a ban".
+  // A poll at rate 0.5/min that is tcp_blocked = "already banned, polling slowly" — not causal.
   const rateCorrelation = await db.execute<{ rate_bucket: string; polls: string; blocked: string }>(sql`
-    WITH gaps AS (
-      SELECT status, EXTRACT(EPOCH FROM created_at - LAG(created_at) OVER (PARTITION BY bot_id ORDER BY created_at)) as gap_s
+    WITH sequenced AS (
+      SELECT status, created_at,
+        EXTRACT(EPOCH FROM created_at - LAG(created_at) OVER (PARTITION BY bot_id ORDER BY created_at)) as gap_s,
+        LAG(status) OVER (PARTITION BY bot_id ORDER BY created_at) as prev_status
       FROM poll_logs WHERE created_at >= ${since}
     ),
     rated AS (
-      SELECT status,
+      SELECT status, prev_status,
         CASE WHEN gap_s IS NULL OR gap_s > 120 OR gap_s <= 0 THEN NULL ELSE ROUND(60.0 / gap_s, 1) END as rate_per_min
-      FROM gaps
+      FROM sequenced
+    ),
+    filtered AS (
+      -- Include: non-blocked polls (normal operation) + FIRST block in a sequence (prev was not blocked)
+      -- Exclude: sustained blocks (prev was also blocked) — these are backoff polls, not causal
+      SELECT status, rate_per_min
+      FROM rated
+      WHERE rate_per_min IS NOT NULL
+        AND (status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked')
     )
     SELECT CASE WHEN rate_per_min < 1 THEN '<1/min' WHEN rate_per_min < 3 THEN '1-3/min'
       WHEN rate_per_min < 5 THEN '3-5/min' WHEN rate_per_min < 8 THEN '5-8/min' ELSE '8+/min' END as rate_bucket,
       COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
-    FROM rated WHERE rate_per_min IS NOT NULL GROUP BY 1 ORDER BY MIN(rate_per_min)
+    FROM filtered GROUP BY 1 ORDER BY MIN(rate_per_min)
   `);
   const rateVsBanCorrelation = rateCorrelation.rows.map(r => ({
     rateRange: r.rate_bucket, polls: parseInt(r.polls), blocked: parseInt(r.blocked),
@@ -1041,30 +1071,44 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
     byProvider[r.provider] = { polls: p, blockRate: p > 0 ? Math.round(parseInt(r.blocked) / p * 10000) / 10000 : 0, avgResponseMs: parseInt(r.avg_ms) };
   }
 
+  // Session age vs block: same filtering — exclude sustained block polls (already banned)
   const sessionAge = await db.execute<{ age_bucket: string; polls: string; blocked: string }>(sql`
+    WITH sequenced AS (
+      SELECT status, connection_info->>'sessionAgeMs' as session_age_ms,
+        LAG(status) OVER (PARTITION BY bot_id ORDER BY created_at) as prev_status
+      FROM poll_logs WHERE created_at >= ${since} AND connection_info->>'sessionAgeMs' IS NOT NULL
+    )
     SELECT CASE
-        WHEN (connection_info->>'sessionAgeMs')::int < 900000 THEN '0-15min'
-        WHEN (connection_info->>'sessionAgeMs')::int < 1800000 THEN '15-30min'
-        WHEN (connection_info->>'sessionAgeMs')::int < 2700000 THEN '30-45min'
-        WHEN (connection_info->>'sessionAgeMs')::int < 3600000 THEN '45-60min'
+        WHEN (session_age_ms)::int < 900000 THEN '0-15min'
+        WHEN (session_age_ms)::int < 1800000 THEN '15-30min'
+        WHEN (session_age_ms)::int < 2700000 THEN '30-45min'
+        WHEN (session_age_ms)::int < 3600000 THEN '45-60min'
         ELSE '60min+'
       END as age_bucket,
       COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
-    FROM poll_logs WHERE created_at >= ${since} AND connection_info->>'sessionAgeMs' IS NOT NULL
-    GROUP BY 1 ORDER BY MIN((connection_info->>'sessionAgeMs')::int)
+    FROM sequenced
+    WHERE status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked'
+    GROUP BY 1 ORDER BY MIN((session_age_ms)::int)
   `);
   const sessionAgeVsBlock = sessionAge.rows.map(r => ({
     ageRange: r.age_bucket, polls: parseInt(r.polls),
     blockRate: parseInt(r.polls) > 0 ? Math.round(parseInt(r.blocked) / parseInt(r.polls) * 10000) / 10000 : 0,
   }));
 
-  const safeBuckets = rateVsBanCorrelation.filter(r => r.blockRate < 0.05);
+  // Recommendation: find the highest rate with <5% ban-trigger rate (using filtered data)
+  const safeBuckets = rateVsBanCorrelation.filter(r => r.blockRate < 0.05 && r.polls > 100);
   const optimalRate = safeBuckets.length > 0 ? safeBuckets[safeBuckets.length - 1]!.rateRange : 'unknown';
+  const maxSafe = safeBuckets.length > 0 ? safeBuckets[safeBuckets.length - 1]! : null;
 
   const result = {
     overallStats: { totalPolls, tcpBlockedRate: totalPolls > 0 ? Math.round(tcpBlocked / totalPolls * 10000) / 10000 : 0, softBanRate: totalPolls > 0 ? Math.round(softBan / totalPolls * 10000) / 10000 : 0, periodDays: days },
     rateVsBanCorrelation, byProvider, sessionAgeVsBlock,
-    recommendation: { optimalRate, reasoning: `Highest rate bucket with <5% block rate: ${optimalRate}` },
+    methodology: 'Rate correlation excludes sustained-block polls (already banned, in backoff). Only counts ban-triggering polls (transition from ok→blocked) to measure causal relationship between rate and ban probability.',
+    recommendation: {
+      optimalRate,
+      maxSafeBlockRate: maxSafe?.blockRate ?? null,
+      reasoning: `Highest rate bucket (>100 polls) with <5% ban-trigger rate: ${optimalRate}`,
+    },
   };
 
   setCached(cacheKey, result, 10 * 60_000);
