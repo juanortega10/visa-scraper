@@ -1685,18 +1685,17 @@ function persistDateSightings(
     return Math.round((new Date(y, m - 1, d).getTime() - todayMs) / 864e5);
   }
 
-  const now = new Date();
+  // Use ISO string to ensure UTC regardless of server timezone (RPi may be UTC-5)
+  const nowIso = new Date().toISOString();
 
   if (appeared.length > 0) {
     pending.push(
-      db.insert(dateSightings).values(
-        appeared.map(date => ({
-          botId,
-          date,
-          appearedAt: now,
-          daysFromNow: daysFr(date),
-        })),
-      ).catch(e => logger.error('dateSighting insert failed', { error: String(e) })),
+      db.execute(sql`
+        INSERT INTO date_sightings (bot_id, date, appeared_at, days_from_now)
+        VALUES ${sql.join(appeared.map(date =>
+          sql`(${botId}, ${date}, ${nowIso}::timestamp, ${daysFr(date)})`
+        ), sql`, `)}
+      `).catch(e => logger.error('dateSighting insert failed', { error: String(e) })),
     );
   }
 
@@ -1706,8 +1705,8 @@ function persistDateSightings(
       pending.push(
         db.execute(sql`
           UPDATE date_sightings
-          SET disappeared_at = ${now},
-              duration_ms = EXTRACT(EPOCH FROM (${now}::timestamp - appeared_at)) * 1000
+          SET disappeared_at = ${nowIso}::timestamp,
+              duration_ms = EXTRACT(EPOCH FROM (${nowIso}::timestamp - appeared_at)) * 1000
           WHERE id = (
             SELECT id FROM date_sightings
             WHERE bot_id = ${botId} AND date = ${date} AND disappeared_at IS NULL

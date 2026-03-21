@@ -876,7 +876,7 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
 
   const durationStats = await db.execute<{ median_ms: string }>(sql`
     SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_ms
-    FROM date_sightings WHERE bot_id = ${botId} AND appeared_at >= ${since} AND duration_ms IS NOT NULL
+    FROM date_sightings WHERE bot_id = ${botId} AND appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0
   `);
   const medianSlotDurationMin = durationStats.rows[0]?.median_ms
     ? Math.round(parseInt(durationStats.rows[0].median_ms) / 60000 * 10) / 10 : null;
@@ -912,7 +912,7 @@ logsRouter.get('/cross-schedule-comparison', async (c) => {
 
   const activeBots = await db.select({
     id: bots.id, scheduleId: bots.scheduleId, locale: bots.locale,
-    applicantCount: sql<number>`array_length(${bots.applicantIds}, 1)`,
+    applicantCount: sql<number>`jsonb_array_length(${bots.applicantIds})`,
   }).from(bots).where(eq(bots.status, 'active'));
 
   const schedules: Array<{ botId: number; scheduleId: string | null; applicantCount: number; locale: string | null; dates: string[] }> = [];
@@ -970,7 +970,7 @@ logsRouter.get('/slot-patterns', async (c) => {
     SELECT EXTRACT(HOUR FROM appeared_at AT TIME ZONE 'America/Bogota')::text as hour,
       COUNT(*)::text as count,
       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_duration_ms
-    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL GROUP BY 1 ORDER BY 1
+    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0 GROUP BY 1 ORDER BY 1
   `);
   const hourlyDistribution = hourly.rows.map(r => ({
     hour: parseInt(r.hour), sightings: parseInt(r.count),
@@ -990,7 +990,7 @@ logsRouter.get('/slot-patterns', async (c) => {
     SELECT CASE WHEN days_from_now < 30 THEN 'under30days' WHEN days_from_now < 90 THEN '30to90days' ELSE 'over90days' END as bucket,
       COUNT(*)::text as count,
       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_duration_ms
-    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND days_from_now IS NOT NULL GROUP BY 1
+    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0 AND days_from_now IS NOT NULL GROUP BY 1
   `);
   const closeDateStats: Record<string, { count: number; medianDurationMin: number | null }> = {};
   for (const r of proximity.rows) {
