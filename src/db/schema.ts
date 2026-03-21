@@ -176,6 +176,7 @@ export const pollLogs = pgTable(
     publicIp: varchar('public_ip', { length: 45 }), // IPv4 or IPv6
     dateChanges: jsonb('date_changes').$type<{ appeared: string[], disappeared: string[] }>(),
     error: text('error'),
+    banPhase: varchar('ban_phase', { length: 15 }), // null=normal, 'trigger'=first block, 'sustained'=during ban, 'recovery'=first ok post-ban
     connectionInfo: jsonb('connection_info').$type<{
       proxyAttemptIp?: string | null;  // webshare IP tried before fallback (lost if lastProxyIp reset)
       fallbackHappened?: boolean;      // webshare TCP fail → direct fallback

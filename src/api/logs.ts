@@ -1025,29 +1025,31 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
   const tcpBlocked = parseInt(overall.rows[0]?.tcp_blocked ?? '0');
   const softBan = parseInt(overall.rows[0]?.soft_ban ?? '0');
 
-  // Rate vs ban: exclude polls DURING active bans (backoff polls contaminate low-rate buckets).
-  // Only count the transition: the poll that TRIGGERS the ban (prev was ok, this is blocked).
-  // A poll at rate X that resulted in tcp_blocked = "rate X caused a ban".
-  // A poll at rate 0.5/min that is tcp_blocked = "already banned, polling slowly" — not causal.
+  // Rate vs ban: use banPhase to exclude sustained blocks (backoff polls inflate low-rate buckets).
+  // Only include normal polls + ban triggers. Sustained/recovery polls are excluded.
+  // Falls back to LAG(status) for historical polls without banPhase.
   const rateCorrelation = await db.execute<{ rate_bucket: string; polls: string; blocked: string }>(sql`
     WITH sequenced AS (
-      SELECT status, created_at,
+      SELECT status, ban_phase,
         EXTRACT(EPOCH FROM created_at - LAG(created_at) OVER (PARTITION BY bot_id ORDER BY created_at)) as gap_s,
         LAG(status) OVER (PARTITION BY bot_id ORDER BY created_at) as prev_status
       FROM poll_logs WHERE created_at >= ${since}
     ),
     rated AS (
-      SELECT status, prev_status,
+      SELECT status, ban_phase, prev_status,
         CASE WHEN gap_s IS NULL OR gap_s > 120 OR gap_s <= 0 THEN NULL ELSE ROUND(60.0 / gap_s, 1) END as rate_per_min
       FROM sequenced
     ),
     filtered AS (
-      -- Include: non-blocked polls (normal operation) + FIRST block in a sequence (prev was not blocked)
-      -- Exclude: sustained blocks (prev was also blocked) — these are backoff polls, not causal
       SELECT status, rate_per_min
       FROM rated
       WHERE rate_per_min IS NOT NULL
-        AND (status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked')
+        AND (
+          -- Use banPhase when available (new polls)
+          (ban_phase IS NOT NULL AND ban_phase NOT IN ('sustained', 'recovery'))
+          -- Fallback to LAG for old polls without banPhase
+          OR (ban_phase IS NULL AND (status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked'))
+        )
     )
     SELECT CASE WHEN rate_per_min < 1 THEN '<1/min' WHEN rate_per_min < 3 THEN '1-3/min'
       WHEN rate_per_min < 5 THEN '3-5/min' WHEN rate_per_min < 8 THEN '5-8/min' ELSE '8+/min' END as rate_bucket,
@@ -1071,10 +1073,10 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
     byProvider[r.provider] = { polls: p, blockRate: p > 0 ? Math.round(parseInt(r.blocked) / p * 10000) / 10000 : 0, avgResponseMs: parseInt(r.avg_ms) };
   }
 
-  // Session age vs block: same filtering — exclude sustained block polls (already banned)
+  // Session age vs block: exclude sustained block polls using banPhase (with LAG fallback)
   const sessionAge = await db.execute<{ age_bucket: string; polls: string; blocked: string }>(sql`
     WITH sequenced AS (
-      SELECT status, connection_info->>'sessionAgeMs' as session_age_ms,
+      SELECT status, ban_phase, connection_info->>'sessionAgeMs' as session_age_ms,
         LAG(status) OVER (PARTITION BY bot_id ORDER BY created_at) as prev_status
       FROM poll_logs WHERE created_at >= ${since} AND connection_info->>'sessionAgeMs' IS NOT NULL
     )
@@ -1087,7 +1089,8 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
       END as age_bucket,
       COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
     FROM sequenced
-    WHERE status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked'
+    WHERE (ban_phase IS NOT NULL AND ban_phase NOT IN ('sustained', 'recovery'))
+       OR (ban_phase IS NULL AND (status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked'))
     GROUP BY 1 ORDER BY MIN((session_age_ms)::int)
   `);
   const sessionAgeVsBlock = sessionAge.rows.map(r => ({

@@ -89,6 +89,8 @@ export const pollVisaTask = task({
     let publicIp: string | null = null;
     let connInfoExtra: { sessionAgeMs?: number; pollRateRecentPerMin?: number } = {};
     const timings: Record<string, number> = {};
+    let hasOpenBanEpisode = false; // true if bot currently has an open ban_episode
+    let closedBanThisRun = false;  // true if this run's success closed a ban episode
     logger.info('poll-visa START', { botId, chainId, dryRun: dryRun || undefined });
 
     // Public IP resolved lazily after bot load (need to know provider)
@@ -274,6 +276,13 @@ export const pollVisaTask = task({
     }
 
     logger.info('Session loaded', { botId, sessionAgeMin, lastUsedAt: session.lastUsedAt?.toISOString() });
+
+    // Check if bot currently has an open ban episode (for banPhase tagging)
+    const [openEp] = await db.select({ id: banEpisodes.id })
+      .from(banEpisodes)
+      .where(and(eq(banEpisodes.botId, botId), sql`${banEpisodes.endedAt} IS NULL`))
+      .limit(1);
+    hasOpenBanEpisode = !!openEp;
 
     // Pre-emptive re-login: refresh session before the ~88min hard TTL.
     // 50min threshold — Peru sessions expire at ~60min (Colombia ~88min).
@@ -578,7 +587,8 @@ export const pollVisaTask = task({
           const firstEarliest = days[0]?.date;
           const firstStatus = softBanNotified ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
           const firstDateChanges = computeDateChanges(allDays, previousDates);
-          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, connectionInfo: capturedConnInfo });
+          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, banPhase: getBanPhase(firstStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo });
+          if (hasOpenBanEpisode) hasOpenBanEpisode = false; // recovery consumed
           persistDateSightings(pending, botId, firstDateChanges, bot.currentConsularDate, bot.targetDateBefore);
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
@@ -633,7 +643,7 @@ export const pollVisaTask = task({
                   const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
                   if (proxyIp) publicIp = proxyIp;
                 }
-                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: null, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
                 logger.warn(`Super-critical fetch ${loopFetchCount} — HTTP 5xx (${consecutive5xx} consecutive)`, { botId, error: errMsg });
                 if (consecutive5xx >= 2 && !throttleNotified) {
                   throttleNotified = true;
@@ -661,7 +671,8 @@ export const pollVisaTask = task({
                 const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
                 if (proxyIp) publicIp = proxyIp;
               }
-              logPoll(pending, botId, null, 0, fetchMs, tcpBlock ? 'tcp_blocked' : 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+              const scLogStatus = tcpBlock ? 'tcp_blocked' : 'error';
+              logPoll(pending, botId, null, 0, fetchMs, scLogStatus, errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: getBanPhase(scLogStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
               logger.warn(`Super-critical fetch ${loopFetchCount} error`, { botId, consecutiveErrors, error: errMsg });
               if (tcpBlock && !tcpBlockNotified) {
                 tcpBlockNotified = true;
@@ -703,7 +714,8 @@ export const pollVisaTask = task({
             const fetchMs2 = Date.now() - fetchStart;
             const fetchStatus = isSoftBan ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
             const loopDateChanges = computeDateChanges(allDays, previousDates);
-            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, banPhase: getBanPhase(fetchStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+            if (hasOpenBanEpisode) hasOpenBanEpisode = false;
             persistDateSightings(pending, botId, loopDateChanges, bot.currentConsularDate, bot.targetDateBefore);
             previousDates = new Set(allDays.map(d => d.date));
             logger.info(`Super-critical fetch ${loopFetchCount} result`, {
@@ -914,8 +926,11 @@ export const pollVisaTask = task({
             runId: ctx.run.id,
             publicIp,
             dateChanges: finalDateChanges,
+            banPhase: getBanPhase(finalStatus, hasOpenBanEpisode),
             connectionInfo: capturedConnInfo,
           };
+          // Mark recovery consumed so only the first success poll gets tagged
+          if (hasOpenBanEpisode) hasOpenBanEpisode = false;
 
           // topDates always uses raw (unfiltered) dates for consistent cancellation tracking
           const topDatesRaw = allDays.slice(0, 10).map(d => d.date);
@@ -985,6 +1000,8 @@ export const pollVisaTask = task({
             .where(and(eq(banEpisodes.botId, botId), sql`${banEpisodes.endedAt} IS NULL`))
             .then((result) => {
               if (result.rowCount && result.rowCount > 0) {
+                closedBanThisRun = true;
+                hasOpenBanEpisode = false;
                 logger.info('Ban episode CLOSED', { botId });
               }
             })
@@ -1052,13 +1069,14 @@ export const pollVisaTask = task({
           const is5xx = is5xxError(errMsg);
           const fetchMs = Date.now() - iterationStartMs;
           { const proxyIp = client.getLastProxyMeta().proxyAttemptIp; if (proxyIp) publicIp = proxyIp; }
+          const batchLogStatus = isTcp ? 'tcp_blocked' : 'error';
           logPoll(pending, botId, null, 0, fetchMs,
-            isTcp ? 'tcp_blocked' : 'error', errMsg,
+            batchLogStatus, errMsg,
             undefined, undefined, {
               rawDatesCount: 0, provider: effectiveProvider, reloginHappened,
               chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal',
               fetchIndex: batchFetchCount,
-              runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra),
+              runId: ctx.run.id, publicIp, banPhase: getBanPhase(batchLogStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra),
             });
           if (isTcp && !tcpBlockNotified) {
             tcpBlockNotified = true;
@@ -1113,7 +1131,7 @@ export const pollVisaTask = task({
         }
       }
       logger.error(`Poll error: ${errMsg}`, { botId, responseTimeMs, tcpBlock, serverOverload });
-      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal', runId: ctx.run.id, publicIp, connectionInfo: capturedConnInfo });
+      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal', runId: ctx.run.id, publicIp, banPhase: getBanPhase(logStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo });
 
       if (error instanceof SessionExpiredError) {
         logger.warn(`SESSION EXPIRED: ${errMsg} — attempting inline re-login`, { botId });
@@ -1277,6 +1295,7 @@ export const pollVisaTask = task({
               },
             }).catch((e) => logger.error('ban_episode insert failed', { error: String(e) })),
           );
+          hasOpenBanEpisode = true;
           logger.info('Ban episode OPENED', { botId, classification: blockCls });
         } else {
           // Ongoing ban — update open episode (set to 'mixed' if classification differs)
@@ -1465,6 +1484,7 @@ interface LogPollExtra {
   runId?: string;
   publicIp?: string | null;
   dateChanges?: { appeared: string[], disappeared: string[] } | null;
+  banPhase?: 'trigger' | 'sustained' | 'recovery' | null;
   connectionInfo?: {
     proxyAttemptIp?: string | null;
     fallbackReason?: string;
@@ -1505,6 +1525,14 @@ function captureConnInfo(meta: ProxyFetchMeta, extra?: { sessionAgeMs?: number; 
   };
 }
 
+/** Determine ban lifecycle phase for this poll based on current state. */
+function getBanPhase(status: string, hasOpenBan: boolean): 'trigger' | 'sustained' | 'recovery' | null {
+  if (status === 'tcp_blocked') return hasOpenBan ? 'sustained' : 'trigger';
+  if (status === 'error') return null; // non-TCP errors are not ban-related
+  // Success statuses (ok, filtered_out, soft_ban)
+  return hasOpenBan ? 'recovery' : null;
+}
+
 function logPoll(
   pending: Promise<unknown>[],
   botId: number,
@@ -1539,6 +1567,7 @@ function logPoll(
       runId: extra?.runId ?? null,
       publicIp: extra?.publicIp ?? null,
       dateChanges: extra?.dateChanges ?? null,
+      banPhase: extra?.banPhase ?? null,
       connectionInfo: extra?.connectionInfo ?? null,
     }).catch((e) => logger.error('logPoll failed', { error: String(e) })),
   );
