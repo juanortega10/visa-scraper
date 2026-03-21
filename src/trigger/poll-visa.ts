@@ -1043,11 +1043,12 @@ export const pollVisaTask = task({
           break;
         }
 
-        // ── [F] Sleep between polls ──
+        // ── [F] Sleep between polls (start-to-start timing) ──
         {
-          const interPollDelayStr = getPollingDelay(bot.locale, interPollS);
+          const iterationElapsedMs = Date.now() - iterationStartMs;
+          const interPollDelayStr = getPollingDelay(bot.locale, interPollS, iterationElapsedMs);
           const interPollMs = parseInt(interPollDelayStr) * 1_000;
-          logger.info('[BATCH] Poll done, sleeping', { botId, poll: batchFetchCount, interPollMs, elapsedMs: Date.now() - startMs });
+          logger.info('[BATCH] Poll done, sleeping', { botId, poll: batchFetchCount, interPollMs, iterationElapsedMs, elapsedMs: Date.now() - startMs });
           await new Promise((r) => setTimeout(r, interPollMs));
         }
 
@@ -1387,7 +1388,8 @@ export const pollVisaTask = task({
     if (shouldChain) {
       // Self-reschedule (cancel previous delayed run first to prevent pile-up)
       cancelPreviousRun(ctx.run.id, activeRunIdField);
-      const normalDelay = getPollingDelay(bot.locale, getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin));
+      const elapsedMs = Date.now() - startMs;
+      const normalDelay = getPollingDelay(bot.locale, getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin), elapsedMs);
       // tcp_blocked:
       //   webshare → ProxyPoolManager rotates to a healthy IP, use normalDelay (or 5min if sustained)
       //   direct/brightdata/firecrawl → escalating backoff to avoid escalating a single-IP ban

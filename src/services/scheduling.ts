@@ -67,14 +67,19 @@ export function isInSuperCriticalWindow(locale?: string): boolean {
 }
 
 /**
- * Resolves the self-trigger delay between runs.
+ * Resolves the self-trigger delay between runs (start-to-start timing).
  * override: effective interval in seconds (from getEffectiveInterval or bot.pollIntervalSeconds).
+ * elapsedMs: time already spent in this run (subtracted to keep uniform spacing).
  * Falls back to LOCALE_POLL_INTERVALS lookup → DEFAULT_POLL_INTERVAL_S.
  */
-export function getPollingDelay(locale?: string, override?: number): string {
-  if (override != null && override > 0) return jitter(override);
-  const base = LOCALE_POLL_INTERVALS[locale ?? ''] ?? DEFAULT_POLL_INTERVAL_S;
-  return jitter(base);
+export function getPollingDelay(locale?: string, override?: number, elapsedMs?: number): string {
+  const base = (override != null && override > 0) ? override
+    : (LOCALE_POLL_INTERVALS[locale ?? ''] ?? DEFAULT_POLL_INTERVAL_S);
+  // Subtract elapsed time to achieve start-to-start interval (min 1s to avoid hammering)
+  const adjustedSeconds = elapsedMs != null
+    ? Math.max(1, base - elapsedMs / 1000)
+    : base;
+  return jitter(adjustedSeconds);
 }
 
 /** Adds ±5% jitter to a base delay in seconds, returns Trigger.dev delay string. */
