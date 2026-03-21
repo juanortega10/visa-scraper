@@ -932,22 +932,69 @@ logsRouter.get('/cross-schedule-comparison', async (c) => {
   const comparisons: Array<{
     locale: string;
     bots: Array<{ botId: number; scheduleId: string | null; applicantCount: number; datesCount: number }>;
-    sharedDates: number; uniqueDates: Record<number, string[]>;
+    totalUniqueDates: number; sharedByAllBots: number; sharedByMajority: number;
+    medianPairOverlapPct: number; uniqueDates: Record<number, string[]>;
+    byApplicantCount: Record<number, { avgDates: number; bots: number }>;
   }> = [];
 
   for (const [locale, localeBots] of Object.entries(byLocale)) {
     if (localeBots.length < 2) continue;
     const sets = localeBots.map(b => new Set(b.dates));
-    const shared = [...sets[0]!].filter(d => sets.every(s => s.has(d)));
+
+    // All dates seen by ANY bot (union)
+    const allDatesUnion = new Set<string>();
+    for (const s of sets) for (const d of s) allDatesUnion.add(d);
+
+    // Dates seen by ALL bots (intersection)
+    const sharedByAll = [...allDatesUnion].filter(d => sets.every(s => s.has(d)));
+
+    // Per-date: how many bots see it (majority analysis)
+    const dateBotCount = new Map<string, number>();
+    for (const d of allDatesUnion) {
+      dateBotCount.set(d, sets.filter(s => s.has(d)).length);
+    }
+    const majorityDates = [...dateBotCount.entries()].filter(([, c]) => c >= Math.ceil(sets.length / 2)).length;
+
+    // Pairwise overlap: median overlap % between all pairs
+    const pairOverlaps: number[] = [];
+    for (let i = 0; i < sets.length; i++) {
+      for (let j = i + 1; j < sets.length; j++) {
+        const overlap = [...sets[i]!].filter(d => sets[j]!.has(d)).length;
+        const smaller = Math.min(sets[i]!.size, sets[j]!.size);
+        if (smaller > 0) pairOverlaps.push(Math.round(overlap / smaller * 1000) / 10);
+      }
+    }
+    pairOverlaps.sort((a, b) => a - b);
+    const medianPairOverlap = pairOverlaps.length > 0 ? pairOverlaps[Math.floor(pairOverlaps.length / 2)]! : 0;
+
+    // Dates unique to a single bot (no other bot sees them)
     const uniqueDates: Record<number, string[]> = {};
     for (let i = 0; i < localeBots.length; i++) {
-      const only = localeBots[i]!.dates.filter(d => sets.every((s, j) => j === i || !s.has(d)));
+      const only = localeBots[i]!.dates.filter(d => dateBotCount.get(d) === 1);
       if (only.length > 0) uniqueDates[localeBots[i]!.botId] = only.slice(0, 10);
     }
+
+    // Applicant count correlation
+    const byApplicantCount: Record<number, { avgDates: number; bots: number }> = {};
+    for (const b of localeBots) {
+      const ac = b.applicantCount;
+      const entry = byApplicantCount[ac] ??= { avgDates: 0, bots: 0 };
+      entry.avgDates += b.dates.length;
+      entry.bots++;
+    }
+    for (const entry of Object.values(byApplicantCount)) {
+      entry.avgDates = Math.round(entry.avgDates / entry.bots);
+    }
+
     comparisons.push({
       locale,
       bots: localeBots.map(b => ({ botId: b.botId, scheduleId: b.scheduleId, applicantCount: b.applicantCount, datesCount: b.dates.length })),
-      sharedDates: shared.length, uniqueDates,
+      totalUniqueDates: allDatesUnion.size,
+      sharedByAllBots: sharedByAll.length,
+      sharedByMajority: majorityDates,
+      medianPairOverlapPct: medianPairOverlap,
+      uniqueDates,
+      byApplicantCount,
     });
   }
 
