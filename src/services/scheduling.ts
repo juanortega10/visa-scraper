@@ -1,10 +1,11 @@
-/** Default polling interval (9s). Universal — no per-phase overrides.
- * Exp 9 confirmed 20/min/IP on days.json with zero blocks.
- * 9s → ~7 fetches/min target (well within 20/min/IP limit). */
-export const DEFAULT_POLL_INTERVAL_S = 9;
+/** Default polling interval (5s). Analytics (30d, 464K polls) confirmed
+ * 8+/min has 0.12% ban-trigger rate — same as 5-8/min (0.11%).
+ * 5s → ~8-10/min effective. Previous 9s → 5.5/min.
+ * Response: 791ms direct, 1608ms webshare. Trigger overhead: ~300ms. */
+export const DEFAULT_POLL_INTERVAL_S = 5;
 
 /** Per-locale override for the normal polling interval.
- * Empty — all locales use DEFAULT_POLL_INTERVAL_S (9s). */
+ * Empty — all locales use DEFAULT_POLL_INTERVAL_S (5s). */
 const LOCALE_POLL_INTERVALS: Record<string, number> = {};
 
 export function getNormalInterval(locale?: string, override?: number): number {
