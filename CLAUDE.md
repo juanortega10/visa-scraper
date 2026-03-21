@@ -16,6 +16,10 @@ API multi-tenant para monitorear y reagendar citas de visa B1/B2 en embajadas de
 - Claude Code: verificar siempre antes de ejecutar `--commit` o `client.reschedule()`.
 - El bot en producción tiene protección (`isAtLeastNDaysEarlier` en `poll-visa.ts` y `reschedule-logic.ts`). Scripts manuales NO la tienen.
 
+## REGLA: Bots solo-CAS son inválidos
+
+Cuando el portal crea bots automáticamente desde un grupo familiar, puede generar bots **solo con cita CAS** (sin consular). Estos son citas de entrega/interview waiver de padres — el bot no los soporta. **Eliminarlos con `DELETE /api/bots/:id`** al detectarlos (`currentConsularDate: null, currentCasDate: not null`).
+
 ## REGLA CRITICA: Scripts deben respetar limitaciones del bot
 
 Antes de cualquier script que interactúe con visa: `GET /api/bots/:id` para leer estado actual.

@@ -5,7 +5,7 @@ import { bots, sessions } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
-import { loginWithFallback, InvalidCredentialsError } from '../services/login.js';
+import { loginWithFallback, InvalidCredentialsError, AccountLockedError } from '../services/login.js';
 import { notifyUserTask } from './notify-user.js';
 import { getPollingDelay, getEffectiveInterval } from '../services/scheduling.js';
 import { visaPollingPerBotQueue } from './queues.js';
@@ -178,6 +178,21 @@ export const loginVisaTask = task({
           data: { message: 'Login failed: invalid email or password. Update credentials and re-activate.' },
         }, { tags: [`bot:${botId}`] });
         return { success: false, action: 'invalid_credentials' };
+      }
+
+      if (e instanceof AccountLockedError) {
+        const lockMsg = e.lockedUntil
+          ? `Account locked until ${e.lockedUntil.toISOString()}. Will auto-retry via cron.`
+          : 'Account locked after too many failed login attempts. Lockout lasts ~1h. Will auto-retry via cron.';
+        logger.error('Account locked', { botId, lockedUntil: e.lockedUntil?.toISOString() });
+        logAuth({ email, action: 'login_visa', locale: creds.locale, result: 'error', errorMessage: `account_locked${e.lockedUntil ? ` until ${e.lockedUntil.toISOString()}` : ''}`, botId });
+        await db.update(bots).set({ status: 'login_required', updatedAt: new Date() }).where(eq(bots.id, botId));
+        await notifyUserTask.trigger({
+          botId,
+          event: 'account_locked',
+          data: { message: lockMsg, lockedUntil: e.lockedUntil?.toISOString() },
+        }, { tags: [`bot:${botId}`] });
+        return { success: false, action: 'account_locked' };
       }
 
       logger.error('Login failed', { botId, error: errMsg });

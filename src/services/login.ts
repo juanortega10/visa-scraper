@@ -34,6 +34,17 @@ export class InvalidCredentialsError extends Error {
   }
 }
 
+export class AccountLockedError extends Error {
+  /** When the lockout expires (if parseable from response), or undefined */
+  lockedUntil?: Date;
+
+  constructor(message = 'Account locked after too many failed login attempts', lockedUntil?: Date) {
+    super(message);
+    this.name = 'AccountLockedError';
+    this.lockedUntil = lockedUntil;
+  }
+}
+
 interface PureFetchLoginOptions {
   /** Skip fetching appointment page for tokens (faster, ~970ms vs ~1.7s) */
   skipTokens?: boolean;
@@ -131,10 +142,18 @@ export async function pureFetchLogin(
     ...(dispatcher ? { dispatcher } : {}),
   });
 
-  // Check for invalid credentials
+  // Check for invalid credentials or account lock
   const postBody = await postResp.text();
   if (postBody.includes('inválida') || postBody.includes('Invalid Email or password')) {
     throw new InvalidCredentialsError();
+  }
+
+  // Check for explicit account lock message: "Your account is locked until 19 March, 2026, 20:19:09 -05."
+  const lockMatch = postBody.match(/account is locked until ([^<.]+)/i);
+  if (lockMatch) {
+    let lockedUntil: Date | undefined;
+    try { lockedUntil = new Date(lockMatch[1].trim()); } catch { /* unparseable */ }
+    throw new AccountLockedError(`Account locked until ${lockMatch[1].trim()}`, lockedUntil);
   }
 
   // Extract new session cookie from POST response
@@ -158,6 +177,10 @@ export async function pureFetchLogin(
   // Verify success
   if (postResp.status === 200) {
     if (!postBody.includes('window.location')) {
+      // Account locked: form returned without error message (not "inválida" — already caught above)
+      if (postBody.includes('sign_in_form')) {
+        throw new AccountLockedError();
+      }
       throw new Error(`Login POST 200 but no redirect in body: ${postBody.substring(0, 200)}`);
     }
   } else if (postResp.status !== 302) {
@@ -425,7 +448,7 @@ export async function performLogin(creds: LoginCredentials): Promise<LoginResult
     console.log(`[login] IV succeeded — cookie=${result.cookie.length}chars hasTokens=${result.hasTokens} csrf=${result.csrfToken?.substring(0, 10) || '(none)'}`);
     return result;
   } catch (e) {
-    if (e instanceof InvalidCredentialsError) throw e;
+    if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
     console.warn(`[login] IV failed: ${e instanceof Error ? e.message : e}`);
   }
 
@@ -461,7 +484,7 @@ export async function loginWithFallback(
     const result = await performLogin(creds);
     return { result, via: 'direct:ok' };
   } catch (e) {
-    if (e instanceof InvalidCredentialsError) throw e;
+    if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
     const label = classifyLoginError(e);
     attempts.push(`direct[${label}]`);
     console.warn(`[login] Direct failed [${label}]: ${e instanceof Error ? e.message : e}`);
@@ -496,7 +519,7 @@ export async function loginWithFallback(
       console.log(`[login] ✓ ws:${ip} succeeded`);
       return { result, via: attempts.join(' → ') };
     } catch (e2) {
-      if (e2 instanceof InvalidCredentialsError) throw e2;
+      if (e2 instanceof InvalidCredentialsError || e2 instanceof AccountLockedError) throw e2;
       const label = classifyLoginError(e2);
       attempts.push(`ws:${ip}[${label}]`);
       console.warn(`[login] ✗ ws:${ip} [${label}]: ${e2 instanceof Error ? e2.message : e2}`);

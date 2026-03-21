@@ -1,9 +1,9 @@
 import { Hono } from 'hono';
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
-import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs } from '../db/schema.js';
+import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, gte } from 'drizzle-orm';
+import { eq, and, desc, gte, sql } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
@@ -108,6 +108,11 @@ function validateCreateBot(body: Record<string, unknown>): string | null {
     }
   }
 
+  if (body.notificationPhone !== undefined && body.notificationPhone !== null) {
+    if (typeof body.notificationPhone !== 'string' || !/^\d{10,15}$/.test(body.notificationPhone))
+      return 'notificationPhone must be 10-15 digits (no + or spaces)';
+  }
+
   return validateExclusions(body);
 }
 
@@ -141,6 +146,10 @@ function validateUpdateBot(body: Record<string, unknown>): string | null {
     if (!Array.isArray(body.pollEnvironments) ||
         !body.pollEnvironments.every((e: unknown) => e === 'dev' || e === 'prod'))
       return 'pollEnvironments must be an array of "dev" and/or "prod"';
+  }
+  if (body.notificationPhone !== undefined && body.notificationPhone !== null) {
+    if (typeof body.notificationPhone !== 'string' || !/^\d{10,15}$/.test(body.notificationPhone))
+      return 'notificationPhone must be 10-15 digits (no + or spaces)';
   }
   return validateExclusions(body);
 }
@@ -214,6 +223,69 @@ botsRouter.get('/countries', (c) => {
   return c.json(countries);
 });
 
+// Landing — consolidated endpoint: bots + reschedule events + poll health stats (last 24h + 1h)
+botsRouter.get('/landing', async (c) => {
+  const since24 = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const since1h = new Date(Date.now() - 60 * 60 * 1000);
+  const since = since24; // kept for reschedule window
+
+  const [allBots, rescheduleRows, pollStats, pollStats1h] = await Promise.all([
+    db.select({
+      id: bots.id, locale: bots.locale, status: bots.status,
+      ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
+      currentConsularDate: bots.currentConsularDate,
+      currentConsularTime: bots.currentConsularTime,
+      consecutiveErrors: bots.consecutiveErrors,
+      targetDateBefore: bots.targetDateBefore,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
+      pollEnvironments: bots.pollEnvironments,
+    }).from(bots),
+
+    db.select({
+      botId: rescheduleLogs.botId, success: rescheduleLogs.success,
+      newConsularDate: rescheduleLogs.newConsularDate,
+      newConsularTime: rescheduleLogs.newConsularTime,
+      createdAt: rescheduleLogs.createdAt,
+    }).from(rescheduleLogs)
+      .where(gte(rescheduleLogs.createdAt, since))
+      .orderBy(desc(rescheduleLogs.createdAt)),
+
+    db.select({
+      botId: pollLogs.botId,
+      total: sql<number>`count(*)::int`,
+      ok:    sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+      tcp:   sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
+      error: sql<number>`count(*) filter (where ${pollLogs.status} not in ('ok', 'filtered_out', 'tcp_blocked'))::int`,
+    }).from(pollLogs)
+      .where(gte(pollLogs.createdAt, since24))
+      .groupBy(pollLogs.botId),
+
+    db.select({
+      botId: pollLogs.botId,
+      total: sql<number>`count(*)::int`,
+      ok:    sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+      tcp:   sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
+    }).from(pollLogs)
+      .where(gte(pollLogs.createdAt, since1h))
+      .groupBy(pollLogs.botId),
+  ]);
+
+  const events: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
+  for (const r of rescheduleRows) {
+    if (!events[r.botId]) events[r.botId] = { successes: [], failedCount: 0 };
+    if (r.success) events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
+    else events[r.botId].failedCount++;
+  }
+
+  const health: Record<number, { total: number; ok: number; tcp: number; error: number }> = {};
+  for (const r of pollStats) health[r.botId] = { total: r.total, ok: r.ok, tcp: r.tcp, error: r.error };
+
+  const health1h: Record<number, { total: number; ok: number; tcp: number }> = {};
+  for (const r of pollStats1h) health1h[r.botId] = { total: r.total, ok: r.ok, tcp: r.tcp };
+
+  return c.json({ bots: allBots, events, health, health1h });
+});
+
 // Recent events — reschedule activity last 24h, grouped by botId
 botsRouter.get('/recent-events', async (c) => {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -273,6 +345,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     discoveryToken,
     targetDateBefore,
     maxReschedules,
+    notificationPhone,
   } = body;
 
   // Check if discoveryToken has a cached session we can reuse
@@ -348,6 +421,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       webhookUrl,
       notificationEmail: finalNotificationEmail,
       ownerEmail: finalOwnerEmail,
+      notificationPhone: notificationPhone ?? null,
       proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
       status: 'login_required',
@@ -359,6 +433,11 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
 
   // Log successful bot creation with botId
   logAuth({ email: visaEmail, action: 'create_bot', locale, result: 'ok', clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c), botId: bot.id });
+
+  // Notify Kapso (fire-and-forget)
+  if (notificationPhone) {
+    notifyKapsoActivation(notificationPhone, bot.id).catch(() => {});
+  }
 
   // Insert exclusions
   if (excludedDateRanges.length > 0) {
@@ -648,11 +727,13 @@ botsRouter.get('/:id', async (c) => {
     targetDateBefore: bots.targetDateBefore,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
+    skipCas: bots.skipCas,
     consecutiveErrors: bots.consecutiveErrors,
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
-    notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail,
+    notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
     webhookUrl: bots.webhookUrl,
+    visaEmail: bots.visaEmail, applicantIds: bots.applicantIds, clerkUserId: bots.clerkUserId,
     activatedAt: bots.activatedAt, createdAt: bots.createdAt, updatedAt: bots.updatedAt,
     casCacheJson: bots.casCacheJson,
   }).from(bots).where(eq(bots.id, id));
@@ -669,6 +750,15 @@ botsRouter.get('/:id', async (c) => {
     startDate: excludedDates.startDate,
     endDate: excludedDates.endDate,
   }).from(excludedDates).where(eq(excludedDates.botId, id));
+
+  // Fetch Clerk registration email if clerkUserId exists
+  let clerkEmail: string | null = null;
+  if (bot.clerkUserId) {
+    try {
+      const user = await clerkClient.users.getUser(bot.clerkUserId);
+      clerkEmail = user.emailAddresses[0]?.emailAddress ?? null;
+    } catch { /* Clerk unavailable or user deleted */ }
+  }
 
   return c.json({
     id: bot.id,
@@ -687,8 +777,13 @@ botsRouter.get('/:id', async (c) => {
     rescheduleCount: bot.rescheduleCount,
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
+    skipCas: bot.skipCas,
     notificationEmail: bot.notificationEmail ?? null,
     ownerEmail: bot.ownerEmail ?? null,
+    notificationPhone: bot.notificationPhone ?? null,
+    visaEmail: (() => { try { return decrypt(bot.visaEmail); } catch { return null; } })(),
+    applicantIds: bot.applicantIds,
+    clerkEmail,
     consecutiveErrors: bot.consecutiveErrors,
     activeRunId: bot.activeRunId,
     activeCloudRunId: bot.activeCloudRunId,
@@ -744,6 +839,9 @@ botsRouter.put('/:id', async (c) => {
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;
+  if (body.skipCas !== undefined) updates.skipCas = !!body.skipCas;
+  if (body.notificationPhone !== undefined) updates.notificationPhone = body.notificationPhone;
+  if (body.visaPassword !== undefined) updates.visaPassword = encrypt(body.visaPassword);
   await db.update(bots).set(updates).where(eq(bots.id, id));
 
   // Replace exclusions if provided
@@ -978,3 +1076,43 @@ botsRouter.delete('/:id', async (c) => {
 
   return c.json({ success: true });
 });
+
+// ── Kapso activation tracking ───────────────────────────
+
+async function notifyKapsoActivation(phone: string, botId: number): Promise<void> {
+  const apiKey = process.env.KAPSO_API_KEY;
+  const baseUrl = process.env.KAPSO_API_BASE_URL;
+  if (!apiKey || !baseUrl) {
+    console.warn('[kapso] KAPSO_API_KEY or KAPSO_API_BASE_URL not set, skipping activation tracking');
+    return;
+  }
+
+  const headers = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  // 1. Update lead status
+  try {
+    const res = await fetch(`${baseUrl}/api/v1/databases/leads/rows?phone=eq.${phone}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ status: 'activated', bot_id: botId, updated_at: new Date().toISOString() }),
+    });
+    console.log(`[kapso] PATCH leads phone=${phone} botId=${botId} status=${res.status}`);
+  } catch (e) {
+    console.warn(`[kapso] PATCH leads failed phone=${phone}:`, e);
+  }
+
+  // 2. Log funnel event
+  try {
+    const res = await fetch(`${baseUrl}/api/v1/databases/funnel_events/rows`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ phone, event_type: 'wa_lead_activated', message_text: `bot:${botId}`, created_at: new Date().toISOString() }),
+    });
+    console.log(`[kapso] POST funnel_events phone=${phone} botId=${botId} status=${res.status}`);
+  } catch (e) {
+    console.warn(`[kapso] POST funnel_events failed phone=${phone}:`, e);
+  }
+}

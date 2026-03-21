@@ -18,6 +18,7 @@ export interface RescheduleBot {
   ascFacilityId: string;
   targetDateBefore?: string | null;
   maxCasGapDays?: number | null;
+  skipCas?: boolean;
 }
 
 export interface RescheduleAttempt {
@@ -167,7 +168,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     }
   }
   // Determine if this embassy requires CAS (biometrics) appointments
-  const needsCas = !!bot.ascFacilityId;
+  let needsCas = !!bot.ascFacilityId && !bot.skipCas;
 
   // Build CAS cache map for fast lookup (valid for up to 60 min, stale kept as fallback)
   const casCache = new Map<string, CasCacheEntry>();
@@ -194,6 +195,13 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     logger.info('Pre-reschedule refreshTokens (priming server-side state)', { botId });
     await client.refreshTokens();
     logger.info('Pre-reschedule refreshTokens OK', { botId });
+
+    // Auto-detect: if appointment page has no ASC fields, this account doesn't need CAS
+    // (e.g. visa renewal / interview waiver). Override needsCas regardless of bot config.
+    if (needsCas && client.getHasAscFields() === false) {
+      logger.info('Auto-detected no ASC fields in appointment HTML — overriding needsCas to false', { botId, collectsBiometrics: client.getCollectsBiometrics() });
+      needsCas = false;
+    }
   } catch (refreshErr) {
     if (refreshErr instanceof SessionExpiredError) throw refreshErr;
     logger.warn('Pre-reschedule refreshTokens failed (will attempt POST anyway)', {

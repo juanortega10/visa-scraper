@@ -33,11 +33,15 @@ export function extractScheduleId(groupsHtml: string): string | null {
 }
 
 export function extractApplicantIdsFromGroups(groupsHtml: string): string[] {
+  // Exclude archived groups section — contains applicant IDs from old/removed groups
+  const archivedIdx = groupsHtml.search(/[Aa]rchived\s*[Gg]roups/);
+  const html = archivedIdx > -1 ? groupsHtml.slice(0, archivedIdx) : groupsHtml;
+
   const regex = /\/applicants\/(\d+)/g;
   const seen = new Set<string>();
   const ids: string[] = [];
   let m;
-  while ((m = regex.exec(groupsHtml)) !== null) {
+  while ((m = regex.exec(html)) !== null) {
     if (!seen.has(m[1]!)) {
       seen.add(m[1]!);
       ids.push(m[1]!);
@@ -157,11 +161,15 @@ export interface GroupInfo {
  * then extracts applicant IDs and dates from each section.
  */
 export function extractGroups(groupsHtml: string): GroupInfo[] {
+  // Exclude archived groups section
+  const archivedIdx = groupsHtml.search(/[Aa]rchived\s*[Gg]roups/);
+  const html = archivedIdx > -1 ? groupsHtml.slice(0, archivedIdx) : groupsHtml;
+
   // Collect the first occurrence position of each unique schedule ID.
   const seen = new Set<string>();
   const boundaries: Array<{ id: string; start: number }> = [];
 
-  for (const m of groupsHtml.matchAll(/\/schedule\/(\d+)\//g)) {
+  for (const m of html.matchAll(/\/schedule\/(\d+)\//g)) {
     if (!seen.has(m[1]!)) {
       seen.add(m[1]!);
       boundaries.push({ id: m[1]!, start: m.index! });
@@ -171,8 +179,8 @@ export function extractGroups(groupsHtml: string): GroupInfo[] {
   if (boundaries.length === 0) return [];
 
   return boundaries.map(({ id, start }, i) => {
-    const end = boundaries[i + 1]?.start ?? groupsHtml.length;
-    const section = groupsHtml.slice(start, end);
+    const end = boundaries[i + 1]?.start ?? html.length;
+    const section = html.slice(start, end);
 
     const applicantIds: string[] = [];
     const apptSeen = new Set<string>();

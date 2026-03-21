@@ -3,7 +3,8 @@
  * 9s → ~7 fetches/min target (well within 20/min/IP limit). */
 export const DEFAULT_POLL_INTERVAL_S = 9;
 
-/** Per-locale override for the normal polling interval. Empty by default — all locales use 10s. */
+/** Per-locale override for the normal polling interval.
+ * Empty — all locales use DEFAULT_POLL_INTERVAL_S (9s). */
 const LOCALE_POLL_INTERVALS: Record<string, number> = {};
 
 export function getNormalInterval(locale?: string, override?: number): number {

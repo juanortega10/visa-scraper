@@ -42,6 +42,7 @@ export const prefetchCasSchedule = schedules.task({
       proxyProvider: bots.proxyProvider, userId: bots.userId,
       visaEmail: bots.visaEmail, visaPassword: bots.visaPassword,
       casCacheJson: bots.casCacheJson,
+      skipCas: bots.skipCas,
     }).from(bots).where(eq(bots.status, 'active'));
     logger.info('prefetch-cas cron START', { botCount: activeBots.length });
 
@@ -51,9 +52,13 @@ export const prefetchCasSchedule = schedules.task({
     }
 
     for (const bot of activeBots) {
-      // Skip bots that don't require a CAS appointment (no ASC facility)
+      // Skip bots that don't require a CAS appointment (no ASC facility or skipCas)
       if (!bot.ascFacilityId || bot.ascFacilityId === '') {
         logger.info('Skipping bot without ASC facility', { botId: bot.id, locale: bot.locale });
+        continue;
+      }
+      if (bot.skipCas) {
+        logger.info('Skipping bot with skipCas=true', { botId: bot.id });
         continue;
       }
 

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
-import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, dispatchLogs } from '../db/schema.js';
-import { eq, desc, and, gte, sql } from 'drizzle-orm';
+import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, dispatchLogs, bookableEvents, dateSightings, banEpisodes } from '../db/schema.js';
+import { eq, desc, and, gte, lte, sql, isNotNull } from 'drizzle-orm';
 
 export const logsRouter = new Hono();
 
@@ -92,7 +92,7 @@ logsRouter.get('/bots/:id/logs/polls/summary', async (c) => {
 // Cancellations (server-side computation over full 24h window)
 logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
   const botId = parseInt(c.req.param('id'));
-  const hours = parseInt(c.req.query('hours') || '24');
+  const hours = Math.min(parseInt(c.req.query('hours') || '24'), 240); // cap 10 days
   const cacheKey = `canc-${botId}-${hours}`;
   const cached = getCached(cacheKey);
   if (cached) return c.json(cached);
@@ -163,12 +163,18 @@ logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
   for (const r of rows) {
     const dc = r.dateChanges as { appeared?: string[]; disappeared?: string[] } | null;
     if (!dc?.appeared?.length) continue;
-    if (dc.appeared.length > 30) continue; // skip false bursts
+    // Filter appeared to only dates within 365 days (skip far-future reload noise)
+    // Then skip if still > 30 (true mass-reload after long gap)
+    let appeared = dc.appeared;
+    if (appeared.length > 30) {
+      appeared = appeared.filter((d) => daysFr(d) <= 365);
+      if (appeared.length === 0 || appeared.length > 30) continue;
+    }
     const time = new Date(r.createdAt!).getTime();
     let burst = burstMap.get(time);
     if (!burst) { burst = { time, count: 0, best: 99999 }; burstMap.set(time, burst); }
 
-    for (const date of dc.appeared) {
+    for (const date of appeared) {
       const days = daysFr(date);
       let goneAt: number | null = null, dur: number | null = null;
       const disList = disMap.get(date);
@@ -355,6 +361,7 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
   const botId = parseInt(c.req.param('id'));
   const limit = parseInt(c.req.query('limit') || '50');
   const offset = parseInt(c.req.query('offset') || '0');
+  const hasDate = c.req.query('hasDate') === 'true';
 
   // Omit allDates, phaseTimings, rescheduleDetails to reduce egress
   const logs = await db
@@ -370,16 +377,49 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
       dateChanges: pollLogs.dateChanges,
       publicIp: pollLogs.publicIp,
       runId: pollLogs.runId,
+      fetchIndex: pollLogs.fetchIndex,
       connectionInfo: pollLogs.connectionInfo,
       createdAt: pollLogs.createdAt,
     })
     .from(pollLogs)
-    .where(eq(pollLogs.botId, botId))
+    .where(and(
+      eq(pollLogs.botId, botId),
+      hasDate ? isNotNull(pollLogs.earliestDate) : undefined,
+    ))
     .orderBy(desc(pollLogs.createdAt))
     .limit(limit)
     .offset(offset);
 
   return c.json(logs);
+});
+
+// Date history (all-time, one row per Bogota day with earliest poll date seen)
+logsRouter.get('/bots/:id/logs/date-history', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const cacheKey = `dh-${botId}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const rows = await db
+    .select({
+      day: sql<string>`date_trunc('day', ${pollLogs.createdAt} AT TIME ZONE 'America/Bogota')::date`,
+      bestDate: sql<string>`min(${pollLogs.earliestDate})`,
+      polls: sql<number>`count(*)::int`,
+    })
+    .from(pollLogs)
+    .where(and(eq(pollLogs.botId, botId), isNotNull(pollLogs.earliestDate)))
+    .groupBy(sql`date_trunc('day', ${pollLogs.createdAt} AT TIME ZONE 'America/Bogota')`)
+    .orderBy(sql`date_trunc('day', ${pollLogs.createdAt} AT TIME ZONE 'America/Bogota') asc`);
+
+  const days = rows.map((r) => ({
+    day: String(r.day).slice(0, 10),
+    bestDate: r.bestDate,
+    polls: r.polls,
+  }));
+
+  const result = { days };
+  setCached(cacheKey, result);
+  return c.json(result);
 });
 
 // Poll log detail (loads allDates on-demand for calendar)
@@ -621,6 +661,65 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
   });
 });
 
+// Bookable events
+logsRouter.get('/bots/:id/logs/bookable-events', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const hours = Math.min(parseInt(c.req.query('hours') || '168'), 720); // cap 30 days
+  const cacheKey = `be-${botId}-${hours}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const since = new Date(Date.now() - hours * 3_600_000);
+  const rows = await db
+    .select()
+    .from(bookableEvents)
+    .where(and(eq(bookableEvents.botId, botId), gte(bookableEvents.detectedAt, since)))
+    .orderBy(desc(bookableEvents.detectedAt))
+    .limit(300);
+
+  setCached(cacheKey, rows, 60_000);
+  return c.json(rows);
+});
+
+// Date sightings (materialized cancellations)
+logsRouter.get('/bots/:id/logs/date-sightings', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const hours = Math.min(parseInt(c.req.query('hours') || '24'), 240);
+  const maxDays = parseInt(c.req.query('maxDays') || '365');
+  const cacheKey = `ds-${botId}-${hours}-${maxDays}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const since = new Date(Date.now() - hours * 3600_000);
+  const rows = await db
+    .select()
+    .from(dateSightings)
+    .where(and(
+      eq(dateSightings.botId, botId),
+      gte(dateSightings.appearedAt, since),
+      lte(dateSightings.daysFromNow, maxDays),
+    ))
+    .orderBy(desc(dateSightings.appearedAt))
+    .limit(500);
+
+  const result = {
+    events: rows.map(r => ({
+      date: r.date,
+      time: new Date(r.appearedAt).getTime(),
+      days: r.daysFromNow,
+      goneAt: r.disappearedAt ? new Date(r.disappearedAt).getTime() : null,
+      dur: r.durationMs,
+    })),
+    totalEvents: rows.length,
+    uniqueDates: new Set(rows.map(r => r.date)).size,
+    closeCount: rows.filter(r => r.daysFromNow != null && r.daysFromNow < 60).length,
+    tMin: rows.length > 0 ? new Date(rows[rows.length - 1].appearedAt).getTime() : 0,
+    tMax: rows.length > 0 ? new Date(rows[0].appearedAt).getTime() : 1,
+  };
+  setCached(cacheKey, result, 60_000);
+  return c.json(result);
+});
+
 // Reschedule logs
 logsRouter.get('/bots/:id/logs/reschedules', async (c) => {
   const botId = parseInt(c.req.param('id'));
@@ -636,5 +735,339 @@ logsRouter.get('/bots/:id/logs/reschedules', async (c) => {
     .offset(offset);
 
   return c.json(logs);
+});
+
+// ── Ban Status ────────────────────────────────────────────
+
+logsRouter.get('/bots/:id/ban-status', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  if (isNaN(botId)) return c.json({ error: 'Invalid bot ID' }, 400);
+
+  const cacheKey = `ban-status-${botId}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const [openBan] = await db.select().from(banEpisodes)
+    .where(and(eq(banEpisodes.botId, botId), sql`${banEpisodes.endedAt} IS NULL`))
+    .limit(1);
+
+  const stats = await db.execute<{
+    classification: string; count: string; avg_min: string;
+    median_min: string; p90_min: string; min_min: string; max_min: string;
+  }>(sql`
+    SELECT classification,
+      COUNT(*)::text as count,
+      ROUND(AVG(duration_min))::text as avg_min,
+      ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_min))::text as median_min,
+      ROUND(PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY duration_min))::text as p90_min,
+      MIN(duration_min)::text as min_min,
+      MAX(duration_min)::text as max_min
+    FROM ban_episodes
+    WHERE bot_id = ${botId} AND ended_at IS NOT NULL AND duration_min IS NOT NULL
+    GROUP BY classification
+  `);
+
+  const historicalStats: Record<string, { count: number; avgMin: number; medianMin: number; p90Min: number }> = {};
+  for (const row of stats.rows) {
+    historicalStats[row.classification] = {
+      count: parseInt(row.count), avgMin: parseInt(row.avg_min),
+      medianMin: parseInt(row.median_min), p90Min: parseInt(row.p90_min),
+    };
+  }
+
+  const recentEpisodes = await db.select({
+    id: banEpisodes.id, startedAt: banEpisodes.startedAt, endedAt: banEpisodes.endedAt,
+    durationMin: banEpisodes.durationMin, classification: banEpisodes.classification, pollCount: banEpisodes.pollCount,
+  }).from(banEpisodes).where(eq(banEpisodes.botId, botId)).orderBy(desc(banEpisodes.startedAt)).limit(5);
+
+  let currentBan = null;
+  let estimatedRecoveryMin = null;
+  if (openBan) {
+    const durationSoFarMin = Math.round((Date.now() - openBan.startedAt.getTime()) / 60000);
+    const clsStats = historicalStats[openBan.classification];
+    estimatedRecoveryMin = clsStats ? Math.max(0, clsStats.medianMin - durationSoFarMin) : null;
+    currentBan = {
+      startedAt: openBan.startedAt, durationSoFarMin, classification: openBan.classification,
+      pollCount: openBan.pollCount, pollDetails: openBan.pollDetails, triggerContext: openBan.triggerContext,
+    };
+  }
+
+  const result = { currentBan, estimatedRecoveryMin, historicalStats, recentEpisodes };
+  setCached(cacheKey, result, 60_000);
+  return c.json(result);
+});
+
+// ── Ban Episodes List ─────────────────────────────────────
+
+logsRouter.get('/bots/:id/ban-episodes', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const limit = parseInt(c.req.query('limit') || '20');
+  const offset = parseInt(c.req.query('offset') || '0');
+
+  const episodes = await db.select().from(banEpisodes)
+    .where(eq(banEpisodes.botId, botId))
+    .orderBy(desc(banEpisodes.startedAt))
+    .limit(limit).offset(offset);
+
+  return c.json(episodes);
+});
+
+// ── Reschedule Analytics ──────────────────────────────────
+
+logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  const days = parseInt(c.req.query('days') || '30');
+  if (isNaN(botId)) return c.json({ error: 'Invalid bot ID' }, 400);
+
+  const cacheKey = `reschedule-analytics-${botId}-${days}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const reschedules = await db.select({
+    success: rescheduleLogs.success, createdAt: rescheduleLogs.createdAt,
+    oldConsularDate: rescheduleLogs.oldConsularDate, newConsularDate: rescheduleLogs.newConsularDate,
+  }).from(rescheduleLogs).where(and(eq(rescheduleLogs.botId, botId), gte(rescheduleLogs.createdAt, since)));
+
+  const successes = reschedules.filter(r => r.success);
+
+  const outcomeRows = await db.execute<{ outcome: string; count: string }>(sql`
+    SELECT outcome, COUNT(*)::text as count FROM bookable_events
+    WHERE bot_id = ${botId} AND detected_at >= ${since} GROUP BY outcome ORDER BY count DESC
+  `);
+  const failureBreakdown: Record<string, number> = {};
+  for (const r of outcomeRows.rows) failureBreakdown[r.outcome] = parseInt(r.count);
+
+  const hourly = await db.execute<{ hour: string; successes: string; total: string }>(sql`
+    SELECT EXTRACT(HOUR FROM created_at AT TIME ZONE 'America/Bogota')::text as hour,
+      SUM(CASE WHEN success THEN 1 ELSE 0 END)::text as successes, COUNT(*)::text as total
+    FROM reschedule_logs WHERE bot_id = ${botId} AND created_at >= ${since} GROUP BY 1 ORDER BY 1
+  `);
+  const byHourBogota = hourly.rows.map(r => ({
+    hour: parseInt(r.hour), successes: parseInt(r.successes), attempts: parseInt(r.total),
+  }));
+
+  const daily = await db.execute<{ dow: string; successes: string; total: string }>(sql`
+    SELECT EXTRACT(DOW FROM created_at AT TIME ZONE 'America/Bogota')::text as dow,
+      SUM(CASE WHEN success THEN 1 ELSE 0 END)::text as successes, COUNT(*)::text as total
+    FROM reschedule_logs WHERE bot_id = ${botId} AND created_at >= ${since} GROUP BY 1 ORDER BY 1
+  `);
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const byDayOfWeek = daily.rows.map(r => ({
+    day: dayNames[parseInt(r.dow)] ?? r.dow, successes: parseInt(r.successes), attempts: parseInt(r.total),
+  }));
+
+  const durationStats = await db.execute<{ median_ms: string }>(sql`
+    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_ms
+    FROM date_sightings WHERE bot_id = ${botId} AND appeared_at >= ${since} AND duration_ms IS NOT NULL
+  `);
+  const medianSlotDurationMin = durationStats.rows[0]?.median_ms
+    ? Math.round(parseInt(durationStats.rows[0].median_ms) / 60000 * 10) / 10 : null;
+
+  const improvements = successes
+    .filter(r => r.oldConsularDate && r.newConsularDate)
+    .map(r => Math.round((new Date(r.oldConsularDate!).getTime() - new Date(r.newConsularDate!).getTime()) / 86400000))
+    .filter(d => d > 0);
+
+  const result = {
+    summary: {
+      totalAttempts: reschedules.length, successes: successes.length,
+      successRate: reschedules.length > 0 ? Math.round(successes.length / reschedules.length * 1000) / 1000 : 0,
+    },
+    failureBreakdown,
+    timingPatterns: { byHourBogota, byDayOfWeek, medianSlotDurationMin },
+    datePatterns: {
+      avgDaysImprovement: improvements.length > 0 ? Math.round(improvements.reduce((a, b) => a + b, 0) / improvements.length) : null,
+      totalImprovements: improvements.length,
+    },
+  };
+
+  setCached(cacheKey, result, 5 * 60_000);
+  return c.json(result);
+});
+
+// ── Cross-Schedule Date Comparison ────────────────────────
+
+logsRouter.get('/cross-schedule-comparison', async (c) => {
+  const cacheKey = 'cross-schedule-comparison';
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const activeBots = await db.select({
+    id: bots.id, scheduleId: bots.scheduleId, locale: bots.locale,
+    applicantCount: sql<number>`array_length(${bots.applicantIds}, 1)`,
+  }).from(bots).where(eq(bots.status, 'active'));
+
+  const schedules: Array<{ botId: number; scheduleId: string | null; applicantCount: number; locale: string | null; dates: string[] }> = [];
+
+  for (const bot of activeBots) {
+    const [poll] = await db.select({ allDates: pollLogs.allDates }).from(pollLogs)
+      .where(and(eq(pollLogs.botId, bot.id), sql`${pollLogs.status} IN ('ok', 'filtered_out')`, isNotNull(pollLogs.allDates)))
+      .orderBy(desc(pollLogs.createdAt)).limit(1);
+    if (!poll?.allDates) continue;
+    const dates = (poll.allDates as Array<{ date: string }>).map(d => d.date);
+    schedules.push({ botId: bot.id, scheduleId: bot.scheduleId, applicantCount: bot.applicantCount ?? 0, locale: bot.locale, dates });
+  }
+
+  const byLocale: Record<string, typeof schedules> = {};
+  for (const s of schedules) (byLocale[s.locale ?? 'es-co'] ??= []).push(s);
+
+  const comparisons: Array<{
+    locale: string;
+    bots: Array<{ botId: number; scheduleId: string | null; applicantCount: number; datesCount: number }>;
+    sharedDates: number; uniqueDates: Record<number, string[]>;
+  }> = [];
+
+  for (const [locale, localeBots] of Object.entries(byLocale)) {
+    if (localeBots.length < 2) continue;
+    const sets = localeBots.map(b => new Set(b.dates));
+    const shared = [...sets[0]!].filter(d => sets.every(s => s.has(d)));
+    const uniqueDates: Record<number, string[]> = {};
+    for (let i = 0; i < localeBots.length; i++) {
+      const only = localeBots[i]!.dates.filter(d => sets.every((s, j) => j === i || !s.has(d)));
+      if (only.length > 0) uniqueDates[localeBots[i]!.botId] = only.slice(0, 10);
+    }
+    comparisons.push({
+      locale,
+      bots: localeBots.map(b => ({ botId: b.botId, scheduleId: b.scheduleId, applicantCount: b.applicantCount, datesCount: b.dates.length })),
+      sharedDates: shared.length, uniqueDates,
+    });
+  }
+
+  const result = { comparisons, timestamp: new Date().toISOString() };
+  setCached(cacheKey, result, 5 * 60_000);
+  return c.json(result);
+});
+
+// ── Slot Patterns (global) ────────────────────────────────
+
+logsRouter.get('/slot-patterns', async (c) => {
+  const days = parseInt(c.req.query('days') || '7');
+  const cacheKey = `slot-patterns-${days}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const hourly = await db.execute<{ hour: string; count: string; median_duration_ms: string }>(sql`
+    SELECT EXTRACT(HOUR FROM appeared_at AT TIME ZONE 'America/Bogota')::text as hour,
+      COUNT(*)::text as count,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_duration_ms
+    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL GROUP BY 1 ORDER BY 1
+  `);
+  const hourlyDistribution = hourly.rows.map(r => ({
+    hour: parseInt(r.hour), sightings: parseInt(r.count),
+    medianDurationMin: r.median_duration_ms ? Math.round(parseInt(r.median_duration_ms) / 60000 * 10) / 10 : null,
+  }));
+
+  const daily = await db.execute<{ dow: string; count: string }>(sql`
+    SELECT EXTRACT(DOW FROM appeared_at AT TIME ZONE 'America/Bogota')::text as dow, COUNT(*)::text as count
+    FROM date_sightings WHERE appeared_at >= ${since} GROUP BY 1 ORDER BY 1
+  `);
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const dayOfWeekDistribution = daily.rows.map(r => ({
+    day: dayNames[parseInt(r.dow)] ?? r.dow, sightings: parseInt(r.count),
+  }));
+
+  const proximity = await db.execute<{ bucket: string; count: string; median_duration_ms: string }>(sql`
+    SELECT CASE WHEN days_from_now < 30 THEN 'under30days' WHEN days_from_now < 90 THEN '30to90days' ELSE 'over90days' END as bucket,
+      COUNT(*)::text as count,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_duration_ms
+    FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND days_from_now IS NOT NULL GROUP BY 1
+  `);
+  const closeDateStats: Record<string, { count: number; medianDurationMin: number | null }> = {};
+  for (const r of proximity.rows) {
+    closeDateStats[r.bucket] = {
+      count: parseInt(r.count),
+      medianDurationMin: r.median_duration_ms ? Math.round(parseInt(r.median_duration_ms) / 60000 * 10) / 10 : null,
+    };
+  }
+
+  const result = { hourlyDistribution, dayOfWeekDistribution, closeDateStats, periodDays: days };
+  setCached(cacheKey, result, 10 * 60_000);
+  return c.json(result);
+});
+
+// ── Poll Rate Analysis ────────────────────────────────────
+
+logsRouter.get('/poll-rate-analysis', async (c) => {
+  const days = parseInt(c.req.query('days') || '7');
+  const cacheKey = `poll-rate-analysis-${days}`;
+  const cached = getCached(cacheKey);
+  if (cached) return c.json(cached);
+
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const overall = await db.execute<{ total: string; tcp_blocked: string; soft_ban: string }>(sql`
+    SELECT COUNT(*)::text as total,
+      SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as tcp_blocked,
+      SUM(CASE WHEN status = 'soft_ban' THEN 1 ELSE 0 END)::text as soft_ban
+    FROM poll_logs WHERE created_at >= ${since}
+  `);
+  const totalPolls = parseInt(overall.rows[0]?.total ?? '0');
+  const tcpBlocked = parseInt(overall.rows[0]?.tcp_blocked ?? '0');
+  const softBan = parseInt(overall.rows[0]?.soft_ban ?? '0');
+
+  const rateCorrelation = await db.execute<{ rate_bucket: string; polls: string; blocked: string }>(sql`
+    WITH gaps AS (
+      SELECT status, EXTRACT(EPOCH FROM created_at - LAG(created_at) OVER (PARTITION BY bot_id ORDER BY created_at)) as gap_s
+      FROM poll_logs WHERE created_at >= ${since}
+    ),
+    rated AS (
+      SELECT status,
+        CASE WHEN gap_s IS NULL OR gap_s > 120 OR gap_s <= 0 THEN NULL ELSE ROUND(60.0 / gap_s, 1) END as rate_per_min
+      FROM gaps
+    )
+    SELECT CASE WHEN rate_per_min < 1 THEN '<1/min' WHEN rate_per_min < 3 THEN '1-3/min'
+      WHEN rate_per_min < 5 THEN '3-5/min' WHEN rate_per_min < 8 THEN '5-8/min' ELSE '8+/min' END as rate_bucket,
+      COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
+    FROM rated WHERE rate_per_min IS NOT NULL GROUP BY 1 ORDER BY MIN(rate_per_min)
+  `);
+  const rateVsBanCorrelation = rateCorrelation.rows.map(r => ({
+    rateRange: r.rate_bucket, polls: parseInt(r.polls), blocked: parseInt(r.blocked),
+    blockRate: parseInt(r.polls) > 0 ? Math.round(parseInt(r.blocked) / parseInt(r.polls) * 10000) / 10000 : 0,
+  }));
+
+  const byProviderRows = await db.execute<{ provider: string; polls: string; blocked: string; avg_ms: string }>(sql`
+    SELECT COALESCE(provider, 'unknown') as provider, COUNT(*)::text as polls,
+      SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked,
+      ROUND(AVG(response_time_ms))::text as avg_ms
+    FROM poll_logs WHERE created_at >= ${since} GROUP BY 1 ORDER BY COUNT(*) DESC
+  `);
+  const byProvider: Record<string, { polls: number; blockRate: number; avgResponseMs: number }> = {};
+  for (const r of byProviderRows.rows) {
+    const p = parseInt(r.polls);
+    byProvider[r.provider] = { polls: p, blockRate: p > 0 ? Math.round(parseInt(r.blocked) / p * 10000) / 10000 : 0, avgResponseMs: parseInt(r.avg_ms) };
+  }
+
+  const sessionAge = await db.execute<{ age_bucket: string; polls: string; blocked: string }>(sql`
+    SELECT CASE
+        WHEN (connection_info->>'sessionAgeMs')::int < 900000 THEN '0-15min'
+        WHEN (connection_info->>'sessionAgeMs')::int < 1800000 THEN '15-30min'
+        WHEN (connection_info->>'sessionAgeMs')::int < 2700000 THEN '30-45min'
+        WHEN (connection_info->>'sessionAgeMs')::int < 3600000 THEN '45-60min'
+        ELSE '60min+'
+      END as age_bucket,
+      COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
+    FROM poll_logs WHERE created_at >= ${since} AND connection_info->>'sessionAgeMs' IS NOT NULL
+    GROUP BY 1 ORDER BY MIN((connection_info->>'sessionAgeMs')::int)
+  `);
+  const sessionAgeVsBlock = sessionAge.rows.map(r => ({
+    ageRange: r.age_bucket, polls: parseInt(r.polls),
+    blockRate: parseInt(r.polls) > 0 ? Math.round(parseInt(r.blocked) / parseInt(r.polls) * 10000) / 10000 : 0,
+  }));
+
+  const safeBuckets = rateVsBanCorrelation.filter(r => r.blockRate < 0.05);
+  const optimalRate = safeBuckets.length > 0 ? safeBuckets[safeBuckets.length - 1]!.rateRange : 'unknown';
+
+  const result = {
+    overallStats: { totalPolls, tcpBlockedRate: totalPolls > 0 ? Math.round(tcpBlocked / totalPolls * 10000) / 10000 : 0, softBanRate: totalPolls > 0 ? Math.round(softBan / totalPolls * 10000) / 10000 : 0, periodDays: days },
+    rateVsBanCorrelation, byProvider, sessionAgeVsBlock,
+    recommendation: { optimalRate, reasoning: `Highest rate bucket with <5% block rate: ${optimalRate}` },
+  };
+
+  setCached(cacheKey, result, 10 * 60_000);
+  return c.json(result);
 });
 

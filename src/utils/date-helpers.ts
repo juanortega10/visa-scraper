@@ -62,3 +62,8 @@ export function isAtLeastNDaysEarlier(candidate: string, current: string, minDay
 export function toBogotaDate(date: Date = new Date()): Date {
   return new Date(date.toLocaleString('en-US', { timeZone: 'America/Bogota' }));
 }
+
+export function computeDaysImprovement(candidate: string, current: string | null | undefined): number | null {
+  if (!current) return null;
+  return Math.round((new Date(current).getTime() - new Date(candidate).getTime()) / 86_400_000);
+}

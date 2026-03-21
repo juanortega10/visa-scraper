@@ -13,12 +13,14 @@ export interface LocaleTexts {
 
 export function getLocaleTexts(locale: string): LocaleTexts {
   if (locale === 'es-pe') {
+    // Peru has limited reschedules — commit field required
     return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: true };
   }
   if (locale.startsWith('es-')) {
-    return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: true };
+    // Colombia and other Spanish locales — unlimited reschedules, no commit
+    return { continueText: 'Continuar', rescheduleText: 'Reprogramar', includeCommit: false };
   }
-  return { continueText: 'Continue', rescheduleText: 'Reschedule', includeCommit: true };
+  return { continueText: 'Continue', rescheduleText: 'Reschedule', includeCommit: false };
 }
 
 export const USER_AGENT =

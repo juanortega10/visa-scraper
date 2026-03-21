@@ -26,6 +26,8 @@ import type { ProxyProvider } from '../src/services/proxy-fetch.js';
 const isCommit = process.argv.includes('--commit');
 const botIdArg = process.argv.find((a) => a.startsWith('--bot-id='));
 const botId = botIdArg ? parseInt(botIdArg.split('=')[1]!, 10) : 6;
+const providerArg = process.argv.find((a) => a.startsWith('--provider='));
+const providerOverride = providerArg ? providerArg.split('=')[1] : null;
 
 function step(n: number, label: string) {
   console.log(`\n${'='.repeat(60)}`);
@@ -50,7 +52,8 @@ async function main() {
 
   console.log(`Current consular: ${bot.currentConsularDate} ${bot.currentConsularTime}`);
   console.log(`Current CAS:      ${bot.currentCasDate} ${bot.currentCasTime}`);
-  console.log(`Provider:         ${bot.proxyProvider}`);
+  const effectiveProvider = (providerOverride ?? bot.proxyProvider) as ProxyProvider;
+  console.log(`Provider:         ${effectiveProvider}${providerOverride ? ' (override)' : ''}`);
   console.log(`Excluded dates:   ${exDates.length} ranges`);
   console.log(`Excluded times:   ${exTimes.length} ranges`);
 
@@ -61,7 +64,7 @@ async function main() {
       applicantIds: bot.applicantIds,
       consularFacilityId: bot.consularFacilityId,
       ascFacilityId: bot.ascFacilityId,
-      proxyProvider: bot.proxyProvider as ProxyProvider,
+      proxyProvider: effectiveProvider,
     },
   );
 

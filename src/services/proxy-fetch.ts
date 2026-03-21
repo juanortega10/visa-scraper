@@ -5,6 +5,20 @@ import { join } from 'path';
 
 export type ProxyErrorSource = 'proxy_infra' | 'embassy_block' | 'proxy_quota';
 
+export type TcpSubcategory =
+  | 'socket_immediate_close'  // bytesRead=0 → cuenta baneada activamente
+  | 'pool_exhausted'          // todas las IPs webshare fallaron
+  | 'connection_reset'        // ECONNRESET / "other side closed"
+  | 'connection_timeout'      // ETIMEDOUT
+  | 'dns_fail'                // ENOTFOUND
+  | 'proxy_tunnel_fail'       // HTTP Tunneling → infra webshare
+  | 'connection_refused';     // ECONNREFUSED
+
+export type BlockClassification =
+  | 'transient'    // pocas IPs fallaron, no exhausted
+  | 'ip_ban'       // pool exhausted, bytesRead > 0
+  | 'account_ban'; // bytesRead === 0 (servidor rechaza activamente)
+
 export function classifyProxyError(err: unknown, _latencyMs: number): ProxyErrorSource {
   const msg = err instanceof Error ? err.message : String(err);
   if (/HTTP Tunneling/i.test(msg)) {
@@ -142,6 +156,32 @@ export interface ProxyFetchMeta {
   fallbackReason: string | null;
   websharePoolSize: number;
   errorSource: ProxyErrorSource | null;
+  tcpSubcategory: TcpSubcategory | null;
+  poolExhausted: boolean;
+  socketBytesRead: number | null;
+}
+
+export function extractBytesRead(err: unknown): number | null {
+  const cause = (err as any)?.cause;
+  const bytes = cause?.socket?.bytesRead;
+  return typeof bytes === 'number' ? bytes : null;
+}
+
+export function classifyTcpSubcategory(err: unknown, poolExhausted: boolean): TcpSubcategory {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (extractBytesRead(err) === 0) return 'socket_immediate_close';
+  if (poolExhausted) return 'pool_exhausted';
+  if (/ENOTFOUND/i.test(msg)) return 'dns_fail';
+  if (/ETIMEDOUT/i.test(msg)) return 'connection_timeout';
+  if (/ECONNREFUSED/i.test(msg)) return 'connection_refused';
+  if (/HTTP Tunneling/i.test(msg)) return 'proxy_tunnel_fail';
+  return 'connection_reset'; // ECONNRESET, "other side closed", fetch failed
+}
+
+export function deriveBlockClassification(meta: Pick<ProxyFetchMeta, 'socketBytesRead' | 'poolExhausted'>): BlockClassification {
+  if (meta.socketBytesRead === 0) return 'account_ban';
+  if (meta.poolExhausted) return 'ip_ban';
+  return 'transient';
 }
 
 // ── Proxy Pool Manager ───────────────────────────────────────────────────────
@@ -559,18 +599,32 @@ export async function proxyFetch(
   provider: ProxyProvider = 'direct',
   proxyUrls?: string[] | null,
 ): Promise<{ response: Response; meta: ProxyFetchMeta }> {
-  const meta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null };
+  const meta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null, tcpSubcategory: null, poolExhausted: false, socketBytesRead: null };
 
   switch (provider) {
-    case 'direct':
-      return {
-        response: await fetch(url, {
-          ...options,
-          // @ts-expect-error undici dispatcher works with global fetch
-          dispatcher: getDirectAgent(),
-        }),
-        meta,
-      };
+    case 'direct': {
+      try {
+        return {
+          response: await fetch(url, {
+            ...options,
+            // @ts-expect-error undici dispatcher works with global fetch
+            dispatcher: getDirectAgent(),
+          }),
+          meta,
+        };
+      } catch (err) {
+        // Populate meta for direct provider TCP errors so captureConnInfo has data
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTcp = /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up|EPIPE|other side closed/i.test(msg);
+        if (isTcp) {
+          meta.socketBytesRead = extractBytesRead(err);
+          meta.errorSource = classifyProxyError(err, 0);
+          meta.tcpSubcategory = classifyTcpSubcategory(err, false);
+          (err as Error & { proxyMeta?: ProxyFetchMeta }).proxyMeta = { ...meta };
+        }
+        throw err;
+      }
+    }
     case 'brightdata':
       return { response: await fetchViaBrightData(url, options), meta };
     case 'webshare': {
@@ -635,6 +689,9 @@ export async function proxyFetch(
           if (!proxyUrls?.length) invalidateWebshareCache();
           meta.fallbackReason = (msg.match(CODE_RE)?.[0] ?? 'TCP_FAIL').toUpperCase();
           meta.errorSource = errorSource;
+          meta.poolExhausted = true;
+          meta.socketBytesRead = extractBytesRead(err);
+          meta.tcpSubcategory = classifyTcpSubcategory(err, true);
           console.warn(`[proxy-fetch] ${sourceTag} All webshare IPs exhausted after ${WEBSHARE_MAX_RETRIES + 1} attempts, throwing`);
           (err as Error & { proxyMeta?: ProxyFetchMeta }).proxyMeta = { ...meta };
           throw err;

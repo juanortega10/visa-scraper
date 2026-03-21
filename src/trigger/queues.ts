@@ -5,10 +5,11 @@ export const visaPollingQueue = queue({
   concurrencyLimit: 10,
 });
 
-/** Per-bot polling queue: concurrencyLimit=1 so each concurrencyKey (poll-{botId}) runs 1 at a time. */
+/** Per-bot polling queue: concurrencyLimit=10 allows all bots to poll simultaneously.
+ * Each bot is serialized via concurrencyKey (poll-{botId}) at trigger time. */
 export const visaPollingPerBotQueue = queue({
   name: 'visa-polling-per-bot',
-  concurrencyLimit: 1,
+  concurrencyLimit: 10,
 });
 
 export const visaRescheduleQueue = queue({

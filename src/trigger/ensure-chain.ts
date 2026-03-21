@@ -117,26 +117,16 @@ export const ensureChainSchedule = schedules.task({
 
     for (const bot of targetBots) {
       const envs = (bot.pollEnvironments as string[] | null) ?? ['dev'];
-      const usesDev = envs.includes('dev');
       const usesCloud = envs.includes('prod');
       const usesCron = envs.length > 1; // dual-source (e.g. ['dev','prod']) = cron-driven
 
-      if (usesDev) {
-        const dev = await ensureChainForBot(
-          bot.id,
-          bot.activeRunId,
-          `poll-${bot.id}`,
-          bot.activatedAt,
-          [`bot:${bot.id}`, 'guardian'],
-          usesCron,
-          'dev',
-        );
-        if (dev.newRunId) {
-          await db.update(bots)
-            .set({ activeRunId: dev.newRunId, updatedAt: new Date() })
-            .where(eq(bots.id, bot.id));
-        }
-        results[bot.id] = { dev: dev.action };
+      // ensure-chain runs in PRODUCTION (cloud). It can only manage cloud chains —
+      // dev chains are managed by the RPi dev worker/cron. Triggering a dev chain
+      // from cloud creates runs that execute in cloud but bypass the pollEnvironments
+      // filter (chainId='dev' → isCloud=false → no guard).
+      if (!usesCloud) {
+        logger.info('ensure-chain: skipping dev-only bot', { botId: bot.id, pollEnvironments: envs });
+        continue;
       }
 
       if (usesCloud) {

@@ -52,6 +52,8 @@ export class VisaClient {
   private baseUrl: string;
   private texts: LocaleTexts;
   private extractedAscFacilityId: string | null = null;
+  private collectsBiometrics: boolean | null = null;  // from data-collects-biometrics attr
+  private hasAscFields: boolean | null = null;         // whether ASC form fields exist in HTML
   private capturedPages = new Map<string, string>();
   private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null };
 
@@ -86,6 +88,16 @@ export class VisaClient {
 
   getCapturedPages(): Map<string, string> {
     return this.capturedPages;
+  }
+
+  /** Whether the consulate collects biometrics (from data-collects-biometrics). null = not yet detected. */
+  getCollectsBiometrics(): boolean | null {
+    return this.collectsBiometrics;
+  }
+
+  /** Whether ASC form fields exist in the appointment HTML. false = renewal/interview-waiver account. */
+  getHasAscFields(): boolean | null {
+    return this.hasAscFields;
   }
 
   updateSession(newSession: Partial<VisaSession>): void {
@@ -189,8 +201,13 @@ export class VisaClient {
   // ── Token Refresh ──────────────────────────────────────
 
   async refreshTokens(): Promise<void> {
-    const qs = this.config.applicantIds.map((id) => `applicants[]=${id}`).join('&');
-    const url = `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment?${qs}&confirmed_limit_message=1&commit=${this.texts.continueText}`;
+    const refreshParts: string[] = [];
+    if (this.config.applicantIds.length > 1) {
+      refreshParts.push(this.config.applicantIds.map((id) => `applicants[]=${id}`).join('&'));
+    }
+    refreshParts.push('confirmed_limit_message=1');
+    if (this.texts.includeCommit) refreshParts.push(`commit=${this.texts.continueText}`);
+    const url = `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment?${refreshParts.join('&')}`;
 
     // Must use direct — Firecrawl strips form elements (no authenticity_token)
     const resp = await this.doDirectFetch(url, {
@@ -227,6 +244,14 @@ export class VisaClient {
     if (ascMatch?.[1]) {
       this.extractedAscFacilityId = ascMatch[1];
     }
+
+    // Detect if consulate collects biometrics (renewal accounts have data-collects-biometrics="false" and no ASC fields)
+    const collectsBioMatch = html.match(/data-collects-biometrics="(\w+)"/);
+    if (collectsBioMatch?.[1]) {
+      this.collectsBiometrics = collectsBioMatch[1] === 'true';
+    }
+    // If no ASC fields exist at all in the HTML, this is a renewal/interview-waiver account
+    this.hasAscFields = html.includes('asc_appointment_facility_id');
   }
 
   // ── Current Appointment (from groups page) ────────────
@@ -338,7 +363,15 @@ export class VisaClient {
       body.set('commit', this.texts.rescheduleText);
     }
 
-    const qs = this.config.applicantIds.map(id => `applicants%5B%5D=${id}`).join('&');
+    // Only include applicants[] in Referer when multiple applicants (single = implicit)
+    const appointmentUrl = `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment`;
+    const refererParts: string[] = [];
+    if (this.config.applicantIds.length > 1) {
+      refererParts.push(this.config.applicantIds.map(id => `applicants%5B%5D=${id}`).join('&'));
+    }
+    refererParts.push('confirmed_limit_message=1');
+    if (this.texts.includeCommit) refererParts.push(`commit=${this.texts.continueText}`);
+    const referer = refererParts.length > 0 ? `${appointmentUrl}?${refererParts.join('&')}` : appointmentUrl;
 
     logger.info('[reschedule] POST details', {
       scheduleId: this.config.scheduleId,
@@ -352,7 +385,7 @@ export class VisaClient {
       bodyLen: body.toString().length,
     });
 
-    const resp = await this.doDirectFetch(`${this.baseUrl}/schedule/${this.config.scheduleId}/appointment`, {
+    const resp = await this.doDirectFetch(appointmentUrl, {
       method: 'POST',
       headers: {
         Cookie: `_yatri_session=${this.session.cookie}`,
@@ -360,7 +393,7 @@ export class VisaClient {
         'X-CSRF-Token': this.session.csrfToken,
         'User-Agent': USER_AGENT,
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        Referer: `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment?${qs}&confirmed_limit_message=1&commit=${this.texts.continueText}`,
+        Referer: referer,
         Origin: 'https://ais.usvisa-info.com',
         'Upgrade-Insecure-Requests': '1',
         ...BROWSER_HEADERS,

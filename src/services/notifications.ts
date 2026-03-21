@@ -514,6 +514,15 @@ ${card(kvTable(kvRows))}
     return { subject, html };
   }
 
+  if (event === 'account_locked') {
+    const subject = 'Cuenta bloqueada — reintentos pausados ~1h';
+    const html = wrap(`
+<h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_RED}">Cuenta bloqueada</span></h2>
+<p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('AUTO-RETRY', '#fef3c7', '#92400e')} &nbsp;${esc(String(data.message ?? ''))}</p>
+<p style="${F_BODY};font-size:15px;color:${C_MID};margin-top:20px">El lockout dura ~1h. El cron reintentará automáticamente.</p>`);
+    return { subject, html };
+  }
+
   if (event === 'invalid_credentials') {
     const subject = 'Credenciales inválidas — bot detenido';
     const html = wrap(`
@@ -534,6 +543,9 @@ ${card(`<pre style="${F_BODY};font-size:13px;color:${C_MID};white-space:pre-wrap
 // Events sent to notificationEmail (dev/admin) — operational noise excluded
 const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'reschedule_failed', 'bot_paused']);
 
+// Always receives reschedule_success regardless of bot owner
+const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
+
 export async function notifyUser(
   bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; webhookUrl: string | null },
   event: string,
@@ -552,6 +564,15 @@ export async function notifyUser(
   if (bot.ownerEmail && event === 'reschedule_success') {
     const { subject, html } = buildEmail(event, data);
     promises.push(sendEmail(bot.id, event, bot.ownerEmail, subject, html));
+  }
+
+  // Admin always gets reschedule_success, deduplicated
+  if (ADMIN_RESCHEDULE_EMAIL && event === 'reschedule_success') {
+    const alreadySent = [bot.notificationEmail, bot.ownerEmail].includes(ADMIN_RESCHEDULE_EMAIL);
+    if (!alreadySent) {
+      const { subject, html } = buildEmail(event, data);
+      promises.push(sendEmail(bot.id, event, ADMIN_RESCHEDULE_EMAIL, subject, html));
+    }
   }
 
   if (bot.webhookUrl) {

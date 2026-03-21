@@ -12,6 +12,7 @@ import {
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 // ── Enums ──────────────────────────────────────────────
 
@@ -80,12 +81,14 @@ export const bots = pgTable(
     maxReschedules: integer('max_reschedules'),                         // null = unlimited, e.g. Peru = 2
     rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
+    skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
     pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
     targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
     webhookUrl: text('webhook_url'),
     notificationEmail: text('notification_email'),   // operational alerts (all events) — typically the admin
     ownerEmail: text('owner_email'),                  // bot owner — only gets reschedule_success
+    notificationPhone: text('notification_phone'),    // WhatsApp phone, digits only (e.g. "573142963759")
     activatedAt: timestamp('activated_at'),
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
@@ -179,12 +182,17 @@ export const pollLogs = pgTable(
       fallbackReason?: string;         // ECONNRESET | ETIMEDOUT | ECONNREFUSED | ...
       websharePoolSize?: number;       // IPs disponibles en el pool al momento del request
       errorSource?: 'proxy_infra' | 'embassy_block' | 'proxy_quota';
+      tcpSubcategory?: 'socket_immediate_close' | 'pool_exhausted' | 'connection_reset' | 'connection_timeout' | 'dns_fail' | 'proxy_tunnel_fail' | 'connection_refused';
+      poolExhausted?: boolean;
+      socketBytesRead?: number;
+      blockClassification?: 'transient' | 'ip_ban' | 'account_ban';
+      sessionAgeMs?: number;           // ms since session.createdAt — enables session-age vs block correlation
+      pollRateRecentPerMin?: number;   // polls/min from last 5 polls — enables rate vs block correlation
     }>(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (table) => [
-    index('poll_logs_bot_idx').on(table.botId),
-    index('poll_logs_created_idx').on(table.createdAt),
+    index('poll_logs_bot_created_idx').on(table.botId, table.createdAt),
   ],
 );
 
@@ -343,6 +351,86 @@ export const notificationLogs = pgTable(
   ],
 );
 
+// ── Bookable Events ──────────────────────────────────────
+
+export const bookableEvents = pgTable('bookable_events', {
+  id: serial('id').primaryKey(),
+  botId: integer('bot_id').notNull().references(() => bots.id, { onDelete: 'cascade' }),
+  date: date('date').notNull(),
+  // 'success' | 'blocked_limit' | 'no_times' | 'no_cas_days' | 'no_cas_times' |
+  // 'no_cas_times_cached' | 'post_failed' | 'post_error' | 'session_expired' |
+  // 'stale_data' | 'max_reschedules_reached' | 'all_candidates_failed' |
+  // 'fetch_error' | 'verification_failed'
+  outcome: varchar('outcome', { length: 30 }).notNull(),
+  consularDateAtDetection: date('consular_date_at_detection'),
+  daysImprovement: integer('days_improvement'),
+  locale: varchar('locale', { length: 10 }),
+  detectedAt: timestamp('detected_at').notNull().defaultNow(),
+}, (t) => [
+  index('bookable_events_bot_det_idx').on(t.botId, t.detectedAt),
+  index('bookable_events_date_idx').on(t.date),
+]);
+
+// ── Date Sightings ──────────────────────────────────────
+
+export const dateSightings = pgTable('date_sightings', {
+  id: serial('id').primaryKey(),
+  botId: integer('bot_id').notNull().references(() => bots.id, { onDelete: 'cascade' }),
+  date: date('date').notNull(),
+  appearedAt: timestamp('appeared_at').notNull().defaultNow(),
+  disappearedAt: timestamp('disappeared_at'),
+  durationMs: integer('duration_ms'),
+  daysFromNow: integer('days_from_now'),
+}, (t) => [
+  index('ds_bot_appeared_idx').on(t.botId, t.appearedAt),
+  index('ds_bot_date_idx').on(t.botId, t.date),
+]);
+
+// ── Ban Episodes ──────────────────────────────────────
+
+export const banEpisodes = pgTable('ban_episodes', {
+  id: serial('id').primaryKey(),
+  botId: integer('bot_id')
+    .notNull()
+    .references(() => bots.id, { onDelete: 'cascade' }),
+  startedAt: timestamp('started_at').notNull().defaultNow(),
+  endedAt: timestamp('ended_at'),
+  durationMin: integer('duration_min'),
+  classification: varchar('classification', { length: 20 }).notNull(), // account_ban | ip_ban | transient | mixed
+  pollCount: integer('poll_count').notNull().default(1),
+  /** Compact log of each poll during the ban: [{at, cls, provider, ip, ms, sub, bytesRead}] */
+  pollDetails: jsonb('poll_details').$type<BanPollDetail[]>().default([]),
+  /** Snapshot at ban start: provider, IP, poll rate, session age */
+  triggerContext: jsonb('trigger_context').$type<{
+    provider?: string;
+    publicIp?: string;
+    pollRateRecentPerMin?: number;
+    sessionAgeMs?: number;
+    locale?: string;
+  }>(),
+  /** Snapshot at recovery */
+  recoveryContext: jsonb('recovery_context').$type<{
+    provider?: string;
+    publicIp?: string;
+    recoveryStatus?: string; // ok | filtered_out | soft_ban
+  }>(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  index('ban_episodes_bot_started_idx').on(t.botId, t.startedAt),
+  index('ban_episodes_open_idx').on(t.botId).where(sql`ended_at IS NULL`),
+]);
+
+export interface BanPollDetail {
+  at: string;           // ISO timestamp
+  cls?: string;         // blockClassification
+  sub?: string;         // tcpSubcategory
+  provider?: string;
+  ip?: string;          // publicIp
+  ms?: number;          // responseTimeMs
+  bytesRead?: number;   // socketBytesRead
+  err?: string;         // error message (truncated)
+}
+
 // ── Type exports ───────────────────────────────────────
 
 export type Bot = typeof bots.$inferSelect;
@@ -354,3 +442,6 @@ export type CasPrefetchLog = typeof casPrefetchLogs.$inferSelect;
 export type DispatchLog = typeof dispatchLogs.$inferSelect;
 export type AuthLog = typeof authLogs.$inferSelect;
 export type NotificationLog = typeof notificationLogs.$inferSelect;
+export type BookableEvent = typeof bookableEvents.$inferSelect;
+export type DateSighting = typeof dateSightings.$inferSelect;
+export type BanEpisode = typeof banEpisodes.$inferSelect;

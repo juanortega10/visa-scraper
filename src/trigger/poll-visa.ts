@@ -1,17 +1,17 @@
 import { task, logger, metadata, runs } from '@trigger.dev/sdk/v3';
 import { visaPollingQueue, visaPollingPerBotQueue } from './queues.js';
 import { db } from '../db/client.js';
-import { bots, sessions, excludedDates, excludedTimes, pollLogs, rescheduleLogs } from '../db/schema.js';
-import { eq, and, desc, gte, sql } from 'drizzle-orm';
+import { bots, sessions, excludedDates, excludedTimes, pollLogs, rescheduleLogs, bookableEvents, dateSightings, banEpisodes, type BanPollDetail } from '../db/schema.js';
+import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
-import { filterDates, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
+import { filterDates, isAtLeastNDaysEarlier, computeDaysImprovement } from '../utils/date-helpers.js';
 import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
-import { performLogin, InvalidCredentialsError, type LoginCredentials } from '../services/login.js';
-import { classifyProxyError, type ProxyProvider, type ProxyFetchMeta } from '../services/proxy-fetch.js';
+import { performLogin, InvalidCredentialsError, AccountLockedError, type LoginCredentials } from '../services/login.js';
+import { classifyProxyError, classifyTcpSubcategory, extractBytesRead, deriveBlockClassification, type ProxyProvider, type ProxyFetchMeta, type BlockClassification } from '../services/proxy-fetch.js';
 import { logAuth } from '../utils/auth-logger.js';
 import type { CasCacheData } from '../db/schema.js';
 
@@ -27,11 +27,14 @@ function cancelPreviousRun(currentRunId: string, activeRunId: string | null): vo
   runs.cancel(activeRunId).catch(() => {});
 }
 
+interface DateCooldownEntry { failCount: number; cooldownUntil?: string }
+
 interface PollPayload {
   botId: number;
   chainId?: 'dev' | 'cloud'; // default 'dev'
   dryRun?: boolean;
   lastDatesCount?: number; // raw dates from previous run (for soft ban detection)
+  dateCooldowns?: Record<string, DateCooldownEntry>; // cross-run cooldown for dates that consistently fail reschedule
 }
 
 /** Extract error message including undici's nested cause (e.g. "fetch failed: ECONNRESET"). */
@@ -79,9 +82,12 @@ export const pollVisaTask = task({
     let softBanNotified = false;
     let throttleNotified = false;
     let sustainedTcpBlockCount = 0; // set when tcp_block detected; used for backoff + dedup notify
+    let sustainedAccountBanCount = 0; // subset of sustainedTcpBlockCount: consecutive account_ban polls
     let runRawDatesCount = -1; // latest raw (unfiltered) dates count in this run
     let reloginHappened = false;
+    let updatedCooldowns: Record<string, DateCooldownEntry> = payload.dateCooldowns ?? {};
     let publicIp: string | null = null;
+    let connInfoExtra: { sessionAgeMs?: number; pollRateRecentPerMin?: number } = {};
     const timings: Record<string, number> = {};
     logger.info('poll-visa START', { botId, chainId, dryRun: dryRun || undefined });
 
@@ -104,7 +110,7 @@ export const pollVisaTask = task({
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore,
-      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas,
       pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
       proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
@@ -115,11 +121,13 @@ export const pollVisaTask = task({
       return;
     }
 
-    // Cloud chain: check if bot is configured for cloud polling.
+    // Environment guard: stop chains running in the wrong environment.
     // pollEnvironments is the source of truth; cloudEnabled is legacy (kept for backward compat).
     const botPollEnvs = (bot.pollEnvironments as string[] | null) ?? ['dev'];
-    if (isCloud && !bot.cloudEnabled && !botPollEnvs.includes('prod')) {
-      logger.info('Cloud chain stopped — not configured for cloud', { botId, pollEnvironments: botPollEnvs });
+    const runtimeEnv = ctx.environment.type; // 'PRODUCTION' | 'DEVELOPMENT' | 'STAGING'
+    const isRuntimeCloud = runtimeEnv === 'PRODUCTION';
+    if (isRuntimeCloud && !bot.cloudEnabled && !botPollEnvs.includes('prod')) {
+      logger.info('Chain stopped — bot not configured for cloud polling', { botId, chainId, runtimeEnv, pollEnvironments: botPollEnvs });
       return;
     }
 
@@ -169,7 +177,17 @@ export const pollVisaTask = task({
       });
       for (const otherRun of activePage.data) {
         if (otherRun.id === ctx.run.id) continue;
-        const cancelAlways = otherRun.status === 'QUEUED' || otherRun.status === 'DELAYED';
+        // DEDUP FALLBACK: any DELAYED run for this bot is an intentional backoff chain.
+        // Abort this run (cron) rather than cancelling the backoff, regardless of activeRunIdField.
+        // (activeRunIdField may lag if the DB update failed silently after the previous self-trigger.)
+        if (otherRun.status === 'DELAYED') {
+          logger.warn('DEDUP FALLBACK — found DELAYED run, aborting this run', {
+            botId, chainId, runId: ctx.run.id, delayedRunId: otherRun.id, activeRunId: activeRunIdField,
+          });
+          await Promise.allSettled(pending);
+          return;
+        }
+        const cancelAlways = otherRun.status === 'QUEUED';
         if (!cancelAlways && otherRun.id > ctx.run.id) continue; // Newer executing run — let it cancel us
         logger.warn('DEDUP — cancelling run', {
           botId, duplicateRunId: otherRun.id, duplicateStatus: otherRun.status,
@@ -209,15 +227,22 @@ export const pollVisaTask = task({
       }).from(sessions).where(eq(sessions.botId, botId)),
       db.select().from(excludedDates).where(eq(excludedDates.botId, botId)),
       db.select().from(excludedTimes).where(eq(excludedTimes.botId, botId)),
-      db.select({ rawDatesCount: pollLogs.rawDatesCount, topDates: pollLogs.topDates }).from(pollLogs)
-        .where(eq(pollLogs.botId, botId)).orderBy(desc(pollLogs.id)).limit(1)
-        .catch(() => [] as { rawDatesCount: number | null; topDates: string[] | null }[]),
+      db.select({ rawDatesCount: pollLogs.rawDatesCount, topDates: pollLogs.topDates, allDates: pollLogs.allDates }).from(pollLogs)
+        .where(and(eq(pollLogs.botId, botId), isNotNull(pollLogs.topDates)))
+        .orderBy(desc(pollLogs.id)).limit(1)
+        .catch(() => [] as { rawDatesCount: number | null; topDates: string[] | null; allDates: Array<{date: string}> | null }[]),
     ]);
-    // Seed previousDates from last poll's topDates for dateChanges detection
+    // Seed previousDates from last poll's allDates (full set) for accurate dateChanges detection
+    // Falls back to topDates (3 entries) if allDates is missing (old polls)
     let previousDates: Set<string> | null = null;
-    const lastTopDates = lastPollResult[0]?.topDates;
-    if (lastTopDates && lastTopDates.length > 0) {
-      previousDates = new Set(lastTopDates);
+    const lastAllDates = lastPollResult[0]?.allDates;
+    if (lastAllDates && lastAllDates.length > 0) {
+      previousDates = new Set(lastAllDates.map(d => d.date));
+    } else {
+      const lastTopDates = lastPollResult[0]?.topDates;
+      if (lastTopDates && lastTopDates.length > 0) {
+        previousDates = new Set(lastTopDates);
+      }
     }
     // lastDatesCount may not be passed on cron restart — recover from DB
     const effectiveLastDatesCount = payload.lastDatesCount ?? (lastPollResult[0]?.rawDatesCount ?? undefined);
@@ -230,6 +255,24 @@ export const pollVisaTask = task({
 
     const sessionAgeMs = Date.now() - session.createdAt.getTime();
     const sessionAgeMin = Math.round(sessionAgeMs / 60000);
+    connInfoExtra.sessionAgeMs = sessionAgeMs;
+
+    // Compute poll rate from last 5 polls (for all polls, not just tcp blocks)
+    const rateQuery = await db
+      .select({ createdAt: pollLogs.createdAt })
+      .from(pollLogs)
+      .where(eq(pollLogs.botId, botId))
+      .orderBy(desc(pollLogs.createdAt))
+      .limit(5);
+    if (rateQuery.length >= 2) {
+      const newest = rateQuery[0]!.createdAt.getTime();
+      const oldest = rateQuery[rateQuery.length - 1]!.createdAt.getTime();
+      const spanMin = (newest - oldest) / 60_000;
+      if (spanMin > 0) {
+        connInfoExtra.pollRateRecentPerMin = Math.round((rateQuery.length / spanMin) * 10) / 10;
+      }
+    }
+
     logger.info('Session loaded', { botId, sessionAgeMin, lastUsedAt: session.lastUsedAt?.toISOString() });
 
     // Pre-emptive re-login: refresh session before the ~88min hard TTL.
@@ -424,7 +467,7 @@ export const pollVisaTask = task({
         // Kick off consular days fetch first
         const daysPromise = client.getConsularDays().then((result) => {
           const proxyMeta = client.getLastProxyMeta();
-          capturedConnInfo = captureConnInfo(proxyMeta);
+          capturedConnInfo = captureConnInfo(proxyMeta, connInfoExtra);
           // Capture webshare IP immediately (before appointment fetch may update lastProxyMeta)
           if (proxyMeta.proxyAttemptIp) publicIp = proxyMeta.proxyAttemptIp;
           return result;
@@ -483,20 +526,41 @@ export const pollVisaTask = task({
         days = filterDates(allDays, dateExclusions, bot.targetDateBefore);
         metadata.set("phase", days.length > 0 ? `Analizando ${days.length} fechas...` : "Sin fechas disponibles");
 
-        // Detect cross-run soft ban: previous run had 20+ dates, now ≤2
-        // In cron mode, effectiveLastDatesCount is recovered from DB since payload doesn't carry it
-        if (!softBanNotified && effectiveLastDatesCount && effectiveLastDatesCount > 20 && allDays.length <= 2) {
-          softBanNotified = true;
-          logger.warn('SOFT BAN suspected — dates dropped dramatically', {
-            botId, previousCount: effectiveLastDatesCount, currentCount: allDays.length,
-          });
-          pending.push(
-            notifyUserTask.trigger({
-              botId,
-              event: 'soft_ban_suspected',
-              data: { previousCount: effectiveLastDatesCount, currentCount: allDays.length },
-            }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('soft_ban notify failed', { error: String(e) })),
-          );
+        // Detect soft ban: dramatic date count drop.
+        // Cross-run: previous run or DB had 15+ dates, now ≤2 (lowered from 20→15 threshold)
+        // Intra-bot: query last 5 ok/filtered polls — if median rawDatesCount > 15 and current ≤ 2
+        if (!softBanNotified && allDays.length <= 2) {
+          const crossRunDrop = effectiveLastDatesCount && effectiveLastDatesCount > 15;
+          let intraBotDrop = false;
+          if (!crossRunDrop) {
+            // Query recent successful polls for this bot to detect gradual → sudden drop
+            const recentOkPolls = await db
+              .select({ rawDatesCount: pollLogs.rawDatesCount })
+              .from(pollLogs)
+              .where(and(eq(pollLogs.botId, botId), sql`${pollLogs.status} IN ('ok', 'filtered_out')`, isNotNull(pollLogs.rawDatesCount)))
+              .orderBy(desc(pollLogs.createdAt))
+              .limit(5);
+            const counts = recentOkPolls.map(r => r.rawDatesCount!).filter(n => n > 0);
+            if (counts.length >= 2) {
+              const sorted = [...counts].sort((a, b) => a - b);
+              const median = sorted[Math.floor(sorted.length / 2)];
+              intraBotDrop = (median ?? 0) > 15;
+            }
+          }
+          if (crossRunDrop || intraBotDrop) {
+            softBanNotified = true;
+            const prevCount = crossRunDrop ? effectiveLastDatesCount : 'median>15';
+            logger.warn('SOFT BAN suspected — dates dropped dramatically', {
+              botId, previousCount: prevCount, currentCount: allDays.length, source: crossRunDrop ? 'cross_run' : 'intra_bot',
+            });
+            pending.push(
+              notifyUserTask.trigger({
+                botId,
+                event: 'soft_ban_suspected',
+                data: { previousCount: prevCount, currentCount: allDays.length, source: crossRunDrop ? 'cross_run' : 'intra_bot' },
+              }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('soft_ban notify failed', { error: String(e) })),
+            );
+          }
         }
 
         if (superCritical) {
@@ -514,7 +578,8 @@ export const pollVisaTask = task({
           const firstEarliest = days[0]?.date;
           const firstStatus = softBanNotified ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
           const firstDateChanges = computeDateChanges(allDays, previousDates);
-          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, connectionInfo: capturedConnInfo });
+          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, connectionInfo: capturedConnInfo });
+          persistDateSightings(pending, botId, firstDateChanges, bot.currentConsularDate, bot.targetDateBefore);
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
 
@@ -568,7 +633,7 @@ export const pollVisaTask = task({
                   const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
                   if (proxyIp) publicIp = proxyIp;
                 }
-                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta()) });
+                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
                 logger.warn(`Super-critical fetch ${loopFetchCount} — HTTP 5xx (${consecutive5xx} consecutive)`, { botId, error: errMsg });
                 if (consecutive5xx >= 2 && !throttleNotified) {
                   throttleNotified = true;
@@ -596,7 +661,7 @@ export const pollVisaTask = task({
                 const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
                 if (proxyIp) publicIp = proxyIp;
               }
-              logPoll(pending, botId, null, 0, fetchMs, tcpBlock ? 'tcp_blocked' : 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta()) });
+              logPoll(pending, botId, null, 0, fetchMs, tcpBlock ? 'tcp_blocked' : 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
               logger.warn(`Super-critical fetch ${loopFetchCount} error`, { botId, consecutiveErrors, error: errMsg });
               if (tcpBlock && !tcpBlockNotified) {
                 tcpBlockNotified = true;
@@ -638,7 +703,8 @@ export const pollVisaTask = task({
             const fetchMs2 = Date.now() - fetchStart;
             const fetchStatus = isSoftBan ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
             const loopDateChanges = computeDateChanges(allDays, previousDates);
-            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 3).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, connectionInfo: captureConnInfo(client.getLastProxyMeta()) });
+            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+            persistDateSightings(pending, botId, loopDateChanges, bot.currentConsularDate, bot.targetDateBefore);
             previousDates = new Set(allDays.map(d => d.date));
             logger.info(`Super-critical fetch ${loopFetchCount} result`, {
               botId,
@@ -663,8 +729,10 @@ export const pollVisaTask = task({
       // Batch polling loop: run multiple polls within a single Trigger.dev run (~90s budget)
       // to reduce Trigger.dev overhead (1 dequeue per batch vs 1 per poll).
       const BATCH_BUDGET_MS = 90_000;
+      const interPollS = getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin);
       let batchFetchCount = 0;
       let iterationStartMs = startMs;
+      logger.info('[BATCH] Starting batch loop', { botId, budget: '90s', interPollS, locale: bot.locale });
 
       while (true) {
         batchFetchCount++;
@@ -681,6 +749,17 @@ export const pollVisaTask = task({
           logger.warn('Reschedule BLOCKED — max reschedule limit reached', {
             botId, rescheduleCount: bot.rescheduleCount, maxReschedules: bot.maxReschedules,
           });
+          // Insert bookable_event only when date just appeared (avoid flood on every blocked poll)
+          if (earliest && previousDates && !previousDates.has(earliest)) {
+            pending.push(
+              db.insert(bookableEvents).values({
+                botId, date: earliest, outcome: 'blocked_limit',
+                consularDateAtDetection: bot.currentConsularDate,
+                daysImprovement: computeDaysImprovement(earliest, bot.currentConsularDate),
+                locale: bot.locale,
+              }).catch(e => logger.error('bookable_event insert failed', { error: String(e) }))
+            );
+          }
         } else if (earliest && bot.currentConsularDate && isAtLeastNDaysEarlier(earliest, bot.currentConsularDate, 1)) {
           const RESCHEDULE_DEDUP_MS = 3 * 60 * 1000;
           const [recentReschedule] = await db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
@@ -693,6 +772,20 @@ export const pollVisaTask = task({
             });
             // Update in-memory bot to reflect the new date from the other chain's reschedule
             bot.currentConsularDate = recentReschedule.newConsularDate;
+          } else {
+          // Date cooldown: skip reschedule if all candidate dates are cooling down
+          const cooledDownDates = getActiveCooldowns(updatedCooldowns);
+          const candidateDates = allDays
+            .filter(d => bot.currentConsularDate && isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1))
+            .map(d => d.date);
+          const uncooledCandidates = candidateDates.filter(d => !cooledDownDates.has(d));
+
+          if (uncooledCandidates.length === 0 && candidateDates.length > 0 && cooledDownDates.size > 0) {
+            rescheduleResultLabel = 'cooldown_skip';
+            logger.info('All candidate dates in cooldown — skipping reschedule', {
+              botId, cooledDown: [...cooledDownDates], candidateCount: candidateDates.length,
+              nextExpiry: Object.values(updatedCooldowns).map(e => e.cooldownUntil).filter(Boolean).sort()[0],
+            });
           } else {
           logger.info('EARLIER DATE FOUND — rescheduling inline', {
             botId,
@@ -740,6 +833,7 @@ export const pollVisaTask = task({
           timings.reschedule = Date.now() - rescheduleStart;
           rescheduleResultObj = result;
           rescheduleResultLabel = deriveRescheduleResult(result);
+          const originalConsularDate = bot.currentConsularDate;
           if (result.success) {
             bot.currentConsularDate = result.date!;
             bot.currentConsularTime = result.consularTime!;
@@ -761,6 +855,37 @@ export const pollVisaTask = task({
             );
           }
           logger.info('Inline reschedule done', { botId, success: result.success, reason: result.reason, rescheduleResult: rescheduleResultLabel });
+
+          // Persist bookable_events: one row per failed attempt + one for success
+          const beRows: (typeof bookableEvents.$inferInsert)[] = [];
+          for (const attempt of result.attempts ?? []) {
+            beRows.push({
+              botId, date: attempt.date, outcome: attempt.failReason,
+              consularDateAtDetection: originalConsularDate,
+              daysImprovement: computeDaysImprovement(attempt.date, originalConsularDate),
+              locale: bot.locale,
+            });
+          }
+          if (result.success && result.date) {
+            beRows.push({
+              botId, date: result.date, outcome: 'success',
+              consularDateAtDetection: originalConsularDate,
+              daysImprovement: computeDaysImprovement(result.date, originalConsularDate),
+              locale: bot.locale,
+            });
+          }
+          if (beRows.length > 0) {
+            pending.push(
+              db.insert(bookableEvents).values(beRows)
+                .catch(e => logger.error('bookable_event insert failed', { error: String(e) }))
+            );
+          }
+
+          // Update date cooldowns based on reschedule result
+          if (rescheduleResultObj) {
+            updatedCooldowns = updateDateCooldowns(updatedCooldowns, rescheduleResultObj, candidateDates);
+          }
+          } // end else (cooldown check passed)
           } // end else (no recent reschedule)
         } else if (earliest) {
           logger.info('No improvement — earliest is not ≥1 day before current', {
@@ -793,7 +918,8 @@ export const pollVisaTask = task({
           };
 
           // topDates always uses raw (unfiltered) dates for consistent cancellation tracking
-          const topDatesRaw = allDays.slice(0, 3).map(d => d.date);
+          const topDatesRaw = allDays.slice(0, 10).map(d => d.date);
+          persistDateSightings(pending, botId, finalDateChanges, bot.currentConsularDate, bot.targetDateBefore);
           if (days.length === 0) {
             logger.info('No available dates', { botId, responseTimeMs, softBan: softBanNotified });
             logPoll(pending, botId, null, 0, responseTimeMs, finalStatus, undefined, topDatesRaw, undefined, extra);
@@ -844,24 +970,67 @@ export const pollVisaTask = task({
           bot.status = 'active';
         }
 
+        // ── Close any open ban episode on successful poll ──
+        pending.push(
+          db.update(banEpisodes)
+            .set({
+              endedAt: new Date(),
+              durationMin: sql`EXTRACT(EPOCH FROM now() - ${banEpisodes.startedAt})::int / 60`,
+              recoveryContext: {
+                provider: effectiveProvider,
+                publicIp: publicIp || undefined,
+                recoveryStatus: softBanNotified ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out'),
+              },
+            })
+            .where(and(eq(banEpisodes.botId, botId), sql`${banEpisodes.endedAt} IS NULL`))
+            .then((result) => {
+              if (result.rowCount && result.rowCount > 0) {
+                logger.info('Ban episode CLOSED', { botId });
+              }
+            })
+            .catch((e) => logger.error('ban_episode close failed', { error: String(e) })),
+        );
+
         // ── [E] Batch loop exit conditions ──
 
-        // TCP block / throttle → exit, self-trigger will use longer delay
-        if (tcpBlockNotified || throttleNotified) break;
+        // Throttle → always exit (server-side, no point retrying immediately)
+        if (throttleNotified) {
+          logger.info('[BATCH] Exit: throttle', { botId, batchFetchCount, elapsedMs: Date.now() - startMs });
+          break;
+        }
+        // TCP block → only exit if pool is fully exhausted; otherwise reset and continue
+        // with fresh IPs (ProxyPoolManager already penalized the failed ones).
+        if (tcpBlockNotified) {
+          const poolExhausted = capturedConnInfo?.poolExhausted === true;
+          if (poolExhausted) {
+            logger.info('[BATCH] Exit: tcp_block pool_exhausted', { botId, batchFetchCount, elapsedMs: Date.now() - startMs });
+            break;
+          }
+          logger.info('[BATCH] TCP block but pool has healthy IPs — continuing batch', { botId, batchFetchCount, elapsedMs: Date.now() - startMs });
+          tcpBlockNotified = false;
+        }
 
         // Super-critical window started → exit so next run runs the SC loop
-        if (isInSuperCriticalWindow(bot.locale)) break;
+        if (isInSuperCriticalWindow(bot.locale)) {
+          logger.info('[BATCH] Exit: super_critical', { botId, batchFetchCount, elapsedMs: Date.now() - startMs });
+          break;
+        }
 
         // Dry run → 1 iteration only (mock data doesn't change)
         if (dryRun) break;
 
         // Budget nearly exhausted (8s margin for self-trigger setup)
-        if (Date.now() - startMs >= BATCH_BUDGET_MS - 8_000) break;
+        const elapsedMs = Date.now() - startMs;
+        if (elapsedMs >= BATCH_BUDGET_MS - 8_000) {
+          logger.info('[BATCH] Exit: budget_exhausted', { botId, batchFetchCount, elapsedMs });
+          break;
+        }
 
         // ── [F] Sleep between polls ──
         {
-          const interPollDelayStr = getPollingDelay(bot.locale, getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin));
+          const interPollDelayStr = getPollingDelay(bot.locale, interPollS);
           const interPollMs = parseInt(interPollDelayStr) * 1_000;
+          logger.info('[BATCH] Poll done, sleeping', { botId, poll: batchFetchCount, interPollMs, elapsedMs: Date.now() - startMs });
           await new Promise((r) => setTimeout(r, interPollMs));
         }
 
@@ -869,13 +1038,13 @@ export const pollVisaTask = task({
         if (isInSuperCriticalWindow(bot.locale)) break;
 
         // ── [H] Next fetch ──
+        previousDates = new Set(allDays.map(d => d.date));
         iterationStartMs = Date.now();
         try {
           allDays = await client.getConsularDays();
-          { const proxyMeta = client.getLastProxyMeta(); if (proxyMeta.proxyAttemptIp) publicIp = proxyMeta.proxyAttemptIp; capturedConnInfo = captureConnInfo(proxyMeta); }
+          { const proxyMeta = client.getLastProxyMeta(); if (proxyMeta.proxyAttemptIp) publicIp = proxyMeta.proxyAttemptIp; capturedConnInfo = captureConnInfo(proxyMeta, connInfoExtra); }
           runRawDatesCount = allDays.length;
           days = filterDates(allDays, dateExclusions, bot.targetDateBefore);
-          previousDates = new Set(allDays.map(d => d.date));
         } catch (fetchErr) {
           if (fetchErr instanceof SessionExpiredError) throw fetchErr;
           const errMsg = extractErrorMessage(fetchErr);
@@ -889,7 +1058,7 @@ export const pollVisaTask = task({
               rawDatesCount: 0, provider: effectiveProvider, reloginHappened,
               chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal',
               fetchIndex: batchFetchCount,
-              runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta()),
+              runId: ctx.run.id, publicIp, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra),
             });
           if (isTcp && !tcpBlockNotified) {
             tcpBlockNotified = true;
@@ -919,6 +1088,29 @@ export const pollVisaTask = task({
       {
         const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
         if (proxyIp) publicIp = proxyIp;
+      }
+      // For direct provider TCP blocks, capturedConnInfo may be null — enrich from error metadata
+      if (tcpBlock && !capturedConnInfo) {
+        // proxy-fetch.ts now populates proxyMeta on direct provider errors
+        const errMeta = (error as Error & { proxyMeta?: ProxyFetchMeta })?.proxyMeta;
+        if (errMeta) {
+          capturedConnInfo = captureConnInfo(errMeta, connInfoExtra);
+        } else {
+          // Fallback: derive from bytesRead + error message
+          const bytesRead = extractBytesRead(error);
+          capturedConnInfo = {
+            blockClassification: bytesRead === 0 ? 'account_ban' : 'transient',
+            socketBytesRead: bytesRead ?? undefined,
+            errorSource: classifyProxyError(error, 0),
+            tcpSubcategory: classifyTcpSubcategory(error, false),
+            ...connInfoExtra,
+          };
+        }
+      } else if (tcpBlock && capturedConnInfo) {
+        // Enrich existing capturedConnInfo with sessionAgeMs/pollRateRecentPerMin if missing
+        if (connInfoExtra.sessionAgeMs !== undefined && !capturedConnInfo.sessionAgeMs) {
+          capturedConnInfo.sessionAgeMs = connInfoExtra.sessionAgeMs;
+        }
       }
       logger.error(`Poll error: ${errMsg}`, { botId, responseTimeMs, tcpBlock, serverOverload });
       logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal', runId: ctx.run.id, publicIp, connectionInfo: capturedConnInfo });
@@ -995,6 +1187,23 @@ export const pollVisaTask = task({
             await Promise.allSettled(pending);
             return;
           }
+          if (loginErr instanceof AccountLockedError) {
+            const lockMsg = loginErr.lockedUntil
+              ? `Account locked until ${loginErr.lockedUntil.toISOString()}. Will auto-retry via cron.`
+              : 'Account locked after too many failed login attempts. Will auto-retry in ~1h.';
+            logger.error('Inline re-login: account locked — stopping chain', { botId, lockedUntil: loginErr.lockedUntil?.toISOString() });
+            logAuth({ email, action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: `account_locked${loginErr.lockedUntil ? ` until ${loginErr.lockedUntil.toISOString()}` : ''}`, botId });
+            await db.update(bots).set({ status: 'login_required', updatedAt: new Date() }).where(eq(bots.id, botId));
+            pending.push(
+              notifyUserTask.trigger({
+                botId,
+                event: 'account_locked',
+                data: { message: lockMsg, lockedUntil: loginErr.lockedUntil?.toISOString() },
+              }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('notify failed', { error: String(e) })),
+            );
+            await Promise.allSettled(pending);
+            return; // No login-visa fallback, no self-chain — cron retries in 2min but login will keep failing until lockout expires
+          }
           // Login failed — fall through to normal error handling below
           const loginErrMsg = loginErr instanceof Error ? loginErr.message : String(loginErr);
           logger.error(`Inline re-login FAILED: ${loginErrMsg}`, { botId });
@@ -1013,14 +1222,77 @@ export const pollVisaTask = task({
       // regardless of which code path (outer catch vs batch-loop inner catch) set tcpBlockNotified.
       if (tcpBlock) {
         const recentStatuses = await db
-          .select({ status: pollLogs.status })
+          .select({
+            status: pollLogs.status,
+            blockCls: sql<string>`${pollLogs.connectionInfo}->>'blockClassification'`,
+            createdAt: pollLogs.createdAt,
+          })
           .from(pollLogs)
           .where(eq(pollLogs.botId, botId))
           .orderBy(desc(pollLogs.createdAt))
           .limit(5);
         const firstNonTcp = recentStatuses.findIndex((r) => r.status !== 'tcp_blocked');
         sustainedTcpBlockCount = firstNonTcp === -1 ? recentStatuses.length : firstNonTcp;
+        // null blockCls (502/unknown) treated conservatively — does not reset escalation
+        const firstNonAccountBan = recentStatuses.findIndex((r) => r.blockCls !== null && r.blockCls !== 'account_ban');
+        sustainedAccountBanCount = firstNonAccountBan === -1 ? recentStatuses.length : firstNonAccountBan;
+        // Compute pollRateRecentPerMin from last 5 polls timestamps
+        if (recentStatuses.length >= 2) {
+          const newest = recentStatuses[0]!.createdAt?.getTime() ?? 0;
+          const oldest = recentStatuses[recentStatuses.length - 1]!.createdAt?.getTime() ?? 0;
+          const spanMin = (newest - oldest) / 60_000;
+          if (spanMin > 0) {
+            connInfoExtra.pollRateRecentPerMin = Math.round((recentStatuses.length / spanMin) * 10) / 10;
+          }
+        }
       }
+      // ── Ban episode tracking ──
+      if (tcpBlock) {
+        const blockCls = capturedConnInfo?.blockClassification ?? 'transient';
+        const pollDetail: BanPollDetail = {
+          at: new Date().toISOString(),
+          cls: blockCls,
+          sub: capturedConnInfo?.tcpSubcategory ?? undefined,
+          provider: effectiveProvider,
+          ip: publicIp || undefined,
+          ms: responseTimeMs,
+          bytesRead: capturedConnInfo?.socketBytesRead ?? undefined,
+          err: errMsg?.substring(0, 120),
+        };
+
+        if (sustainedTcpBlockCount === 0) {
+          // First block — open new episode
+          pending.push(
+            db.insert(banEpisodes).values({
+              botId,
+              classification: blockCls,
+              pollCount: 1,
+              pollDetails: [pollDetail],
+              triggerContext: {
+                provider: effectiveProvider,
+                publicIp: publicIp || undefined,
+                pollRateRecentPerMin: connInfoExtra.pollRateRecentPerMin,
+                sessionAgeMs: connInfoExtra.sessionAgeMs,
+                locale: bot.locale ?? 'es-co',
+              },
+            }).catch((e) => logger.error('ban_episode insert failed', { error: String(e) })),
+          );
+          logger.info('Ban episode OPENED', { botId, classification: blockCls });
+        } else {
+          // Ongoing ban — update open episode (set to 'mixed' if classification differs)
+          pending.push(
+            db.update(banEpisodes)
+              .set({
+                pollCount: sql`${banEpisodes.pollCount} + 1`,
+                pollDetails: sql`${banEpisodes.pollDetails} || ${JSON.stringify([pollDetail])}::jsonb`,
+                classification: sql`CASE WHEN ${banEpisodes.classification} = ${blockCls} THEN ${blockCls} ELSE 'mixed' END`,
+              })
+              .where(and(eq(banEpisodes.botId, botId), sql`${banEpisodes.endedAt} IS NULL`))
+              .catch((e) => logger.error('ban_episode update failed', { error: String(e) })),
+          );
+        }
+      }
+
       if (tcpBlock && !tcpBlockNotified) {
         tcpBlockNotified = true;
         const errorSource = classifyProxyError(error, responseTimeMs);
@@ -1102,14 +1374,30 @@ export const pollVisaTask = task({
       //   direct/brightdata/firecrawl → escalating backoff to avoid escalating a single-IP ban
       // 5xx throttle → 3min (server-side, not IP-specific)
       let delay: string;
+      const blockCls = capturedConnInfo?.blockClassification;
       if (tcpBlockNotified && bot.proxyProvider === 'webshare') {
-        // ≥3 consecutive tcp_blocks = sustained block → 5min backoff to avoid spam.
-        delay = sustainedTcpBlockCount >= 3 ? '5m' : normalDelay;
+        if (blockCls === 'account_ban') {
+          // Account ban lasts 6h+. Probe first occurrence (could be transient pool exhaustion),
+          // then escalate as the ban is confirmed to be sustained.
+          delay = sustainedAccountBanCount <= 1 ? '10m'
+            : sustainedAccountBanCount <= 3 ? '30m'
+            : '120m';
+        } else {
+          // ip_ban / pool partially degraded — pool rotates IPs, 5min is fine
+          delay = sustainedTcpBlockCount >= 3 ? '5m' : normalDelay;
+        }
       } else if (tcpBlockNotified) {
-        // 0-2 consecutive: normalDelay, 3-4: 10min, 5+: 30min
-        delay = sustainedTcpBlockCount <= 2 ? normalDelay
-          : sustainedTcpBlockCount <= 4 ? '10m'
-          : '30m';
+        if (blockCls === 'account_ban') {
+          // Direct IP ban — escalate aggressively (ban lasts 6h+, no pool to rotate)
+          delay = sustainedAccountBanCount <= 1 ? '10m'
+            : sustainedAccountBanCount <= 3 ? '30m'
+            : '120m';
+        } else {
+          // Transient / connection_reset — existing behavior
+          delay = sustainedTcpBlockCount <= 2 ? normalDelay
+            : sustainedTcpBlockCount <= 4 ? '10m'
+            : '30m';
+        }
       } else if (throttleNotified) {
         delay = '3m';
       } else {
@@ -1117,7 +1405,7 @@ export const pollVisaTask = task({
       }
       const priority = calculatePriority(bot.activatedAt);
       const concurrencyKey = isCloud ? `poll-cloud-${botId}` : `poll-${botId}`;
-      logger.info('Self-rescheduling (chain)', { botId, chainId, delay, priority, ...(hadTransientError ? { tcpBlock: tcpBlockNotified, throttle: throttleNotified } : {}) });
+      logger.info('Self-rescheduling (chain)', { botId, chainId, delay, priority, ...(hadTransientError ? { tcpBlock: tcpBlockNotified, throttle: throttleNotified, blockCls, sustainedAccountBanCount } : {}) });
 
       metadata.set("phase", "Auto-programando...");
       const handle = await pollVisaTask.trigger(
@@ -1126,6 +1414,7 @@ export const pollVisaTask = task({
           ...(isCloud ? { chainId: 'cloud' as const } : {}),
           ...(dryRun ? { dryRun } : {}),
           ...(runRawDatesCount > 0 ? { lastDatesCount: runRawDatesCount } : {}),
+          ...(Object.keys(updatedCooldowns).length > 0 ? { dateCooldowns: updatedCooldowns } : {}),
         },
         {
           delay: dryRun ? '30s' : delay,
@@ -1181,16 +1470,39 @@ interface LogPollExtra {
     fallbackReason?: string;
     websharePoolSize?: number;
     errorSource?: 'proxy_infra' | 'embassy_block' | 'proxy_quota';
+    tcpSubcategory?: 'socket_immediate_close' | 'pool_exhausted' | 'connection_reset' | 'connection_timeout' | 'dns_fail' | 'proxy_tunnel_fail' | 'connection_refused';
+    poolExhausted?: boolean;
+    socketBytesRead?: number;
+    blockClassification?: BlockClassification;
+    sessionAgeMs?: number;
+    pollRateRecentPerMin?: number;
   } | null;
 }
 
-function captureConnInfo(meta: ProxyFetchMeta): LogPollExtra['connectionInfo'] {
-  return (meta.proxyAttemptIp || meta.websharePoolSize > 0) ? {
+function captureConnInfo(meta: ProxyFetchMeta, extra?: { sessionAgeMs?: number; pollRateRecentPerMin?: number }): LogPollExtra['connectionInfo'] {
+  // Always return connectionInfo when there's any proxy metadata OR when we have enrichment data.
+  // Previously only returned when proxyAttemptIp/websharePoolSize/poolExhausted was set,
+  // causing 67% of tcp_blocked polls (especially direct provider) to have null connectionInfo.
+  const hasProxyData = meta.proxyAttemptIp || meta.websharePoolSize > 0 || meta.poolExhausted;
+  const hasErrorData = meta.errorSource !== null || meta.tcpSubcategory !== null || meta.socketBytesRead !== null;
+  const hasExtraData = extra?.sessionAgeMs !== undefined || extra?.pollRateRecentPerMin !== undefined;
+
+  if (!hasProxyData && !hasErrorData && !hasExtraData) return null;
+
+  return {
     proxyAttemptIp: meta.proxyAttemptIp,
     fallbackReason: meta.fallbackReason || undefined,
     websharePoolSize: meta.websharePoolSize > 0 ? meta.websharePoolSize : undefined,
     errorSource: meta.errorSource ?? undefined,
-  } : null;
+    tcpSubcategory: meta.tcpSubcategory ?? undefined,
+    poolExhausted: meta.poolExhausted || undefined,
+    socketBytesRead: meta.socketBytesRead ?? undefined,
+    // Always derive blockClassification when ANY classification data is available
+    blockClassification: (meta.poolExhausted || meta.socketBytesRead !== null)
+      ? deriveBlockClassification(meta) : undefined,
+    sessionAgeMs: extra?.sessionAgeMs,
+    pollRateRecentPerMin: extra?.pollRateRecentPerMin,
+  };
 }
 
 function logPoll(
@@ -1252,6 +1564,54 @@ function deriveRescheduleResult(result: RescheduleResult): string {
   return result.reason ?? 'unknown';
 }
 
+// ── Date cooldown: skip reschedule for dates that consistently fail (no CAS, no times) ──
+const DATE_COOLDOWN_THRESHOLD = 5;   // consecutive failures before cooldown kicks in
+const DATE_COOLDOWN_MINUTES = 10;    // cooldown duration in minutes
+
+function updateDateCooldowns(
+  existing: Record<string, DateCooldownEntry>,
+  result: RescheduleResult,
+  currentDates: string[],
+): Record<string, DateCooldownEntry> {
+  // Success → clear all cooldowns (landscape changed)
+  if (result.success) return {};
+
+  const updated = { ...existing };
+
+  // New date appeared → reset all cooldowns (landscape changed)
+  if (currentDates.some(d => !(d in existing))) return {};
+
+  for (const attempt of result.attempts ?? []) {
+    const { date, failReason } = attempt;
+    if (failReason === 'no_times' || failReason === 'no_cas_days' || failReason === 'no_cas_times') {
+      const prev = updated[date] ?? { failCount: 0 };
+      const newCount = prev.failCount + 1;
+      updated[date] = newCount >= DATE_COOLDOWN_THRESHOLD
+        ? { failCount: newCount, cooldownUntil: new Date(Date.now() + DATE_COOLDOWN_MINUTES * 60_000).toISOString() }
+        : { failCount: newCount };
+    }
+    // fetch_error / post_failed = transient, don't count
+  }
+
+  // Prune dates no longer available
+  for (const date of Object.keys(updated)) {
+    if (!currentDates.includes(date)) delete updated[date];
+  }
+
+  return updated;
+}
+
+function getActiveCooldowns(cooldowns: Record<string, DateCooldownEntry>): Set<string> {
+  const now = Date.now();
+  const result = new Set<string>();
+  for (const [date, entry] of Object.entries(cooldowns)) {
+    if (entry.cooldownUntil && new Date(entry.cooldownUntil).getTime() > now) {
+      result.add(date);
+    }
+  }
+  return result;
+}
+
 /** Compute appeared/disappeared dates between two consecutive polls (pure, no I/O). */
 function computeDateChanges(
   currentDates: DaySlot[],
@@ -1264,4 +1624,68 @@ function computeDateChanges(
   const appeared = [...currentSet].filter(d => !prev.has(d));
   const disappeared = [...prev].filter(d => !currentSet.has(d));
   return { appeared, disappeared };
+}
+
+/** Persist date sightings to date_sightings table (fire-and-forget).
+ *  Only stores dates strictly before currentConsularDate (actual improvements). */
+function persistDateSightings(
+  pending: Promise<unknown>[],
+  botId: number,
+  dateChanges: { appeared: string[], disappeared: string[] } | null,
+  currentConsularDate: string | null,
+  targetDateBefore: string | null,
+): void {
+  if (!dateChanges) return;
+  // Filter: improvements (before appointment) + dates up to 3 months after appointment
+  const cutoff = targetDateBefore ?? currentConsularDate;
+  const filter = (dates: string[]) => {
+    if (!cutoff) return dates;
+    const cutoffMs = new Date(cutoff).getTime();
+    const maxMs = cutoffMs + 90 * 864e5; // 3 months after appointment
+    return dates.filter(d => new Date(d).getTime() <= maxMs);
+  };
+  const appeared = filter(dateChanges.appeared);
+  const disappeared = filter(dateChanges.disappeared);
+  if (appeared.length === 0 && disappeared.length === 0) return;
+
+  // Compute daysFromNow relative to Bogota time
+  const nowBog = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+  const todayMs = new Date(nowBog.getFullYear(), nowBog.getMonth(), nowBog.getDate()).getTime();
+  function daysFr(ds: string): number {
+    const [y, m, d] = ds.split('-').map(Number) as [number, number, number];
+    return Math.round((new Date(y, m - 1, d).getTime() - todayMs) / 864e5);
+  }
+
+  const now = new Date();
+
+  if (appeared.length > 0) {
+    pending.push(
+      db.insert(dateSightings).values(
+        appeared.map(date => ({
+          botId,
+          date,
+          appearedAt: now,
+          daysFromNow: daysFr(date),
+        })),
+      ).catch(e => logger.error('dateSighting insert failed', { error: String(e) })),
+    );
+  }
+
+  if (disappeared.length > 0) {
+    // Update the most recent open sighting for each disappeared date
+    for (const date of disappeared) {
+      pending.push(
+        db.execute(sql`
+          UPDATE date_sightings
+          SET disappeared_at = ${now},
+              duration_ms = EXTRACT(EPOCH FROM (${now}::timestamp - appeared_at)) * 1000
+          WHERE id = (
+            SELECT id FROM date_sightings
+            WHERE bot_id = ${botId} AND date = ${date} AND disappeared_at IS NULL
+            ORDER BY appeared_at DESC LIMIT 1
+          )
+        `).catch(e => logger.error('dateSighting update failed', { error: String(e) })),
+      );
+    }
+  }
 }
