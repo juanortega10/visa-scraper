@@ -852,8 +852,18 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
     SELECT outcome, COUNT(*)::text as count FROM bookable_events
     WHERE bot_id = ${botId} AND detected_at >= ${since} GROUP BY outcome ORDER BY count DESC
   `);
-  const failureBreakdown: Record<string, number> = {};
+  let failureBreakdown: Record<string, number> = {};
   for (const r of outcomeRows.rows) failureBreakdown[r.outcome] = parseInt(r.count);
+
+  // Fallback to poll_logs.reschedule_result if bookable_events is empty (older bots)
+  if (Object.keys(failureBreakdown).length === 0) {
+    const pollOutcomes = await db.execute<{ outcome: string; count: string }>(sql`
+      SELECT reschedule_result as outcome, COUNT(*)::text as count
+      FROM poll_logs WHERE bot_id = ${botId} AND created_at >= ${since} AND reschedule_result IS NOT NULL
+      GROUP BY 1 ORDER BY count DESC
+    `);
+    for (const r of pollOutcomes.rows) failureBreakdown[r.outcome] = parseInt(r.count);
+  }
 
   const hourly = await db.execute<{ hour: string; successes: string; total: string }>(sql`
     SELECT EXTRACT(HOUR FROM created_at AT TIME ZONE 'America/Bogota')::text as hour,
