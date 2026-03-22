@@ -1,11 +1,11 @@
-/** Default polling interval (5s). Analytics (30d, 464K polls) confirmed
- * 8+/min has 0.12% ban-trigger rate — same as 5-8/min (0.11%).
- * 5s → ~8-10/min effective. Previous 9s → 5.5/min.
- * Response: 791ms direct, 1608ms webshare. Trigger overhead: ~300ms. */
-export const DEFAULT_POLL_INTERVAL_S = 5;
+/** Default polling interval (7s).
+ * 9s (0.135% ban-trigger) → 5s (0.578% ban-trigger, 4x increase after 3h A/B).
+ * 7s = middle ground: ~7.5/min effective (+35% vs 9s) within safe 5-8/min bucket.
+ * Response: 791ms direct, 1608ms webshare. Start-to-start timing subtracts elapsed. */
+export const DEFAULT_POLL_INTERVAL_S = 7;
 
 /** Per-locale override for the normal polling interval.
- * Empty — all locales use DEFAULT_POLL_INTERVAL_S (5s). */
+ * Empty — all locales use DEFAULT_POLL_INTERVAL_S (7s). */
 const LOCALE_POLL_INTERVALS: Record<string, number> = {};
 
 export function getNormalInterval(locale?: string, override?: number): number {
