@@ -332,11 +332,15 @@ export async function discoverAccount(
   // Extract all groups (multi-schedule accounts have one group per applicant/family unit)
   const groups = extractGroups(groupsHtml);
 
+  // Find the primary group (matches scheduleId). Multi-schedule accounts (family members with
+  // separate appointments from different years) have multiple groups — we only want the active one.
+  const primaryGroup = groups.find(g => g.scheduleId === scheduleId);
+
   // Extract current appointments (primary group — first in page)
   const { currentConsularDate, currentConsularTime, currentCasDate, currentCasTime } = extractAppointments(groupsHtml);
 
-  // Pre-extract applicant IDs from groups page (needed in appointment URL)
-  const groupsApplicantIds = extractApplicantIdsFromGroups(groupsHtml);
+  // Use primary group's applicant IDs only (not all groups — old/past appointments have different applicants)
+  const groupsApplicantIds = primaryGroup?.applicantIds ?? extractApplicantIdsFromGroups(groupsHtml);
 
   // Step 3: GET appointment page → applicantIds, names, facility IDs
   // applicantIds from groups page are needed in query string — without them the server
@@ -406,14 +410,21 @@ export async function discoverAccount(
     console.warn('[discover] Could not access appointment page — using fallbacks');
   }
 
-  // Extract applicant IDs: try appointment page checkboxes first, fallback to groups page links
+  // Extract applicant IDs: try appointment page checkboxes first, fallback to primary group
   let applicantIds = apptPageOk ? extractApplicantIdsFromAppointment(apptHtml) : [];
   if (applicantIds.length === 0) {
-    applicantIds = extractApplicantIdsFromGroups(groupsHtml);
+    // Use primary group IDs (not all groups — accounts with multiple schedules have past applicants)
+    applicantIds = primaryGroup?.applicantIds ?? extractApplicantIdsFromGroups(groupsHtml);
   }
 
-  // Extract applicant names: try appointment page checkboxes first, fallback to groups page <td>
-  const applicantNames = extractApplicantNames(groupsHtml, apptHtml, apptPageOk);
+  // Extract applicant names: try appointment page first, fallback to primary group
+  let applicantNames = apptPageOk ? extractApplicantNames('', apptHtml, true) : [];
+  if (applicantNames.length === 0 && primaryGroup) {
+    applicantNames = primaryGroup.applicantNames;
+  }
+  if (applicantNames.length === 0) {
+    applicantNames = extractApplicantNames(groupsHtml, apptHtml, apptPageOk);
+  }
 
   // Extract facility IDs from appointment page with locale-based fallback
   const { consularFacilityId, ascFacilityId } = extractFacilityIds(apptHtml, apptPageOk, locale);
