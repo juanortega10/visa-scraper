@@ -8,7 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [2026-04-03]
+## [2026-04-03] — Reschedule stability fixes
+
+### Added
+- **CHANGELOG.md**: This file. Keep a Changelog format, generated from git history.
 
 ### Fixed
 - **Infinite retry loop on ghost slots**: `exhaustedDates` was a local `Set` inside `executeReschedule()` and not persisted between polls. Dates failing with `false_positive_verification` are now written to `blockedConsularDates` in `casCacheJson` with a 2h TTL, stopping the bot from retrying the same phantom slot every 30s.
