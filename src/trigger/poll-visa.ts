@@ -828,6 +828,22 @@ export const pollVisaTask = task({
           // Lazy load casCacheJson only when reschedule is needed (~50-150 KB, saves egress on every poll)
           const [cacheRow] = await db.select({ casCacheJson: bots.casCacheJson }).from(bots).where(eq(bots.id, botId));
           const cacheData = cacheRow?.casCacheJson as CasCacheData | null;
+
+          // Filter out consular dates blocked due to repeated no_cas_days failures
+          const nowMs = Date.now();
+          const rawBlocked = cacheData?.blockedConsularDates ?? {};
+          const activeBlocked = Object.fromEntries(
+            Object.entries(rawBlocked).filter(([, until]) => new Date(until).getTime() > nowMs),
+          );
+          const blockedDateSet = new Set(Object.keys(activeBlocked));
+          const daysForReschedule = blockedDateSet.size > 0
+            ? allDays.filter(d => !blockedDateSet.has(d.date))
+            : allDays;
+          if (blockedDateSet.size > 0) {
+            const skipped = allDays.filter(d => blockedDateSet.has(d.date)).map(d => d.date);
+            logger.info('CAS blocker: skipping dates with no CAS availability', { botId, skipped, activeBlocked });
+          }
+
           const rescheduleStart = Date.now();
           const result = await executeReschedule({
             client,
@@ -835,7 +851,7 @@ export const pollVisaTask = task({
             bot,
             dateExclusions,
             timeExclusions,
-            preFetchedDays: allDays,
+            preFetchedDays: daysForReschedule,
             casCacheJson: cacheData,
             dryRun,
             pending,
@@ -845,6 +861,45 @@ export const pollVisaTask = task({
           timings.reschedule = Date.now() - rescheduleStart;
           rescheduleResultObj = result;
           rescheduleResultLabel = deriveRescheduleResult(result);
+
+          // Block consular dates that had no_cas_days for 30 min (prevents retrying until CAS availability changes)
+          // Also block false-positive dates for 2h (slot was taken by another user — won't free up soon)
+          // Also block repeatedly-failing dates (3+ failures of any type) for 1h
+          if (!result.success) {
+            const noCasDates = [...new Set(
+              (result.attempts ?? []).filter(a => a.failReason === 'no_cas_days').map(a => a.date),
+            )];
+            const fpDates = result.falsePositiveDates ?? [];
+            const rfDates = result.repeatedlyFailingDates ?? [];
+            if (noCasDates.length > 0 || fpDates.length > 0 || rfDates.length > 0) {
+              const updatedBlocked = { ...activeBlocked };
+              if (noCasDates.length > 0) {
+                const blockUntil30m = new Date(nowMs + 30 * 60 * 1000).toISOString();
+                for (const d of noCasDates) updatedBlocked[d] = blockUntil30m;
+                logger.info('CAS blocker: blocked dates after no_cas_days', { botId, dates: noCasDates, until: blockUntil30m });
+              }
+              if (fpDates.length > 0) {
+                const blockUntil2h = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
+                for (const d of fpDates) updatedBlocked[d] = blockUntil2h;
+                logger.info('CAS blocker: blocked dates after false_positive_verification', { botId, dates: fpDates, until: blockUntil2h });
+              }
+              if (rfDates.length > 0) {
+                const blockUntil1h = new Date(nowMs + 60 * 60 * 1000).toISOString();
+                for (const d of rfDates) {
+                  // Don't overwrite longer blocks (fp = 2h > rf = 1h)
+                  if (!updatedBlocked[d] || new Date(updatedBlocked[d]!).getTime() < new Date(blockUntil1h).getTime()) {
+                    updatedBlocked[d] = blockUntil1h;
+                  }
+                }
+                logger.info('CAS blocker: blocked dates after repeated failures', { botId, dates: rfDates, until: blockUntil1h });
+              }
+              pending.push(
+                db.execute(sql`UPDATE bots SET cas_cache_json = jsonb_set(COALESCE(cas_cache_json,'{}'), '{blockedConsularDates}', ${JSON.stringify(updatedBlocked)}::jsonb) WHERE id = ${botId}`)
+                  .catch(e => logger.warn('CAS blocker write failed', { botId, error: String(e) })),
+              );
+            }
+          }
+
           const originalConsularDate = bot.currentConsularDate;
           if (result.success) {
             bot.currentConsularDate = result.date!;
@@ -1195,7 +1250,7 @@ export const pollVisaTask = task({
           if (loginErr instanceof InvalidCredentialsError) {
             logger.error('Inline re-login: invalid credentials', { botId });
             logAuth({ email, action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: 'invalid_credentials', botId });
-            await db.update(bots).set({ status: 'error', updatedAt: new Date() }).where(eq(bots.id, botId));
+            await db.update(bots).set({ status: 'invalid_credentials', updatedAt: new Date() }).where(eq(bots.id, botId));
             pending.push(
               notifyUserTask.trigger({
                 botId,
