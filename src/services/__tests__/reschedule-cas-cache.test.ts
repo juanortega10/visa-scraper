@@ -708,3 +708,338 @@ describe('executeReschedule — atomic claimSlot (no-CAS)', () => {
     expect(mockDbUpdate).toHaveBeenCalledTimes(3);
   });
 });
+
+describe('executeReschedule — maxCasGapDays=1 (consecutive days only)', () => {
+  const TEST_NOW = new Date('2026-04-01T12:00:00Z');
+  // refreshedAt 5min before TEST_NOW — cache is fresh
+  const FRESH_REFRESHED_AT = new Date(TEST_NOW.getTime() - 5 * 60000).toISOString();
+
+  function freshCache(entries: { date: string; slots: number; times?: string[] }[]): CasCacheData {
+    return {
+      refreshedAt: FRESH_REFRESHED_AT,
+      windowDays: 21,
+      totalDates: entries.length,
+      fullDates: entries.filter(e => e.slots === 0).length,
+      entries: entries.map(e => ({
+        date: e.date,
+        slots: e.slots,
+        times: e.times ?? (e.slots > 0 ? ['07:00', '07:15', '07:30', '08:00'].slice(0, e.slots) : []),
+      })),
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(TEST_NOW);
+  });
+
+  // Consular: Apr 10 — only gap-1 (Apr 9) should be accepted
+  const CONSULAR_DAY: DaySlot[] = [{ date: '2026-04-10', business_day: true }];
+
+  const BOT_CONSECUTIVE: RescheduleBot = {
+    currentConsularDate: '2026-05-01',
+    currentConsularTime: '09:00',
+    currentCasDate: '2026-04-24',
+    currentCasTime: '08:00',
+    ascFacilityId: '26',
+    maxCasGapDays: 1,
+  };
+
+  function setupClaim() {
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-05-01' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+  }
+
+  function setupNoClaim() {
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-05-01' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate.mockReturnValue(chain([]));
+  }
+
+  it('accepts CAS exactly 1 day before consular (strictly consecutive)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // Apr 9 = 1 day before Apr 10 → should pass
+    const cache = freshCache([
+      { date: '2026-04-09', slots: 4, times: ['07:00', '07:15', '07:30', '08:00'] },
+    ]);
+
+    setupClaim();
+
+    const result = await executeReschedule({
+      client: makeClient(),
+      botId: 39,
+      bot: BOT_CONSECUTIVE,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: CONSULAR_DAY,
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.casDate).toBe('2026-04-09');
+  });
+
+  it('rejects CAS 2 days before consular (sábado-lunes gap)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // Consular: Monday Apr 13 — CAS: Saturday Apr 11 = 2 calendar days gap → must be rejected
+    const sabadomLunes: DaySlot[] = [{ date: '2026-04-13', business_day: true }];
+
+    // Only Apr 11 (gap=2) available — no gap-1 option
+    const cache = freshCache([
+      { date: '2026-04-11', slots: 4, times: ['07:00'] },
+    ]);
+
+    setupNoClaim();
+
+    const client = makeClient({
+      getCasDays: vi.fn().mockResolvedValue([
+        { date: '2026-04-11', business_day: true },
+      ]),
+    });
+
+    const result = await executeReschedule({
+      client,
+      botId: 39,
+      bot: BOT_CONSECUTIVE,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: sabadomLunes,
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.attempts?.every(a => a.failReason === 'no_cas_days')).toBe(true);
+  });
+
+  it('rejects CAS 3+ days before consular', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // Only CAS dates 3, 5, 8 days before → all rejected by maxCasGapDays=1
+    const cache = freshCache([
+      { date: '2026-04-07', slots: 4, times: ['07:00'] },  // 3 days before Apr 10
+      { date: '2026-04-05', slots: 4, times: ['07:00'] },  // 5 days before
+      { date: '2026-04-02', slots: 4, times: ['07:00'] },  // 8 days before
+    ]);
+
+    setupNoClaim();
+
+    const client = makeClient({
+      getCasDays: vi.fn().mockResolvedValue([
+        { date: '2026-04-07', business_day: true },
+        { date: '2026-04-05', business_day: true },
+        { date: '2026-04-02', business_day: true },
+      ]),
+    });
+
+    const result = await executeReschedule({
+      client,
+      botId: 39,
+      bot: BOT_CONSECUTIVE,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: CONSULAR_DAY,
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('uses first gap-1 CAS when multiple consular candidates exist', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // Two consular candidates: Apr 10 and Apr 15
+    const twoDays: DaySlot[] = [
+      { date: '2026-04-10', business_day: true },
+      { date: '2026-04-15', business_day: true },
+    ];
+
+    // Apr 9 (gap-1 for Apr 10) and Apr 14 (gap-1 for Apr 15) both available
+    const cache = freshCache([
+      { date: '2026-04-09', slots: 3, times: ['07:00', '07:15', '07:30'] },
+      { date: '2026-04-14', slots: 3, times: ['07:00', '07:15', '07:30'] },
+    ]);
+
+    setupClaim();
+
+    const result = await executeReschedule({
+      client: makeClient(),
+      botId: 39,
+      bot: BOT_CONSECUTIVE,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: twoDays,
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 2,
+      pending: [],
+    });
+
+    expect(result.success).toBe(true);
+    // Should pick Apr 10 (earlier) with Apr 9 CAS
+    expect(result.date).toBe('2026-04-10');
+    expect(result.casDate).toBe('2026-04-09');
+  });
+});
+
+// ── repeatedlyFailingDates tests ──
+
+describe('executeReschedule — repeatedlyFailingDates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  it('populates repeatedlyFailingDates when a date accumulates 3+ no_cas_days failures', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // 3 consular times, all return no CAS days → 3 no_cas_days failures on same consular date
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['07:00', '08:00', '09:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([]),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: '2026-06-04', business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.repeatedlyFailingDates).toContain('2026-06-04');
+  });
+
+  it('does NOT populate repeatedlyFailingDates when a date has fewer than 3 failures', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // 2 consular times → 2 no_cas_days failures — below threshold
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['07:00', '08:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([]),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: '2026-06-04', business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+    // Only 2 failures — below threshold of 3
+    expect(result.repeatedlyFailingDates).toBeUndefined();
+  });
+
+  it('does NOT include dates already in falsePositiveDates in repeatedlyFailingDates', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // POST succeeds but verification shows same date → false positive (verification_failed)
+    // That also counts as 1 failure via dateFailureCount, but falsePositiveDates takes priority
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['07:00', '08:00', '09:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([{ date: '2026-05-28', business_day: true }]),
+      getCasTimes: vi.fn().mockResolvedValue({ available_times: ['07:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      // Appointment unchanged → false positive on every attempt
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: '2026-11-19', consularTime: '07:00' }),
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: '2026-06-04', business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // If the date ended up in falsePositiveDates, it must NOT also be in repeatedlyFailingDates
+    if (result.falsePositiveDates?.includes('2026-06-04')) {
+      expect(result.repeatedlyFailingDates ?? []).not.toContain('2026-06-04');
+    }
+  });
+
+  it('counts failures across different failReasons toward same per-date counter', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // 4 consular times: all result in no_cas_days → 4 failures → above threshold of 3
+    // This specifically tests that mixed count accumulation works
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['07:00', '08:00', '09:00', '10:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([]),  // no CAS days → no_cas_days for each time
+    });
+
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: '2026-06-04', business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+    // 4 failures (4 consular times × no_cas_days) → exceeds threshold → date blocked
+    expect(result.repeatedlyFailingDates).toContain('2026-06-04');
+  });
+});

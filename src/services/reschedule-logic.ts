@@ -57,6 +57,11 @@ export interface RescheduleResult {
   reason?: string;
   totalDurationMs?: number;
   attempts?: RescheduleAttempt[];
+  /** Dates where POST returned a fake success but verification showed appointment unchanged.
+   *  Caller should persist these to blockedConsularDates so they aren't retried next poll. */
+  falsePositiveDates?: string[];
+  /** Dates with 3+ failures of any type in this call — caller should block for 1h. */
+  repeatedlyFailingDates?: string[];
 }
 
 export async function executeReschedule(params: RescheduleParams): Promise<RescheduleResult> {
@@ -210,7 +215,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   }
 
   const exhaustedDates = new Set<string>();
+  const falsePositiveDates = new Set<string>(); // Persisted to blockedConsularDates by caller
   const transientFailCount = new Map<string, number>();
+  const dateFailureCount = new Map<string, number>(); // total failures per date (any type)
+  const REPEATEDLY_FAILING_THRESHOLD = 3;
   let securedResult: RescheduleResult | null = null;
   let effectiveCurrentDate = currentConsularDate;
   let prevConsularDate = bot.currentConsularDate;
@@ -367,6 +375,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       if (consularTimes.length === 0) {
         logger.warn('No consular times, re-fetching days', { botId });
         failedAttempts.push({ date: candidate.date, failReason: 'no_times', durationMs: Date.now() - attemptStart });
+        dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
         exhaustedDates.add(candidate.date);
         continue;
       }
@@ -377,8 +386,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         // This prevents concurrent workers from each claiming separate slots simultaneously.
         const claimed = await claimSlot();
         if (!claimed) {
-          if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-          return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+          const rfDatesEarly = [...dateFailureCount.entries()].filter(([d, c]) => c >= REPEATEDLY_FAILING_THRESHOLD && !falsePositiveDates.has(d)).map(([d]) => d);
+          if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
+          return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
         }
         let postAttempted = false;
         for (const consularTime of consularTimes) {
@@ -427,7 +437,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
               );
               failedAttempts.push({ date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+              dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
               exhaustedDates.add(candidate.date);
+              falsePositiveDates.add(candidate.date);
             }
           } catch (verifyErr) {
             // Verification failed (network error) — proceed assuming success (better than losing a real reschedule)
@@ -468,18 +480,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               lastUsedAt: new Date(),
             }).where(eq(sessions.botId, botId))
               .catch((e) => logger.error('session persist failed', { error: String(e) })),
-          );
-
-          pending.push(
-            notifyUserTask.trigger({
-              botId,
-              event: 'reschedule_success',
-              data: {
-                oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
-                newConsularDate: candidate.date, newConsularTime: consularTime,
-                selectionStrategy, attempt, candidateIdx, totalCandidates: candidates.length,
-              },
-            }).catch((e) => logger.error('notify trigger failed', { error: String(e) })),
           );
 
           securedResult = {
@@ -578,8 +578,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       // This prevents concurrent workers from each claiming separate slots simultaneously.
       const claimed = await claimSlot();
       if (!claimed) {
-        if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
-        return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts };
+        const rfDatesEarly = [...dateFailureCount.entries()].filter(([d, c]) => c >= REPEATEDLY_FAILING_THRESHOLD && !falsePositiveDates.has(d)).map(([d]) => d);
+        if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
+        return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
       }
 
       // Process results sequentially (best time first)
@@ -589,6 +590,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         logger.info('CAS days', { botId, consularTime, total: casDays.length, afterFilter: filteredCasDays.length, first: filteredCasDays[0]?.date });
         if (filteredCasDays.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, failReason: 'no_cas_days', durationMs: Date.now() - attemptStart });
+          dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
           continue;
         }
         const casDate = filteredCasDays[0]!.date;
@@ -612,6 +614,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         }
         if (casTimes.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, casDate, failReason: 'no_cas_times', durationMs: Date.now() - attemptStart });
+          dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
           continue;
         }
         const casTime = casTimes[0]!;
@@ -663,7 +666,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
             );
             failedAttempts.push({ date: candidate.date, consularTime, casDate, casTime, failReason: 'verification_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+            dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
             exhaustedDates.add(candidate.date);
+            falsePositiveDates.add(candidate.date);
           }
         } catch (verifyErr) {
           logger.warn('Post-reschedule verification failed (CAS), assuming success', {
@@ -713,25 +718,6 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             })
             .where(eq(sessions.botId, botId))
             .catch((e) => logger.error('session persist failed', { error: String(e) })),
-        );
-
-        pending.push(
-          notifyUserTask.trigger({
-            botId,
-            event: 'reschedule_success',
-            data: {
-              oldConsularDate: prevConsularDate,
-              oldConsularTime: prevConsularTime,
-              newConsularDate: candidate.date,
-              newConsularTime: consularTime,
-              newCasDate: casDate,
-              newCasTime: casTime,
-              selectionStrategy,
-              attempt,
-              candidateIdx,
-              totalCandidates: candidates.length,
-            },
-          }).catch((e) => logger.error('notify trigger failed', { error: String(e) })),
         );
 
         // Track secured result and continue trying for better dates
@@ -800,12 +786,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           }
           const verifyAppt = await client.getCurrentAppointment();
           if (verifyAppt && verifyAppt.consularDate !== prevConsularDate) {
-            // Slot was already claimed via claimSlot() — do NOT re-increment.
-            // Just update the date fields to reflect the actual appointment.
-            logger.warn('POST error but appointment CHANGED — slot already claimed, updating dates only', {
-              botId, expected: candidate.date, actual: verifyAppt.consularDate,
-              prevDate: prevConsularDate, error: errorMsg,
-            });
+            // Always sync DB to actual server state
             await db.update(bots).set({
               currentConsularDate: verifyAppt.consularDate,
               currentConsularTime: verifyAppt.consularTime,
@@ -813,42 +794,78 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               currentCasTime: verifyAppt.casTime,
               updatedAt: new Date(),
             }).where(eq(bots.id, botId));
-            pending.push(
-              db.insert(rescheduleLogs).values({
-                botId,
-                oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
-                oldCasDate: prevCasDate, oldCasTime: prevCasTime,
-                newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
-                newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
-                success: true, error: `[post_error_recovered] ${errorMsg}`,
-              }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
-            );
-            pending.push(
-              notifyUserTask.trigger({
-                botId, event: 'reschedule_success',
-                data: {
+
+            const isImprovement = verifyAppt.consularDate && prevConsularDate
+              ? isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1)
+              : false;
+
+            if (isImprovement) {
+              // Slot was already claimed via claimSlot() — do NOT re-increment.
+              // Just update the date fields to reflect the actual appointment.
+              logger.warn('POST error but appointment CHANGED (improvement) — slot already claimed, updating dates only', {
+                botId, expected: candidate.date, actual: verifyAppt.consularDate,
+                prevDate: prevConsularDate, error: errorMsg,
+              });
+              pending.push(
+                db.insert(rescheduleLogs).values({
+                  botId,
                   oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                  oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                   newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
                   newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
-                  recoveredFromError: true,
-                },
-              }).catch((e) => logger.error('notify trigger failed', { error: String(e) })),
-            );
-            securedResult = {
-              success: true,
-              date: verifyAppt.consularDate!,
-              consularTime: verifyAppt.consularTime ?? undefined,
-              casDate: verifyAppt.casDate ?? undefined,
-              casTime: verifyAppt.casTime ?? undefined,
-              totalDurationMs: Date.now() - totalStart,
-            };
-            effectiveCurrentDate = verifyAppt.consularDate;
-            prevConsularDate = verifyAppt.consularDate;
-            prevConsularTime = verifyAppt.consularTime;
-            prevCasDate = verifyAppt.casDate;
-            prevCasTime = verifyAppt.casTime;
-            // Don't throw/break — continue improving if possible
-            continue;
+                  success: true, error: `[post_error_recovered] ${errorMsg}`,
+                }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
+              );
+              pending.push(
+                notifyUserTask.trigger({
+                  botId, event: 'reschedule_success',
+                  data: {
+                    oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                    newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
+                    newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
+                    recoveredFromError: true,
+                  },
+                }).catch((e) => logger.error('notify trigger failed', { error: String(e) })),
+              );
+              securedResult = {
+                success: true,
+                date: verifyAppt.consularDate!,
+                consularTime: verifyAppt.consularTime ?? undefined,
+                casDate: verifyAppt.casDate ?? undefined,
+                casTime: verifyAppt.casTime ?? undefined,
+                totalDurationMs: Date.now() - totalStart,
+              };
+              effectiveCurrentDate = verifyAppt.consularDate;
+              prevConsularDate = verifyAppt.consularDate;
+              prevConsularTime = verifyAppt.consularTime;
+              prevCasDate = verifyAppt.casDate;
+              prevCasTime = verifyAppt.casTime;
+              // Don't throw/break — continue improving if possible
+              continue;
+            } else {
+              // Portal reverted to a same/later date — do NOT notify as success
+              logger.error('POST error + portal REVERTED appointment (regression) — discarding securedResult', {
+                botId, expected: candidate.date, actual: verifyAppt.consularDate,
+                prevDate: prevConsularDate, error: errorMsg,
+              });
+              pending.push(
+                db.insert(rescheduleLogs).values({
+                  botId,
+                  oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                  oldCasDate: prevCasDate, oldCasTime: prevCasTime,
+                  newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
+                  success: false, error: `[portal_reversion] ${errorMsg}`,
+                }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
+              );
+              securedResult = null;
+              effectiveCurrentDate = verifyAppt.consularDate;
+              prevConsularDate = verifyAppt.consularDate;
+              prevConsularTime = verifyAppt.consularTime;
+              prevCasDate = verifyAppt.casDate;
+              prevCasTime = verifyAppt.casTime;
+              exhaustedDates.add(candidate.date);
+              continue;
+            }
           }
           // Appointment unchanged → POST actually failed, release the claimed slot
           await releaseSlot('post_error_no_change');
@@ -862,6 +879,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       if (error instanceof SessionExpiredError) {
         logger.error('Session expired during reschedule', { botId, step: currentStep, error: errorMsg });
         failedAttempts.push({ date: candidate.date, failReason: 'session_expired', failStep: currentStep, error: errorMsg, durationMs: Date.now() - attemptStart });
+        dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
         if (attempt < maxAttempts && await reloginIfPossible()) continue;
         // If we already secured a date, don't throw — return what we have
         if (securedResult) break;
@@ -880,6 +898,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         cause: errorCause,
         durationMs: Date.now() - attemptStart,
       });
+      dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
       // Transient failure — allow 1 retry (don't add to exhaustedDates)
       transientFailCount.set(candidate.date, (transientFailCount.get(candidate.date) ?? 0) + 1);
       // Re-login before next attempt on network errors
@@ -889,9 +908,78 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
   const totalDurationMs = Date.now() - totalStart;
 
-  // If we secured at least one improvement, return it with deferred verification
+  // Compute dates that failed 3+ times (any reason) — caller should block for 1h
+  const repeatedlyFailingDates = new Set<string>();
+  for (const [date, count] of dateFailureCount) {
+    if (count >= REPEATEDLY_FAILING_THRESHOLD && !falsePositiveDates.has(date)) {
+      repeatedlyFailingDates.add(date);
+    }
+  }
+
+  // If we secured at least one improvement, do a final verification before notifying.
+  // The improvement loop can cause the portal to revert the secured booking (observed behavior:
+  // POSTing a second reschedule attempt reverts the previous one server-side). We confirm the
+  // actual server state before trusting securedResult and before sending the notification.
   if (securedResult) {
     securedResult.totalDurationMs = totalDurationMs;
+
+    try {
+      const finalAppt = await client.getCurrentAppointment();
+      if (finalAppt && finalAppt.consularDate !== securedResult.date) {
+        logger.error('Secured booking reverted by portal — final verification mismatch', {
+          botId,
+          secured: securedResult.date,
+          actualServer: finalAppt.consularDate,
+          totalDurationMs,
+        });
+        await releaseSlot('portal_reversion_detected');
+        // Log the reversion as a failure entry so the dashboard shows it
+        pending.push(
+          db.insert(rescheduleLogs).values({
+            botId,
+            oldConsularDate: securedResult.date,
+            oldConsularTime: securedResult.consularTime ?? null,
+            oldCasDate: securedResult.casDate ?? null,
+            oldCasTime: securedResult.casTime ?? null,
+            newConsularDate: finalAppt.consularDate,
+            newConsularTime: finalAppt.consularTime,
+            success: false, error: 'portal_reversion',
+          }).catch((e) => logger.error('logReschedule (portal_reversion) failed', { error: String(e) })),
+        );
+        // Sync DB to actual server state
+        await db.update(bots).set({
+          currentConsularDate: finalAppt.consularDate,
+          currentConsularTime: finalAppt.consularTime,
+          currentCasDate: finalAppt.casDate ?? null,
+          currentCasTime: finalAppt.casTime ?? null,
+          updatedAt: new Date(),
+        }).where(eq(bots.id, botId));
+        return { success: false, reason: 'portal_reversion', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
+      }
+    } catch (verifyErr) {
+      // Network error on final check — proceed assuming securedResult is valid (don't lose a real success)
+      logger.warn('Final post-reschedule verification failed (network), proceeding with securedResult', {
+        botId, secured: securedResult.date,
+        error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+      });
+    }
+
+    // Confirmed — send the single reschedule_success notification now
+    pending.push(
+      notifyUserTask.trigger({
+        botId,
+        event: 'reschedule_success',
+        data: {
+          oldConsularDate: bot.currentConsularDate,
+          oldConsularTime: bot.currentConsularTime,
+          oldCasDate: bot.currentCasDate,
+          newConsularDate: securedResult.date,
+          newConsularTime: securedResult.consularTime,
+          newCasDate: securedResult.casDate,
+          newCasTime: securedResult.casTime,
+        },
+      }).catch((e) => logger.error('notify trigger failed', { error: String(e) })),
+    );
 
     logger.info('reschedule COMPLETE', {
       botId,
@@ -901,9 +989,26 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       attempts: failedAttempts.length,
     });
 
-    return securedResult;
+    return { ...securedResult, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
   }
 
   logger.warn('reschedule FAILED — all attempts exhausted', { botId, exhausted: [...exhaustedDates], transient: Object.fromEntries(transientFailCount), totalDurationMs, attempts: failedAttempts });
-  return { success: false, reason: 'all_candidates_failed', totalDurationMs, attempts: failedAttempts };
+
+  // Log failed reschedule attempt to reschedule_logs for traceability
+  const failSummary = failedAttempts.map(a => `${a.date}:${a.failReason}${a.consularTime ? `@${a.consularTime}` : ''}`).join(', ');
+  pending.push(
+    db.insert(rescheduleLogs).values({
+      botId,
+      oldConsularDate: bot.currentConsularDate,
+      oldConsularTime: bot.currentConsularTime,
+      oldCasDate: bot.currentCasDate,
+      oldCasTime: bot.currentCasTime,
+      newConsularDate: failedAttempts[0]?.date ?? null,
+      newConsularTime: null,
+      success: false,
+      error: failSummary,
+    }).catch((e) => logger.error('logReschedule (failed) insert error', { error: String(e) })),
+  );
+
+  return { success: false, reason: 'all_candidates_failed', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
 }
