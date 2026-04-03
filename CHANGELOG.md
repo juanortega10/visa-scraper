@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2026-04-03] — Reschedule stability fixes
 
+### Fixed
+- **Portal propagation delay overwrites booked date**: After a successful reschedule, the next poll could read the portal before it propagated the new appointment and overwrite `currentConsularDate` back to the old (worse) date. The appointment sync block in `poll-visa.ts` now checks for a successful `reschedule_log` in the last 2 minutes before accepting a worse consular date from the portal. If one exists, consular fields are skipped; CAS fields are still synced independently.
+
 ### Added
 - **CHANGELOG.md**: This file. Keep a Changelog format, generated from git history.
 

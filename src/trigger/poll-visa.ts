@@ -506,22 +506,58 @@ export const pollVisaTask = task({
             currentAppt.casTime !== bot.currentCasTime;
 
           if (changed) {
+            // Guard against portal propagation delay: if portal shows a worse consular date than DB
+            // and a reschedule succeeded in the last 2 min, the portal likely hasn't propagated yet.
+            // Only skip consular fields — CAS is independent and always safe to sync.
+            const PROPAGATION_GUARD_MS = 2 * 60 * 1000;
+            const portalConsularWorse = bot.currentConsularDate && currentAppt.consularDate &&
+              new Date(currentAppt.consularDate) > new Date(bot.currentConsularDate);
+
+            let skipConsularSync = false;
+            if (portalConsularWorse) {
+              const [recentSuccess] = await db.select({ id: rescheduleLogs.id })
+                .from(rescheduleLogs)
+                .where(and(
+                  eq(rescheduleLogs.botId, botId),
+                  eq(rescheduleLogs.success, true),
+                  gte(rescheduleLogs.createdAt, new Date(Date.now() - PROPAGATION_GUARD_MS)),
+                ))
+                .orderBy(desc(rescheduleLogs.createdAt))
+                .limit(1);
+
+              if (recentSuccess) {
+                skipConsularSync = true;
+                logger.warn('Skipping consular sync — portal propagation delay suspected', {
+                  botId,
+                  dbConsular: `${bot.currentConsularDate} ${bot.currentConsularTime}`,
+                  webConsular: `${currentAppt.consularDate} ${currentAppt.consularTime}`,
+                  recentRescheduleId: recentSuccess.id,
+                });
+              }
+            }
+
             logger.info('Appointment changed externally — syncing DB', {
               botId,
               dbConsular: `${bot.currentConsularDate} ${bot.currentConsularTime}`,
               dbCas: bot.currentCasDate ? `${bot.currentCasDate} ${bot.currentCasTime}` : 'N/A',
               webConsular: `${currentAppt.consularDate} ${currentAppt.consularTime}`,
               webCas: currentAppt.casDate ? `${currentAppt.casDate} ${currentAppt.casTime}` : 'N/A',
+              skipConsularSync,
             });
+
             // Update in-memory for comparison, persist in background
-            bot.currentConsularDate = currentAppt.consularDate;
-            bot.currentConsularTime = currentAppt.consularTime;
+            if (!skipConsularSync) {
+              bot.currentConsularDate = currentAppt.consularDate;
+              bot.currentConsularTime = currentAppt.consularTime;
+            }
             bot.currentCasDate = currentAppt.casDate;
             bot.currentCasTime = currentAppt.casTime;
             pending.push(
               db.update(bots).set({
-                currentConsularDate: currentAppt.consularDate,
-                currentConsularTime: currentAppt.consularTime,
+                ...(skipConsularSync ? {} : {
+                  currentConsularDate: currentAppt.consularDate,
+                  currentConsularTime: currentAppt.consularTime,
+                }),
                 currentCasDate: currentAppt.casDate,
                 currentCasTime: currentAppt.casTime,
                 updatedAt: new Date(),
