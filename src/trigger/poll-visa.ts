@@ -577,7 +577,7 @@ export const pollVisaTask = task({
           // Instead of 3 burst fetches + self-trigger with 10s delay,
           // loop continuously inside a single run with 3s between fetches.
           // Eliminates ~10s dead time between runs.
-          const loopBudgetMs = 45_000; // 45s budget (maxDuration=120s, leave margin for inline reschedule)
+          const loopBudgetMs = 45_000; // 45s budget (maxDuration=300s, leave margin for inline reschedule)
           let loopFetchCount = 1;
           let consecutiveErrors = 0;
           let consecutive5xx = 0;
