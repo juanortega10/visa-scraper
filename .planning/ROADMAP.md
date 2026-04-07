@@ -34,13 +34,16 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 
 5. **Deployed and stable**: Both RPi (`npm run deploy:rpi`) and Trigger.dev cloud (`mcp__trigger__deploy environment=prod`) run for at least 1 hour with no errors related to the tracker, and bot 6's `casCacheJson.dateFailureTracking` is observably populating and pruning in production.
 
-**Plans**: TBD
+**Plans:** 3 plans
+- [ ] 01-01-PLAN.md — Pure layer: schema extension + date-failure-tracker.ts module + unit tests (SCHEMA-01, TRACKER-01..06, TEST-01)
+- [ ] 01-02-PLAN.md — Integration + cleanup: wire reschedule-logic + poll-visa + prefetch-cas, delete all dateCooldowns dead code (INTEG-01..05, POLL-01..05, PREFETCH-01..02, CLEANUP-01..08)
+- [ ] 01-03-PLAN.md — Integration tests + RPi/cloud deploy (TEST-02..09, VERIFY-01..02)
 
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Cross-Poll Failure Tracker Migration | 0/0 | Not started | - |
+| 1. Cross-Poll Failure Tracker Migration | 0/3 | Not started | - |
 
 ## Coverage Validation
 
