@@ -25,25 +25,37 @@ API multi-tenant para monitorear y reagendar citas de visa B1/B2 en embajadas de
 
 ### Active
 
-<!-- Current milestone: TTL cross-poll para fechas repetidamente fallando. -->
+<!--
+Current milestone: MIGRATE `dateCooldowns` from task payload → `casCacheJson.dateFailureTracking`.
+Research discovered (PITFALLS.md §Critical Discovery) that poll-visa.ts:1689-1735 already
+implements `dateCooldowns` with ~80% of the desired semantics. The problem is it lives in the
+Trigger.dev task payload and gets lost on every chain restart, and its reset rule ("any new
+date → reset all") fires too often. The real work is to persist + relax reset + add dimension
+breakdown + add CAS escape hatch, not to build a new tracker.
+-->
 
-- [ ] **TRACK-01**: Un nuevo objeto `dateFailureTracking` persiste contadores de fallos por fecha, con breakdown por dimensión (consular/cas × noTimes/noDays), sobreviviendo múltiples invocaciones de `executeReschedule`.
-- [ ] **TRACK-02**: Los fail reasons `no_times`, `no_cas_days` y `no_cas_times` incrementan el contador correspondiente en `dateFailureTracking`, persistiendo en DB al final de cada poll.
-- [ ] **TRACK-03**: Cuando una fecha alcanza 5 fallos totales dentro de una ventana de 1 hora, `blockedUntil` se setea a `now + 2h` y la fecha se filtra de los candidatos en el próximo poll.
-- [ ] **TRACK-04**: Cuando una fecha desaparece de `days.json` en un poll, su entry en `dateFailureTracking` se elimina (reset).
-- [ ] **TRACK-05**: El bloqueo cross-poll de 2h coexiste con los mecanismos existentes: `falsePositiveDates` 2h, `no_cas_days` TTL 30m, y `repeatedlyFailingDates` per-call 1h. Bloqueos más largos preservados.
-- [ ] **TRACK-06**: Tests unitarios que validan (a) el contador cross-call, (b) la lógica de ventana temporal, (c) el reset al desaparecer del portal, (d) la coexistencia con blockings existentes.
+- [ ] **TRACK-01**: Extend `CasCacheData` in `src/db/schema.ts` with optional `dateFailureTracking?: Record<string, DateFailureEntry>` where `DateFailureEntry = { windowStartedAt, totalCount, byDimension: { consularNoTimes?, consularNoDays?, casNoTimes?, casNoDays? }, lastFailureAt, blockedUntil? }`.
+- [ ] **TRACK-02**: Create pure module `src/services/date-failure-tracker.ts` with `recordFailure(entry, dimension, now)`, `isBlocked(entry, now)`, `pruneDisappeared(tracking, currentDates)`, `clearOnSuccess(tracking, bookedDate)`, `clearOnCasAvailable(tracking, dateWithCas)` — all with injected `now` for testability.
+- [ ] **TRACK-03**: Wire increments in `reschedule-logic.ts` at the 3 tracked sites (`no_times` line 378, `no_cas_days` line 593, `no_cas_times` line 617). Return `dateFailureTrackingDelta` + `newlyBlockedDates` in `RescheduleResult`. Must NOT increment on `verification_failed`, `session_expired`, `post_error`, `fetch_error`.
+- [ ] **TRACK-04**: Orchestrate read/prune/filter/persist in `poll-visa.ts:864-937`. On poll start: prune entries whose window expired (>1h) or whose date is absent from `allDays`. Filter candidate dates by active `blockedUntil`. Persist delta via `jsonb_set('{dateFailureTracking}', ...)` — **OUTSIDE** the `!result.success` guard (increments happen before a later success). Merge `newlyBlockedDates` into `updatedBlocked` with 2h TTL.
+- [ ] **TRACK-05**: On successful reschedule, clear the tracker entry for the booked date (mirror `updateDateCooldowns:1699`). Prevents blocking a date just booked when portal propagation lag resurfaces it.
+- [ ] **TRACK-06**: In `prefetch-cas.ts`, when refreshing CAS data, if a currently-blocked date (`blockedUntil > now`) has new CAS availability, clear its tracker entry via `jsonb_set`. Escape hatch protecting Core Value ("nunca perder fecha bookeable").
+- [ ] **TRACK-07**: DELETE dead code in `poll-visa.ts`: `DateCooldownEntry` interface (line 30), `PollPayload.dateCooldowns` (line 37), `updatedCooldowns` variable (line 88), cooldowns threading at line 1529, `updateDateCooldowns` function (line 1693), `getActiveCooldowns` function (line 1726), `DATE_COOLDOWN_THRESHOLD`/`DATE_COOLDOWN_MINUTES` constants (lines 1690-1691). Post-implementation grep for these symbols must return zero matches.
+- [ ] **TRACK-08**: Tests covering (a) pure-module unit tests of `date-failure-tracker.ts` with injected `now`; (b) cross-call accumulation in `reschedule-cas-cache.test.ts`; (c) success clears tracker (Pitfall 8); (d) CAS escape hatch; (e) flapping date does not escape via aggressive reset; (f) window expiry under `process.env.TZ='America/Bogota'`; (g) counter coverage — every tracked `failedAttempts.push` site increments the tracker.
 
 ### Out of Scope
 
 <!-- Explicit boundaries for this milestone. -->
 
-- **Cambiar `blockedConsularDates` a estructura rica** — decidido mantener `dateFailureTracking` como objeto paralelo dentro de `casCacheJson`, no extender el schema existente (menor riesgo de regresión).
-- **Tabla DB nueva** — `dateFailureTracking` vive en `bots.casCacheJson` (jsonb) como los demás trackers. No justifica una migración de schema.
-- **Contar `post_failed`/`post_error` / `verification_failed`** — estos ya tienen handling dedicado (falsePositiveDates, slot-specific retry); sumarlos distorsionaría el contador.
+- **Coexistir con `dateCooldowns`** — el feature existente se MIGRA y ELIMINA, no se deja en paralelo. El código muerto se borra en TRACK-07. Dejar ambos colapsaría de 6 a 7 capas en lugar de 6→5.
+- **Cambiar `blockedConsularDates` a estructura rica** — decidido mantener `dateFailureTracking` como objeto paralelo dentro de `casCacheJson`, no extender el schema de blockedConsularDates.
+- **Tabla DB nueva** — `dateFailureTracking` vive en `bots.casCacheJson` (jsonb) como los demás trackers. No justifica una migración.
+- **Contar `post_failed`/`post_error` / `verification_failed` / `session_expired` / `fetch_error`** — ya tienen handling dedicado (falsePositiveDates, slot-specific retry, re-login); sumarlos distorsionaría el signal "fecha no-bookeable sostenida".
 - **Políticas distintas por dimensión** (ej. "noDays cuenta más que noTimes") — el breakdown se persiste para habilitar esto en el futuro, pero en v1 todos suman por igual al `totalCount`.
+- **Eliminar `repeatedlyFailingDates` per-call (quick-task 260403-gpj)** — NO se toca. Sigue siendo útil como protección per-call complementaria. Solo se elimina `dateCooldowns` (el que está en task payload).
 - **Dashboard / métricas del tracker** — fuera de scope. Logs estructurados son suficientes para debugging v1.
 - **Backfill histórico de fallos** — el tracker arranca vacío en deploy; fallos anteriores no se recuperan.
+- **Fase 2 refinements** (exponential backoff 15m→30m→1h→2h, decay counter, per-bot tunable threshold) — diferir hasta ver datos de producción del v1.
 
 ## Context
 
@@ -80,11 +92,14 @@ El contador `dateFailureCount` existente en `executeReschedule` (implementado en
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Nuevo objeto `dateFailureTracking` en lugar de extender `blockedConsularDates` | Menor riesgo de regresión — `blockedConsularDates` lo lee y escribe código en múltiples sitios. Un objeto nuevo permite shape distinta sin tocar el existente. | — Pending |
-| Breakdown por dimensión (consular × cas, times × days) | Permite políticas distintas en el futuro sin refactor. Costo marginal ahora (más campos), ganancia alta después. | — Pending |
-| Umbral 5 fails en ventana de 1h → bloqueo 2h | Más tolerante que el per-call (3 sin window). Ventana evita fails viejos irrelevantes. Bloqueo 2x más largo que el per-call porque el signal es más fuerte (confirmado cross-poll). | — Pending |
-| Reset cuando fecha desaparece del portal | Mantiene el tracker pequeño (sin bloat de fechas abandonadas). Reinicia la cuenta si la fecha reaparece — tratándola como nueva oportunidad. | — Pending |
-| No contar `post_failed` / `verification_failed` | Ya tienen handling dedicado (falsePositiveDates, slot-specific retry). Sumarlos contaminaría la señal "fecha no-bookeable sostenida". | — Pending |
+| Migrar + eliminar `dateCooldowns` existente (no coexistir) | El código actual ya implementa ~80% del feature en task payload — lo perdemos cada chain restart. Mejor persistirlo en DB y borrar el paralelo. Colapsa 6→5 capas. | — Pending |
+| Nuevo objeto `dateFailureTracking` en `casCacheJson` (no extender `blockedConsularDates`) | Menor riesgo de regresión. Permite shape rica sin tocar el schema existente que se lee/escribe en múltiples sitios. | — Pending |
+| Breakdown por dimensión (consular × cas, times × days) | Permite políticas distintas en el futuro sin refactor. Costo marginal ahora (~10 líneas), ganancia alta después. v1 todos suman al mismo totalCount. | — Pending |
+| Umbral 5 fails en ventana deslizante de 1h → bloqueo 2h | Ventana temporal evita fails viejos irrelevantes. 2h es 12x más largo que el `dateCooldowns` actual (10min) — suficiente para superar el intervalo de poll y los restarts. | — Pending |
+| Reset rule: ventana expira O fecha desaparece O success | Elimina la regla agresiva `dateCooldowns:1704` ("cualquier fecha nueva → reset all") que en la práctica dispara casi cada poll. | — Pending |
+| Escape hatch via `prefetch-cas` | Cuando prefetch refresca CAS y encuentra disponibilidad para una fecha bloqueada, limpia su entry. Protege el Core Value ("nunca perder fecha bookeable"). | — Pending |
+| Success clears tracker entry | Mirror de `updateDateCooldowns:1699`. Previene bloquear una fecha recién bookeada cuando el portal propaga con lag y la fecha reaparece. | — Pending |
+| No contar `post_failed` / `verification_failed` / `session_expired` / `fetch_error` | Ya tienen handling dedicado. Sumarlos contaminaría el signal "fecha no-bookeable sostenida". | — Pending |
 
 ---
 *Last updated: 2026-04-06 after initialization*
