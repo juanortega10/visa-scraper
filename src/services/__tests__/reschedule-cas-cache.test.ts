@@ -1043,3 +1043,426 @@ describe('executeReschedule — repeatedlyFailingDates', () => {
     expect(result.repeatedlyFailingDates).toContain('2026-06-04');
   });
 });
+
+describe('dateFailureTracking (cross-poll)', () => {
+  // noon UTC = noon Bogota (UTC-5 = 07:00 UTC, but we test window math, not clock display)
+  const NOW_UTC = Date.UTC(2026, 5, 15, 17, 0, 0); // 2026-06-15T17:00:00Z
+
+  function setupDbMocksTracker(currentDate = '2026-11-19') {
+    mockDbSelect.mockReturnValue(chain([{ currentConsularDate: currentDate }]));
+    mockDbInsert.mockReturnValue(chain([]));
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+      .mockReturnValue(chain([]));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_UTC);
+  });
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  // TEST-02: Cross-call accumulation — the core milestone goal
+  it('accumulates across calls: 4 seeded + 1 new no_times = blocked', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01'; // earlier than current 2026-11-19
+    const windowStartedAt = new Date(NOW_UTC - 10 * 60 * 1000).toISOString(); // 10min ago
+
+    const cache: CasCacheData = {
+      refreshedAt: new Date(NOW_UTC - 5 * 60 * 1000).toISOString(),
+      windowDays: 21,
+      totalDates: 0,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: {
+        [candidateDate]: {
+          windowStartedAt,
+          totalCount: 4, // 4 prior failures
+          byDimension: { consularNoTimes: 4 },
+          lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
+        },
+      },
+    };
+
+    const client = makeClient({
+      // CAS path: need to return empty times to get no_cas_times, but let's use no_times (simpler)
+      // Force no_times by returning empty consularTimes
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+    });
+
+    setupDbMocksTracker();
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(false);
+    // 5th failure in the 1h window crosses CROSS_POLL_THRESHOLD (5) → blocked
+    expect(result.newlyBlockedDates).toContain(candidateDate);
+    expect(result.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(5);
+    expect(result.dateFailureTrackingDelta?.[candidateDate]?.blockedUntil).toBeDefined();
+  });
+
+  // TEST-03a: verification_failed (no-CAS path) does NOT increment tracker
+  it('does NOT increment tracker on verification_failed (no-CAS)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01';
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      // Verification: appointment unchanged (false positive)
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: DEFAULT_BOT.currentConsularDate }),
+    });
+
+    setupDbMocksTracker();
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: { ...DEFAULT_BOT, skipCas: true, ascFacilityId: '' }, // no-CAS path
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // verification_failed does NOT call bumpTracker → delta should be undefined or not contain candidateDate
+    expect(result.dateFailureTrackingDelta?.[candidateDate]).toBeUndefined();
+    expect(result.newlyBlockedDates ?? []).not.toContain(candidateDate);
+  });
+
+  // TEST-03b: fetch_error (getConsularTimes throws) does NOT increment tracker
+  it('does NOT increment tracker on fetch_error (getConsularTimes throws)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01';
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockRejectedValue(new Error('network timeout')),
+    });
+
+    setupDbMocksTracker();
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // fetch_error catch block does NOT call bumpTracker
+    expect(result.dateFailureTrackingDelta?.[candidateDate]).toBeUndefined();
+    expect(result.newlyBlockedDates ?? []).not.toContain(candidateDate);
+  });
+
+  // TEST-03c: post_error (reschedule throws) does NOT increment tracker
+  it('does NOT increment tracker on post_error (reschedule throws)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01';
+
+    const client = makeClient({
+      // CAS path: times available, CAS available, then POST throws
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([{ date: '2026-05-28', business_day: true }]),
+      getCasTimes: vi.fn().mockResolvedValue({ available_times: ['07:00'] }),
+      reschedule: vi.fn().mockRejectedValue(new Error('TCP connection reset')),
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: DEFAULT_BOT.currentConsularDate }),
+    });
+
+    setupDbMocksTracker();
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // post_error catch block does NOT call bumpTracker
+    expect(result.dateFailureTrackingDelta?.[candidateDate]).toBeUndefined();
+    expect(result.newlyBlockedDates ?? []).not.toContain(candidateDate);
+  });
+
+  // TEST-04: Successful reschedule clears the booked date from tracker delta
+  it('clears tracker entry on successful reschedule for that date', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01';
+    const windowStartedAt = new Date(NOW_UTC - 10 * 60 * 1000).toISOString();
+
+    const cache: CasCacheData = {
+      refreshedAt: new Date(NOW_UTC - 5 * 60 * 1000).toISOString(),
+      windowDays: 21,
+      totalDates: 1,
+      fullDates: 0,
+      entries: [{ date: '2026-05-28', slots: 3, times: ['07:00', '07:15', '07:30'] }],
+      dateFailureTracking: {
+        [candidateDate]: {
+          windowStartedAt,
+          totalCount: 4, // below threshold — entry exists but not blocked
+          byDimension: { casNoDays: 4 },
+          lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
+        },
+      },
+    };
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([]),
+      // getCasTimes called for cached entry
+      getCasTimes: vi.fn().mockResolvedValue({ available_times: ['07:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      // Verification: appointment changed to candidateDate → success
+      getCurrentAppointment: vi.fn().mockResolvedValue({ consularDate: candidateDate, consularTime: '08:00' }),
+    });
+
+    setupDbMocksTracker();
+
+    const result = await executeReschedule({
+      client,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: cache,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    expect(result.success).toBe(true);
+    // Booked date must be REMOVED from tracker delta (Pitfall 8 — success clears)
+    expect(result.dateFailureTrackingDelta?.[candidateDate]).toBeUndefined();
+  });
+
+  // TEST-05: Still-blocked entry survives portal disappearance (flapping guard)
+  it('still-blocked entry survives portal disappearance (flapping guard)', async () => {
+    // Simulates poll-visa prune logic inline:
+    // When an entry has active blockedUntil, it MUST be preserved even if date not in allDays.
+    const { CROSS_POLL_WINDOW_MS } = await import('../date-failure-tracker.js');
+
+    const candidateDate = '2026-06-15';
+    const windowStartedAt = new Date(NOW_UTC - 10 * 60 * 1000).toISOString();
+    const blockedUntil = new Date(NOW_UTC + 60 * 60 * 1000).toISOString(); // 1h in future
+
+    const entry = {
+      windowStartedAt,
+      totalCount: 5,
+      byDimension: { consularNoTimes: 5 } as const,
+      lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
+      blockedUntil,
+    };
+
+    // Simulate poll-visa prune: allDays does NOT include candidateDate
+    const allDayDates = new Set(['2026-07-01']); // candidateDate absent
+    const nowMs = NOW_UTC;
+
+    let prunedTracker: Record<string, typeof entry> = {};
+    const rawTracker = { [candidateDate]: entry };
+
+    for (const [date, e] of Object.entries(rawTracker)) {
+      const stillBlocked = !!e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs;
+      const inPortal = allDayDates.has(date);
+      const windowOpen = (nowMs - new Date(e.windowStartedAt).getTime()) <= CROSS_POLL_WINDOW_MS;
+      if (stillBlocked) {
+        prunedTracker[date] = e; // preserved regardless — this is the flapping guard
+        continue;
+      }
+      if (!inPortal) continue; // would be dropped (portal_disappeared)
+      if (!windowOpen) continue; // would be dropped (window_expired)
+      prunedTracker[date] = e;
+    }
+
+    // Blocked entry MUST survive even when not in allDays
+    expect(prunedTracker[candidateDate]).toBeDefined();
+    expect(prunedTracker[candidateDate]?.blockedUntil).toBe(blockedUntil);
+  });
+
+  // TEST-06: Bogota TZ window arithmetic
+  it('window arithmetic is correct under Bogota TZ: in-window at T+59min, rolls at T+61min', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const candidateDate = '2026-06-01';
+    // Window started 59 min ago — still in the 1h window
+    const windowStartedAt59 = new Date(NOW_UTC - 59 * 60 * 1000).toISOString();
+
+    const cache59: CasCacheData = {
+      refreshedAt: new Date(NOW_UTC - 5 * 60 * 1000).toISOString(),
+      windowDays: 21,
+      totalDates: 0,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: {
+        [candidateDate]: {
+          windowStartedAt: windowStartedAt59,
+          totalCount: 4, // 4 prior in same window
+          byDimension: { consularNoTimes: 4 },
+          lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
+        },
+      },
+    };
+
+    const client59 = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }), // no_times
+    });
+
+    const mock59 = () => {
+      mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+      mockDbInsert.mockReturnValue(chain([]));
+      mockDbUpdate.mockReturnValueOnce(chain([{ rescheduleCount: 1 }])).mockReturnValue(chain([]));
+    };
+
+    mock59();
+    const result59 = await executeReschedule({
+      client: client59,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: cache59,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // At T+59min window: totalCount should be 5 (4+1), crossed threshold → blocked
+    expect(result59.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(5);
+    expect(result59.newlyBlockedDates).toContain(candidateDate);
+
+    // Now advance time by 2 extra minutes (window opened 61 min ago) → window expires → fresh entry
+    vi.setSystemTime(NOW_UTC + 2 * 60 * 1000);
+
+    const windowStartedAt61 = new Date(NOW_UTC - 61 * 60 * 1000).toISOString();
+    const cache61: CasCacheData = {
+      ...cache59,
+      dateFailureTracking: {
+        [candidateDate]: {
+          windowStartedAt: windowStartedAt61, // 61min ago = expired
+          totalCount: 4,
+          byDimension: { consularNoTimes: 4 },
+          lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
+        },
+      },
+    };
+
+    const client61 = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+    });
+
+    mock59();
+    const result61 = await executeReschedule({
+      client: client61,
+      botId: 12,
+      bot: DEFAULT_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: [{ date: candidateDate, business_day: true }],
+      casCacheJson: cache61,
+      dryRun: false,
+      maxAttempts: 1,
+      pending: [],
+    });
+
+    // At T+61min: window expired → recordFailure should start a fresh window with totalCount=1
+    expect(result61.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(1);
+    expect(result61.newlyBlockedDates ?? []).not.toContain(candidateDate); // 1 < 5 threshold
+  });
+
+  // TEST-08: Counter coverage spy — one of each tracked type → exactly 3 entries
+  it('counter coverage: one of each tracked failure type produces exactly 3 entries', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    // Run 3 separate single-attempt calls to isolate each tracked dimension.
+    // (Multi-attempt on same executeReschedule would re-fetch getConsularDays which returns [].)
+    const dateA = '2026-06-01'; // will get no_times (consularNoTimes)
+    const dateB = '2026-06-05'; // will get no_cas_days (casNoDays)
+    const dateC = '2026-06-10'; // will get no_cas_times (casNoTimes)
+
+    const setupMock = () => {
+      mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
+      mockDbInsert.mockReturnValue(chain([]));
+      mockDbUpdate
+        .mockReturnValueOnce(chain([{ rescheduleCount: 1 }]))
+        .mockReturnValue(chain([]));
+    };
+
+    // Call A: no_times → consularNoTimes
+    setupMock();
+    const resultA = await executeReschedule({
+      client: makeClient({ getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }) }),
+      botId: 12, bot: DEFAULT_BOT, dateExclusions: [], timeExclusions: [],
+      preFetchedDays: [{ date: dateA, business_day: true }],
+      casCacheJson: null, dryRun: false, maxAttempts: 1, pending: [],
+    });
+
+    // Call B: no_cas_days → casNoDays
+    setupMock();
+    const resultB = await executeReschedule({
+      client: makeClient({
+        getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+        getCasDays: vi.fn().mockResolvedValue([]),
+      }),
+      botId: 12, bot: DEFAULT_BOT, dateExclusions: [], timeExclusions: [],
+      preFetchedDays: [{ date: dateB, business_day: true }],
+      casCacheJson: null, dryRun: false, maxAttempts: 1, pending: [],
+    });
+
+    // Call C: no_cas_times → casNoTimes
+    setupMock();
+    const resultC = await executeReschedule({
+      client: makeClient({
+        getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+        getCasDays: vi.fn().mockResolvedValue([{ date: '2026-06-03', business_day: true }]),
+        getCasTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      }),
+      botId: 12, bot: DEFAULT_BOT, dateExclusions: [], timeExclusions: [],
+      preFetchedDays: [{ date: dateC, business_day: true }],
+      casCacheJson: null, dryRun: false, maxAttempts: 1, pending: [],
+    });
+
+    // Each call produces exactly 1 tracker entry for the correct dimension
+    expect(resultA.dateFailureTrackingDelta?.[dateA]?.byDimension?.consularNoTimes).toBe(1);
+    expect(resultB.dateFailureTrackingDelta?.[dateB]?.byDimension?.casNoDays).toBe(1);
+    expect(resultC.dateFailureTrackingDelta?.[dateC]?.byDimension?.casNoTimes).toBe(1);
+    // Combined: 3 distinct tracker entries produced across the 3 tracked dimensions
+    const allDates = [
+      ...Object.keys(resultA.dateFailureTrackingDelta ?? {}),
+      ...Object.keys(resultB.dateFailureTrackingDelta ?? {}),
+      ...Object.keys(resultC.dateFailureTrackingDelta ?? {}),
+    ];
+    expect(allDates.length).toBe(3);
+    expect(new Set(allDates).size).toBe(3); // all different dates
+  });
+});

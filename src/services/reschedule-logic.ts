@@ -7,7 +7,8 @@ import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js'
 import { filterDates, filterTimes, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
 import { notifyUserTask } from '../trigger/notify-user.js';
 import type { DateRange, TimeRange } from '../utils/date-helpers.js';
-import type { CasCacheData, CasCacheEntry } from '../db/schema.js';
+import type { CasCacheData, CasCacheEntry, DateFailureEntry, FailureDimension } from '../db/schema.js';
+import { recordFailure } from './date-failure-tracker.js';
 
 /** Minimal bot fields needed by executeReschedule (avoids requiring full Bot with casCacheJson). */
 export interface RescheduleBot {
@@ -62,6 +63,10 @@ export interface RescheduleResult {
   falsePositiveDates?: string[];
   /** Dates with 3+ failures of any type in this call — caller should block for 1h. */
   repeatedlyFailingDates?: string[];
+  /** Per-date failure tracker delta — caller should persist to casCacheJson.dateFailureTracking. */
+  dateFailureTrackingDelta?: Record<string, DateFailureEntry>;
+  /** Dates whose tracker entry just crossed the block threshold — caller should add to blockedConsularDates with 2h TTL. */
+  newlyBlockedDates?: string[];
 }
 
 export async function executeReschedule(params: RescheduleParams): Promise<RescheduleResult> {
@@ -219,6 +224,32 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   const transientFailCount = new Map<string, number>();
   const dateFailureCount = new Map<string, number>(); // total failures per date (any type)
   const REPEATEDLY_FAILING_THRESHOLD = 3;
+
+  // Cross-poll tracker delta: seeded from casCacheJson (read-only snapshot), mutated in-place.
+  const trackerDelta = new Map<string, DateFailureEntry>(
+    Object.entries(casCacheJson?.dateFailureTracking ?? {}),
+  );
+  const newlyBlockedFromIncrements = new Set<string>();
+
+  const bumpTracker = (date: string, dimension: FailureDimension): void => {
+    // currentConsularDate safety: never increment for the date the bot is already on.
+    // See .planning/phases/01-cross-poll-failure-tracker-migration/01-CONTEXT.md §currentConsularDate safety.
+    if (date === bot.currentConsularDate) return;
+    const prior = trackerDelta.get(date);
+    const next = recordFailure(prior, dimension, Date.now());
+    trackerDelta.set(date, next);
+    logger.info('tracker.increment', {
+      botId, date, dimension,
+      totalCount: next.totalCount, windowStartedAt: next.windowStartedAt,
+    });
+    if (next.blockedUntil && !prior?.blockedUntil) {
+      newlyBlockedFromIncrements.add(date);
+      logger.info('tracker.blocked', {
+        botId, date, until: next.blockedUntil,
+        breakdown: next.byDimension, totalCount: next.totalCount,
+      });
+    }
+  };
   let securedResult: RescheduleResult | null = null;
   let effectiveCurrentDate = currentConsularDate;
   let prevConsularDate = bot.currentConsularDate;
@@ -376,6 +407,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         logger.warn('No consular times, re-fetching days', { botId });
         failedAttempts.push({ date: candidate.date, failReason: 'no_times', durationMs: Date.now() - attemptStart });
         dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
+        bumpTracker(candidate.date, 'consularNoTimes');
         exhaustedDates.add(candidate.date);
         continue;
       }
@@ -387,8 +419,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         const claimed = await claimSlot();
         if (!claimed) {
           const rfDatesEarly = [...dateFailureCount.entries()].filter(([d, c]) => c >= REPEATEDLY_FAILING_THRESHOLD && !falsePositiveDates.has(d)).map(([d]) => d);
-          if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
-          return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
+          const nbdEarly = [...trackerDelta.entries()].filter(([d, e]) => e.blockedUntil && !falsePositiveDates.has(d)).map(([d]) => d);
+          const tdEarly = trackerDelta.size > 0 ? Object.fromEntries(trackerDelta) : undefined;
+          if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined, dateFailureTrackingDelta: tdEarly, newlyBlockedDates: nbdEarly.length > 0 ? nbdEarly : undefined };
+          return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined, dateFailureTrackingDelta: tdEarly, newlyBlockedDates: nbdEarly.length > 0 ? nbdEarly : undefined };
         }
         let postAttempted = false;
         for (const consularTime of consularTimes) {
@@ -492,6 +526,12 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           prevConsularDate = candidate.date;
           prevConsularTime = consularTime;
 
+          // Clear tracker entry for booked date.
+          if (trackerDelta.has(candidate.date)) {
+            trackerDelta.delete(candidate.date);
+            logger.info('tracker.cleared', { botId, date: candidate.date, reason: 'success' });
+          }
+
           logger.info('reschedule SUCCESS (no CAS), will try to improve', {
             botId, secured: `${candidate.date} ${consularTime}`, totalDurationMs: Date.now() - totalStart,
           });
@@ -579,8 +619,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       const claimed = await claimSlot();
       if (!claimed) {
         const rfDatesEarly = [...dateFailureCount.entries()].filter(([d, c]) => c >= REPEATEDLY_FAILING_THRESHOLD && !falsePositiveDates.has(d)).map(([d]) => d);
-        if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
-        return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined };
+        const nbdEarly = [...trackerDelta.entries()].filter(([d, e]) => e.blockedUntil && !falsePositiveDates.has(d)).map(([d]) => d);
+        const tdEarly = trackerDelta.size > 0 ? Object.fromEntries(trackerDelta) : undefined;
+        if (securedResult) return { ...securedResult, totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined, dateFailureTrackingDelta: tdEarly, newlyBlockedDates: nbdEarly.length > 0 ? nbdEarly : undefined };
+        return { success: false, reason: 'max_reschedules_reached', totalDurationMs: Date.now() - totalStart, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: rfDatesEarly.length > 0 ? rfDatesEarly : undefined, dateFailureTrackingDelta: tdEarly, newlyBlockedDates: nbdEarly.length > 0 ? nbdEarly : undefined };
       }
 
       // Process results sequentially (best time first)
@@ -591,6 +633,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         if (filteredCasDays.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, failReason: 'no_cas_days', durationMs: Date.now() - attemptStart });
           dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
+          bumpTracker(candidate.date, 'casNoDays');
           continue;
         }
         const casDate = filteredCasDays[0]!.date;
@@ -615,6 +658,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         if (casTimes.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, casDate, failReason: 'no_cas_times', durationMs: Date.now() - attemptStart });
           dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
+          bumpTracker(candidate.date, 'casNoTimes');
           continue;
         }
         const casTime = casTimes[0]!;
@@ -734,6 +778,12 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         prevConsularTime = consularTime;
         prevCasDate = casDate;
         prevCasTime = casTime;
+
+        // Clear tracker entry for booked date — successful booking means this date is no longer failing.
+        if (trackerDelta.has(candidate.date)) {
+          trackerDelta.delete(candidate.date);
+          logger.info('tracker.cleared', { botId, date: candidate.date, reason: 'success' });
+        }
 
         logger.info('reschedule SUCCESS, will try to improve', {
           botId,
@@ -916,6 +966,14 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     }
   }
 
+  // Compute dates newly blocked by the cross-poll tracker in this call
+  const newlyBlockedDates: string[] = [];
+  for (const [date, entry] of trackerDelta) {
+    if (entry.blockedUntil && !falsePositiveDates.has(date)) {
+      newlyBlockedDates.push(date);
+    }
+  }
+
   // If we secured at least one improvement, do a final verification before notifying.
   // The improvement loop can cause the portal to revert the secured booking (observed behavior:
   // POSTing a second reschedule attempt reverts the previous one server-side). We confirm the
@@ -954,7 +1012,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           currentCasTime: finalAppt.casTime ?? null,
           updatedAt: new Date(),
         }).where(eq(bots.id, botId));
-        return { success: false, reason: 'portal_reversion', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
+        return { success: false, reason: 'portal_reversion', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined, dateFailureTrackingDelta: trackerDelta.size > 0 ? Object.fromEntries(trackerDelta) : undefined, newlyBlockedDates: newlyBlockedDates.length > 0 ? newlyBlockedDates : undefined };
       }
     } catch (verifyErr) {
       // Network error on final check — proceed assuming securedResult is valid (don't lose a real success)
@@ -989,7 +1047,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       attempts: failedAttempts.length,
     });
 
-    return { ...securedResult, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
+    return { ...securedResult, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined, dateFailureTrackingDelta: trackerDelta.size > 0 ? Object.fromEntries(trackerDelta) : undefined, newlyBlockedDates: newlyBlockedDates.length > 0 ? newlyBlockedDates : undefined };
   }
 
   logger.warn('reschedule FAILED — all attempts exhausted', { botId, exhausted: [...exhaustedDates], transient: Object.fromEntries(transientFailCount), totalDurationMs, attempts: failedAttempts });
@@ -1010,5 +1068,5 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     }).catch((e) => logger.error('logReschedule (failed) insert error', { error: String(e) })),
   );
 
-  return { success: false, reason: 'all_candidates_failed', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined };
+  return { success: false, reason: 'all_candidates_failed', totalDurationMs, attempts: failedAttempts, falsePositiveDates: falsePositiveDates.size > 0 ? [...falsePositiveDates] : undefined, repeatedlyFailingDates: repeatedlyFailingDates.size > 0 ? [...repeatedlyFailingDates] : undefined, dateFailureTrackingDelta: trackerDelta.size > 0 ? Object.fromEntries(trackerDelta) : undefined, newlyBlockedDates: newlyBlockedDates.length > 0 ? newlyBlockedDates : undefined };
 }

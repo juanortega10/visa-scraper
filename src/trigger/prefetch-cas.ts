@@ -2,13 +2,23 @@ import { schedules, logger } from '@trigger.dev/sdk/v3';
 import { notifyUserTask } from './notify-user.js';
 import { db } from '../db/client.js';
 import { bots, sessions, casPrefetchLogs } from '../db/schema.js';
-import type { CasCacheData, CasCacheEntry, CasSlotChange, PrefetchReliability } from '../db/schema.js';
-import { eq } from 'drizzle-orm';
+import type { CasCacheData, CasCacheEntry, CasSlotChange, PrefetchReliability, DateFailureEntry } from '../db/schema.js';
+import { eq, sql } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError } from '../services/visa-client.js';
 import { performLogin, InvalidCredentialsError } from '../services/login.js';
+import { clearOnCasAvailable, isBlocked } from '../services/date-failure-tracker.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Returns active (non-expired) blockedConsularDates from existing cache. */
+function getActiveBlockedConsularDates(existing: CasCacheData | null): Record<string, string> {
+  if (!existing?.blockedConsularDates) return {};
+  const now = Date.now();
+  return Object.fromEntries(
+    Object.entries(existing.blockedConsularDates).filter(([, until]) => new Date(until).getTime() > now),
+  );
+}
 
 /**
  * CAS Prefetch — scheduled cron (every 30 min, PRODUCTION only).
@@ -341,12 +351,14 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
       return { updated: false, reason: 'empty_result_kept_old_cache' };
     }
     logger.info('No CAS dates in window, saving empty cache', { botId });
+    const activeBlocked = getActiveBlockedConsularDates(existingCache);
     const cacheData: CasCacheData = {
       refreshedAt: new Date().toISOString(),
       windowDays: WINDOW_DAYS,
       totalDates: 0,
       fullDates: 0,
       entries: [],
+      ...(Object.keys(activeBlocked).length > 0 ? { blockedConsularDates: activeBlocked } : {}),
     };
     await Promise.all([
       db.update(bots).set({ casCacheJson: cacheData, updatedAt: new Date() }).where(eq(bots.id, botId)),
@@ -406,12 +418,43 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
   const failedDates = new Set(failedTimeFetches);
   const changes = computeCasChanges(existingCache?.entries ?? [], entries, failedDates, reliability.reliable);
 
+  // CAS escape hatch: clear tracker entries for dates where fresh CAS is now available
+  // This unblocks dates that the cross-poll tracker blocked but CAS has since freed up.
+  const nowMs = Date.now();
+  let trackerAfterEscape: Record<string, DateFailureEntry> = existingCache?.dateFailureTracking ?? {};
+  const escapedDates: string[] = [];
+  for (const cas of entries) {
+    if (cas.slots <= 0) continue;
+    const entry = trackerAfterEscape[cas.date];
+    if (entry && isBlocked(entry, nowMs)) {
+      trackerAfterEscape = clearOnCasAvailable(trackerAfterEscape, cas.date);
+      escapedDates.push(cas.date);
+    }
+  }
+  if (escapedDates.length > 0) {
+    logger.info('CAS escape hatch: clearing tracker blocks', { botId, dates: escapedDates });
+    for (const date of escapedDates) {
+      logger.info('tracker.cleared', { botId, date, reason: 'cas_available' });
+    }
+    // Persist updated tracker via jsonb_set (separate from the main cache write below)
+    await db.execute(sql`
+      UPDATE bots SET cas_cache_json = jsonb_set(
+        COALESCE(cas_cache_json, '{}'::jsonb),
+        '{dateFailureTracking}',
+        ${JSON.stringify(trackerAfterEscape)}::jsonb
+      ) WHERE id = ${botId}
+    `).catch(e => logger.warn('tracker escape write failed', { botId, error: String(e) }));
+  }
+
+  const activeBlocked2 = getActiveBlockedConsularDates(existingCache);
   const cacheData: CasCacheData = {
     refreshedAt: new Date().toISOString(),
     windowDays: WINDOW_DAYS,
     totalDates: entries.length,
     fullDates,
     entries,
+    ...(Object.keys(activeBlocked2).length > 0 ? { blockedConsularDates: activeBlocked2 } : {}),
+    ...(Object.keys(trackerAfterEscape).length > 0 ? { dateFailureTracking: trackerAfterEscape } : {}),
   };
 
   await Promise.all([

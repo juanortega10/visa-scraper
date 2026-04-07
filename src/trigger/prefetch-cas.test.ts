@@ -7,10 +7,11 @@ vi.mock('@trigger.dev/sdk/v3', () => ({
 }));
 
 // ── Hoisted vi.fn() stubs ────────────────────────────────
-const { mockDbSelect, mockDbInsert, mockDbUpdate } = vi.hoisted(() => ({
+const { mockDbSelect, mockDbInsert, mockDbUpdate, mockDbExecute } = vi.hoisted(() => ({
   mockDbSelect: vi.fn(),
   mockDbInsert: vi.fn(),
   mockDbUpdate: vi.fn(),
+  mockDbExecute: vi.fn(),
 }));
 
 vi.mock('../db/client.js', () => ({
@@ -18,6 +19,7 @@ vi.mock('../db/client.js', () => ({
     select: (...args: any[]) => mockDbSelect(...args),
     insert: (...args: any[]) => mockDbInsert(...args),
     update: (...args: any[]) => mockDbUpdate(...args),
+    execute: (...args: any[]) => mockDbExecute(...args),
   },
 }));
 
@@ -29,6 +31,7 @@ vi.mock('../db/schema.js', () => ({
 
 vi.mock('drizzle-orm', () => ({
   eq: (...args: any[]) => ({ _op: 'eq', args }),
+  sql: (strings: TemplateStringsArray, ...values: any[]) => ({ _sql: strings, _values: values }),
 }));
 
 vi.mock('../services/encryption.js', () => ({
@@ -144,5 +147,97 @@ describe('prefetchForBot — always uses direct proxy', () => {
 
     expect(result).toEqual({ updated: false, reason: 'no_consular_times' });
     expect(mockDbInsert).toHaveBeenCalledOnce();
+  });
+});
+
+// ── CAS escape hatch tests ────────────────────────────────
+
+import { logger } from '@trigger.dev/sdk/v3';
+
+describe('dateFailureTracking CAS escape hatch', () => {
+  const NOW_UTC = Date.UTC(2026, 5, 15, 17, 0, 0); // noon Bogota (UTC-5)
+
+  function makeBotWithBlockedTracker(slots: number) {
+    const blockedUntil = new Date(NOW_UTC + 2 * 60 * 60 * 1000).toISOString();
+    return {
+      ...makeBot(),
+      casCacheJson: {
+        refreshedAt: new Date(NOW_UTC - 20 * 60 * 1000).toISOString(), // 20 min ago — stale
+        windowDays: 30,
+        totalDates: 0,
+        fullDates: 0,
+        entries: [],
+        dateFailureTracking: {
+          '2026-06-23': {
+            windowStartedAt: new Date(NOW_UTC - 30 * 60 * 1000).toISOString(),
+            totalCount: 5,
+            byDimension: { consularNoTimes: 5 },
+            lastFailureAt: new Date(NOW_UTC - 5 * 60 * 1000).toISOString(),
+            blockedUntil,
+          },
+        },
+      },
+    };
+  }
+
+  function makeFullClient(casSlots: number) {
+    const times = casSlots > 0 ? Array.from({ length: casSlots }, (_, i) => `0${7 + i}:00`) : [];
+    return vi.mocked(VisaClient).mockImplementation(function () {
+      return {
+        getConsularDays: vi.fn().mockResolvedValue([{ date: '2026-07-10' }]),
+        getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+        getCasDays: vi.fn().mockResolvedValue([{ date: '2026-06-23' }]),
+        getCasTimes: vi.fn().mockResolvedValue({ available_times: times }),
+      } as any;
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_UTC);
+    mockDbSelect.mockReturnValue(chain([freshSession(5)]));
+    mockDbInsert.mockReturnValue(chain([{ id: 1 }]));
+    mockDbUpdate.mockReturnValue(chain({}));
+    mockDbExecute.mockReturnValue(chain({}));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('clears tracker entry when fresh CAS shows availability for blocked date', async () => {
+    makeFullClient(2); // slots > 0 → should trigger escape hatch
+
+    const runPromise = prefetchForBot(makeBotWithBlockedTracker(2) as any);
+    await vi.runAllTimersAsync();
+    const result = await runPromise;
+
+    expect(result).toEqual({ updated: true });
+    // db.execute called with jsonb_set for tracker escape
+    expect(mockDbExecute).toHaveBeenCalledOnce();
+    // logger.info called with reason: 'cas_available'
+    expect(vi.mocked(logger.info)).toHaveBeenCalledWith(
+      'tracker.cleared',
+      expect.objectContaining({ date: '2026-06-23', reason: 'cas_available' }),
+    );
+  });
+
+  it('does NOT clear tracker entry when fresh CAS has zero slots', async () => {
+    makeFullClient(0); // slots = 0 → escape hatch should NOT fire
+
+    const runPromise = prefetchForBot(makeBotWithBlockedTracker(0) as any);
+    await vi.runAllTimersAsync();
+    const result = await runPromise;
+
+    expect(result).toEqual({ updated: true });
+    // db.execute should NOT be called (no escape needed)
+    expect(mockDbExecute).not.toHaveBeenCalled();
+    // tracker.cleared with cas_available should NOT appear in logs
+    const calls = vi.mocked(logger.info).mock.calls;
+    const escapeCalls = calls.filter(
+      ([msg, data]) => msg === 'tracker.cleared' && (data as any)?.reason === 'cas_available',
+    );
+    expect(escapeCalls).toHaveLength(0);
   });
 });

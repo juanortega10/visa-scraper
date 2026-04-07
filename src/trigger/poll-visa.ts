@@ -13,7 +13,8 @@ import { notifyUserTask } from './notify-user.js';
 import { performLogin, InvalidCredentialsError, AccountLockedError, type LoginCredentials } from '../services/login.js';
 import { classifyProxyError, classifyTcpSubcategory, extractBytesRead, deriveBlockClassification, type ProxyProvider, type ProxyFetchMeta, type BlockClassification } from '../services/proxy-fetch.js';
 import { logAuth } from '../utils/auth-logger.js';
-import type { CasCacheData } from '../db/schema.js';
+import type { CasCacheData, DateFailureEntry } from '../db/schema.js';
+import { isBlocked, pruneDisappeared, CROSS_POLL_WINDOW_MS } from '../services/date-failure-tracker.js';
 
 /**
  * Cancel the bot's previous delayed poll-visa run (if any) to prevent pile-up.
@@ -27,14 +28,11 @@ function cancelPreviousRun(currentRunId: string, activeRunId: string | null): vo
   runs.cancel(activeRunId).catch(() => {});
 }
 
-interface DateCooldownEntry { failCount: number; cooldownUntil?: string }
-
 interface PollPayload {
   botId: number;
   chainId?: 'dev' | 'cloud'; // default 'dev'
   dryRun?: boolean;
   lastDatesCount?: number; // raw dates from previous run (for soft ban detection)
-  dateCooldowns?: Record<string, DateCooldownEntry>; // cross-run cooldown for dates that consistently fail reschedule
 }
 
 /** Extract error message including undici's nested cause (e.g. "fetch failed: ECONNRESET"). */
@@ -85,7 +83,6 @@ export const pollVisaTask = task({
     let sustainedAccountBanCount = 0; // subset of sustainedTcpBlockCount: consecutive account_ban polls
     let runRawDatesCount = -1; // latest raw (unfiltered) dates count in this run
     let reloginHappened = false;
-    let updatedCooldowns: Record<string, DateCooldownEntry> = payload.dateCooldowns ?? {};
     let publicIp: string | null = null;
     let connInfoExtra: { sessionAgeMs?: number; pollRateRecentPerMin?: number } = {};
     const timings: Record<string, number> = {};
@@ -821,20 +818,6 @@ export const pollVisaTask = task({
             // Update in-memory bot to reflect the new date from the other chain's reschedule
             bot.currentConsularDate = recentReschedule.newConsularDate;
           } else {
-          // Date cooldown: skip reschedule if all candidate dates are cooling down
-          const cooledDownDates = getActiveCooldowns(updatedCooldowns);
-          const candidateDates = allDays
-            .filter(d => bot.currentConsularDate && isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1))
-            .map(d => d.date);
-          const uncooledCandidates = candidateDates.filter(d => !cooledDownDates.has(d));
-
-          if (uncooledCandidates.length === 0 && candidateDates.length > 0 && cooledDownDates.size > 0) {
-            rescheduleResultLabel = 'cooldown_skip';
-            logger.info('All candidate dates in cooldown — skipping reschedule', {
-              botId, cooledDown: [...cooledDownDates], candidateCount: candidateDates.length,
-              nextExpiry: Object.values(updatedCooldowns).map(e => e.cooldownUntil).filter(Boolean).sort()[0],
-            });
-          } else {
           logger.info('EARLIER DATE FOUND — rescheduling inline', {
             botId,
             earliest,
@@ -871,7 +854,69 @@ export const pollVisaTask = task({
           const activeBlocked = Object.fromEntries(
             Object.entries(rawBlocked).filter(([, until]) => new Date(until).getTime() > nowMs),
           );
+
+          // ── Cross-poll tracker prune/cap/filter (TRACK-04 flapping-aware) ──
+          const allDayDates = new Set(allDays.map(d => d.date));
+          const rawTracker: Record<string, DateFailureEntry> = cacheData?.dateFailureTracking ?? {};
+
+          let prunedTracker: Record<string, DateFailureEntry> = {};
+          for (const [date, entry] of Object.entries(rawTracker)) {
+            const stillBlocked = !!entry.blockedUntil && new Date(entry.blockedUntil).getTime() > nowMs;
+            const inPortal = allDayDates.has(date);
+            const windowOpen = (nowMs - new Date(entry.windowStartedAt).getTime()) <= CROSS_POLL_WINDOW_MS;
+            if (stillBlocked) {
+              prunedTracker[date] = entry; // preserve regardless of portal/window
+              continue;
+            }
+            if (!inPortal) {
+              logger.info('tracker.cleared', { botId, date, reason: 'portal_disappeared' });
+              continue;
+            }
+            if (!windowOpen) {
+              logger.info('tracker.cleared', { botId, date, reason: 'window_expired' });
+              continue;
+            }
+            prunedTracker[date] = entry;
+          }
+
+          // Defensive currentConsularDate safety net — never count failures on the bot's own date
+          if (bot.currentConsularDate && prunedTracker[bot.currentConsularDate]) {
+            logger.warn('tracker.cleared (currentConsularDate safety net)', {
+              botId, date: bot.currentConsularDate,
+              prevEntry: prunedTracker[bot.currentConsularDate],
+            });
+            logger.info('tracker.cleared', {
+              botId, date: bot.currentConsularDate, reason: 'current_consular_safety',
+            });
+            delete prunedTracker[bot.currentConsularDate];
+          }
+
+          // Cap at 100 entries — evict lowest totalCount first, never evict blocked entries
+          const TRACKER_CAP = 100;
+          const trackerEntries = Object.entries(prunedTracker);
+          if (trackerEntries.length > TRACKER_CAP) {
+            const blockedEntries = trackerEntries.filter(([, e]) => isBlocked(e, nowMs));
+            const evictable = trackerEntries
+              .filter(([, e]) => !isBlocked(e, nowMs))
+              .sort(([, a], [, b]) =>
+                a.totalCount - b.totalCount
+                || new Date(a.lastFailureAt).getTime() - new Date(b.lastFailureAt).getTime(),
+              );
+            const keepCount = Math.max(0, TRACKER_CAP - blockedEntries.length);
+            const kept = evictable.slice(-keepCount);
+            const evicted = evictable.slice(0, evictable.length - kept.length);
+            for (const [date] of evicted) {
+              logger.info('tracker.cleared', { botId, date, reason: 'pruned' });
+            }
+            prunedTracker = Object.fromEntries([...blockedEntries, ...kept]);
+          }
+
+          // Extend blockedDateSet with tracker-blocked dates
           const blockedDateSet = new Set(Object.keys(activeBlocked));
+          for (const [date, entry] of Object.entries(prunedTracker)) {
+            if (isBlocked(entry, nowMs)) blockedDateSet.add(date);
+          }
+
           const daysForReschedule = blockedDateSet.size > 0
             ? allDays.filter(d => !blockedDateSet.has(d.date))
             : allDays;
@@ -888,7 +933,7 @@ export const pollVisaTask = task({
             dateExclusions,
             timeExclusions,
             preFetchedDays: daysForReschedule,
-            casCacheJson: cacheData,
+            casCacheJson: cacheData ? { ...cacheData, dateFailureTracking: prunedTracker } : null,
             dryRun,
             pending,
             loginCredentials: loginCreds,
@@ -898,43 +943,60 @@ export const pollVisaTask = task({
           rescheduleResultObj = result;
           rescheduleResultLabel = deriveRescheduleResult(result);
 
-          // Block consular dates that had no_cas_days for 30 min (prevents retrying until CAS availability changes)
-          // Also block false-positive dates for 2h (slot was taken by another user — won't free up soon)
-          // Also block repeatedly-failing dates (3+ failures of any type) for 1h
+          // ── Persist blockedConsularDates + dateFailureTracking ──
+          // Build updatedBlocked (always, not only on failure, so tracker blocks are persisted too)
+          const updatedBlocked = { ...activeBlocked };
+
           if (!result.success) {
             const noCasDates = [...new Set(
               (result.attempts ?? []).filter(a => a.failReason === 'no_cas_days').map(a => a.date),
             )];
             const fpDates = result.falsePositiveDates ?? [];
             const rfDates = result.repeatedlyFailingDates ?? [];
-            if (noCasDates.length > 0 || fpDates.length > 0 || rfDates.length > 0) {
-              const updatedBlocked = { ...activeBlocked };
-              if (noCasDates.length > 0) {
-                const blockUntil30m = new Date(nowMs + 30 * 60 * 1000).toISOString();
-                for (const d of noCasDates) updatedBlocked[d] = blockUntil30m;
-                logger.info('CAS blocker: blocked dates after no_cas_days', { botId, dates: noCasDates, until: blockUntil30m });
-              }
-              if (fpDates.length > 0) {
-                const blockUntil2h = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
-                for (const d of fpDates) updatedBlocked[d] = blockUntil2h;
-                logger.info('CAS blocker: blocked dates after false_positive_verification', { botId, dates: fpDates, until: blockUntil2h });
-              }
-              if (rfDates.length > 0) {
-                const blockUntil1h = new Date(nowMs + 60 * 60 * 1000).toISOString();
-                for (const d of rfDates) {
-                  // Don't overwrite longer blocks (fp = 2h > rf = 1h)
-                  if (!updatedBlocked[d] || new Date(updatedBlocked[d]!).getTime() < new Date(blockUntil1h).getTime()) {
-                    updatedBlocked[d] = blockUntil1h;
-                  }
+            if (noCasDates.length > 0) {
+              const blockUntil30m = new Date(nowMs + 30 * 60 * 1000).toISOString();
+              for (const d of noCasDates) updatedBlocked[d] = blockUntil30m;
+              logger.info('CAS blocker: blocked dates after no_cas_days', { botId, dates: noCasDates, until: blockUntil30m });
+            }
+            if (fpDates.length > 0) {
+              const blockUntil2h = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
+              for (const d of fpDates) updatedBlocked[d] = blockUntil2h;
+              logger.info('CAS blocker: blocked dates after false_positive_verification', { botId, dates: fpDates, until: blockUntil2h });
+            }
+            if (rfDates.length > 0) {
+              const blockUntil1h = new Date(nowMs + 60 * 60 * 1000).toISOString();
+              for (const d of rfDates) {
+                if (!updatedBlocked[d] || new Date(updatedBlocked[d]!).getTime() < new Date(blockUntil1h).getTime()) {
+                  updatedBlocked[d] = blockUntil1h;
                 }
-                logger.info('CAS blocker: blocked dates after repeated failures', { botId, dates: rfDates, until: blockUntil1h });
               }
-              pending.push(
-                db.execute(sql`UPDATE bots SET cas_cache_json = jsonb_set(COALESCE(cas_cache_json,'{}'), '{blockedConsularDates}', ${JSON.stringify(updatedBlocked)}::jsonb) WHERE id = ${botId}`)
-                  .catch(e => logger.warn('CAS blocker write failed', { botId, error: String(e) })),
-              );
+              logger.info('CAS blocker: blocked dates after repeated failures', { botId, dates: rfDates, until: blockUntil1h });
             }
           }
+
+          // Merge newlyBlockedDates from cross-poll tracker (OUTSIDE !result.success guard)
+          const newlyBlocked = result.newlyBlockedDates ?? [];
+          if (newlyBlocked.length > 0) {
+            const blockUntil2hIso = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
+            for (const d of newlyBlocked) {
+              const existing = updatedBlocked[d];
+              if (!existing || new Date(existing).getTime() < new Date(blockUntil2hIso).getTime()) {
+                updatedBlocked[d] = blockUntil2hIso;
+              }
+            }
+            logger.info('tracker: blocked dates from cross-poll tracker', { botId, dates: newlyBlocked, until: new Date(nowMs + 2 * 60 * 60 * 1000).toISOString() });
+          }
+
+          // Persist blockedConsularDates + dateFailureTracking in a single nested jsonb_set
+          const finalTracker = result.dateFailureTrackingDelta ?? prunedTracker;
+          pending.push(
+            db.execute(sql`
+              UPDATE bots SET cas_cache_json = jsonb_set(
+                jsonb_set(COALESCE(cas_cache_json, '{}'::jsonb), '{blockedConsularDates}', ${JSON.stringify(updatedBlocked)}::jsonb),
+                '{dateFailureTracking}', ${JSON.stringify(finalTracker)}::jsonb
+              ) WHERE id = ${botId}
+            `).catch(e => logger.warn('cas_cache write failed', { botId, error: String(e) })),
+          );
 
           const originalConsularDate = bot.currentConsularDate;
           if (result.success) {
@@ -984,11 +1046,6 @@ export const pollVisaTask = task({
             );
           }
 
-          // Update date cooldowns based on reschedule result
-          if (rescheduleResultObj) {
-            updatedCooldowns = updateDateCooldowns(updatedCooldowns, rescheduleResultObj, candidateDates);
-          }
-          } // end else (cooldown check passed)
           } // end else (no recent reschedule)
         } else if (earliest) {
           logger.info('No improvement — earliest is not ≥1 day before current', {
@@ -1010,6 +1067,7 @@ export const pollVisaTask = task({
             reloginHappened,
             phaseTimings: { ...timings },
             ...(rescheduleResultObj?.attempts ? { rescheduleDetails: { attempts: rescheduleResultObj.attempts } } : {}),
+            ...(rescheduleResultObj?.dateFailureTrackingDelta ? { trackerSize: Object.keys(rescheduleResultObj.dateFailureTrackingDelta).length } : {}),
             allDates: allDays,
             chainId,
             pollPhase,
@@ -1526,7 +1584,6 @@ export const pollVisaTask = task({
           ...(isCloud ? { chainId: 'cloud' as const } : {}),
           ...(dryRun ? { dryRun } : {}),
           ...(runRawDatesCount > 0 ? { lastDatesCount: runRawDatesCount } : {}),
-          ...(Object.keys(updatedCooldowns).length > 0 ? { dateCooldowns: updatedCooldowns } : {}),
         },
         {
           delay: dryRun ? '30s' : delay,
@@ -1570,6 +1627,7 @@ interface LogPollExtra {
   reloginHappened?: boolean;
   phaseTimings?: Record<string, number>;
   rescheduleDetails?: object;
+  trackerSize?: number;
   allDates?: Array<{date: string, business_day: boolean}>;
   chainId?: string;
   pollPhase?: string;
@@ -1686,53 +1744,6 @@ function deriveRescheduleResult(result: RescheduleResult): string {
   return result.reason ?? 'unknown';
 }
 
-// ── Date cooldown: skip reschedule for dates that consistently fail (no CAS, no times) ──
-const DATE_COOLDOWN_THRESHOLD = 5;   // consecutive failures before cooldown kicks in
-const DATE_COOLDOWN_MINUTES = 10;    // cooldown duration in minutes
-
-function updateDateCooldowns(
-  existing: Record<string, DateCooldownEntry>,
-  result: RescheduleResult,
-  currentDates: string[],
-): Record<string, DateCooldownEntry> {
-  // Success → clear all cooldowns (landscape changed)
-  if (result.success) return {};
-
-  const updated = { ...existing };
-
-  // New date appeared → reset all cooldowns (landscape changed)
-  if (currentDates.some(d => !(d in existing))) return {};
-
-  for (const attempt of result.attempts ?? []) {
-    const { date, failReason } = attempt;
-    if (failReason === 'no_times' || failReason === 'no_cas_days' || failReason === 'no_cas_times') {
-      const prev = updated[date] ?? { failCount: 0 };
-      const newCount = prev.failCount + 1;
-      updated[date] = newCount >= DATE_COOLDOWN_THRESHOLD
-        ? { failCount: newCount, cooldownUntil: new Date(Date.now() + DATE_COOLDOWN_MINUTES * 60_000).toISOString() }
-        : { failCount: newCount };
-    }
-    // fetch_error / post_failed = transient, don't count
-  }
-
-  // Prune dates no longer available
-  for (const date of Object.keys(updated)) {
-    if (!currentDates.includes(date)) delete updated[date];
-  }
-
-  return updated;
-}
-
-function getActiveCooldowns(cooldowns: Record<string, DateCooldownEntry>): Set<string> {
-  const now = Date.now();
-  const result = new Set<string>();
-  for (const [date, entry] of Object.entries(cooldowns)) {
-    if (entry.cooldownUntil && new Date(entry.cooldownUntil).getTime() > now) {
-      result.add(date);
-    }
-  }
-  return result;
-}
 
 /** Compute appeared/disappeared dates between two consecutive polls (pure, no I/O). */
 function computeDateChanges(
