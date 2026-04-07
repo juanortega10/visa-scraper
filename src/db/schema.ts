@@ -22,6 +22,7 @@ export const botStatusEnum = pgEnum('bot_status', [
   'active',
   'paused',
   'error',
+  'invalid_credentials',
 ]);
 
 export const proxyProviderEnum = pgEnum('proxy_provider', [
@@ -40,12 +41,35 @@ export interface CasCacheEntry {
   times: string[];    // ["07:00", "07:15", ...] — only if slots > 0
 }
 
+export type FailureDimension = 'consularNoTimes' | 'consularNoDays' | 'casNoTimes' | 'casNoDays';
+
+/**
+ * Cross-poll per-date failure entry. Stored inside CasCacheData.dateFailureTracking.
+ * All timestamps are ISO 8601 with `Z` suffix (codebase convention; CLAUDE.md timezone gotcha).
+ */
+export interface DateFailureEntry {
+  /** First failure of the current 1h sliding window. */
+  windowStartedAt: string;
+  /** Sum of all dimensions in the current window. */
+  totalCount: number;
+  /** Breakdown by dimension. Reserved for future per-dimension policy. */
+  byDimension: Partial<Record<FailureDimension, number>>;
+  /** Last increment timestamp. */
+  lastFailureAt: string;
+  /** Set when totalCount crosses CROSS_POLL_THRESHOLD (5). Dominates shorter blocks. */
+  blockedUntil?: string;
+}
+
 export interface CasCacheData {
   refreshedAt: string;       // ISO 8601
   windowDays: number;        // 21
   totalDates: number;        // dates checked
   fullDates: number;         // dates with 0 slots
   entries: CasCacheEntry[];
+  /** Consular dates blocked after no_cas_days failures. date → ISO expiry. Cleared on next prefetch. */
+  blockedConsularDates?: Record<string, string>;
+  /** Cross-poll per-date failure counters. Pruned when date disappears from days.json. */
+  dateFailureTracking?: Record<string, DateFailureEntry>;
 }
 
 // ── Bots ───────────────────────────────────────────────
@@ -210,8 +234,8 @@ export const rescheduleLogs = pgTable(
     oldConsularTime: varchar('old_consular_time', { length: 5 }),
     oldCasDate: date('old_cas_date'),
     oldCasTime: varchar('old_cas_time', { length: 5 }),
-    newConsularDate: date('new_consular_date').notNull(),
-    newConsularTime: varchar('new_consular_time', { length: 5 }).notNull(),
+    newConsularDate: date('new_consular_date'),
+    newConsularTime: varchar('new_consular_time', { length: 5 }),
     newCasDate: date('new_cas_date'),
     newCasTime: varchar('new_cas_time', { length: 5 }),
     success: boolean('success').notNull(),
