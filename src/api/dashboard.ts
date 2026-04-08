@@ -192,18 +192,18 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .country-name{font-size:13px;font-weight:800;color:var(--bright);text-transform:uppercase;letter-spacing:1px}
 .country-count{font-size:10px;color:var(--muted);margin-left:auto}
 
-.bot-card{display:flex;align-items:center;gap:10px;padding:10px 12px;margin-bottom:6px;
+.bot-card{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin-bottom:8px;
   background:var(--surface);border:1px solid var(--border);border-radius:8px;
   cursor:pointer;-webkit-tap-highlight-color:transparent;transition:border-color .15s,background .15s;
   text-decoration:none;color:inherit}
 .bot-card:hover,.bot-card:active{border-color:var(--accent-border);background:var(--accent-dim)}
 
-.bot-id{font-size:14px;font-weight:800;color:var(--accent);min-width:32px}
+.bot-id{font-size:14px;font-weight:800;color:var(--accent);min-width:32px;padding-top:2px}
 .bot-info{flex:1;min-width:0}
-.bot-appt{font-size:13px;font-weight:700;color:var(--bright);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bot-appt{font-size:13px;font-weight:700;color:var(--bright);white-space:normal;word-break:break-word}
 .bot-appt-none{color:var(--dim);font-style:italic;font-weight:400}
-.bot-meta{font-size:9px;color:var(--muted);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
-.bot-events{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.bot-meta{font-size:9px;color:var(--muted);margin-top:3px;display:flex;gap:6px;flex-wrap:wrap;line-height:1.6}
+.bot-events{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
 .ev-pill{font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;letter-spacing:.2px;white-space:nowrap}
 .ev-ok{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .ev-fail{background:rgba(252,211,77,.08);color:var(--amber);border:1px solid rgba(252,211,77,.2)}
@@ -215,7 +215,8 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .chip-error{background:rgba(248,113,113,.1);color:var(--red)}
 .chip-login_required,.chip-created{background:rgba(96,165,250,.1);color:var(--blue)}
 
-.bot-days{font-size:11px;font-weight:700;color:var(--muted);text-align:right;min-width:36px;flex-shrink:0}
+.bot-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0}
+.bot-days{font-size:11px;font-weight:700;color:var(--muted);text-align:right;min-width:36px}
 .bot-days .num{font-size:14px;color:var(--bright)}
 .bot-days .lbl{font-size:8px;text-transform:uppercase;letter-spacing:.3px}
 
@@ -439,10 +440,12 @@ function renderBotList(bots,events){
       html+='<div class="bot-meta">'+metaParts.join(' <span style="color:var(--dim)">&middot;</span> ')+'</div>';
       if(evPills)html+='<div class="bot-events">'+evPills+'</div>';
       html+='</span>';
+      html+='<span class="bot-right">';
       html+='<span class="chip chip-'+b.status+'">'+b.status+'</span>';
       if(b.currentConsularDate){
         html+='<span class="bot-days" style="color:'+daysColor+'"><span class="num">'+days+'</span><span class="lbl">d</span></span>';
       }
+      html+='</span>';
       html+='</a>';
     });
     html+='</div>';
@@ -1012,6 +1015,17 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
         <input id="phoneInput" placeholder="573..." />
         <button onclick="savePhone()" class="phone-save-btn">ok</button>
         <button onclick="cancelPhoneEdit()" class="phone-cancel-btn">\u2715</button>
+      </span>
+    </div>
+    <div id="infoRitmoRow" style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+      <span style="color:var(--muted);flex-shrink:0">ritmo</span>
+      <span id="infoRitmoDisplay">
+        <span id="infoRitmo" class="phone-display-val" onclick="editRitmo()" title="clic para editar">--</span>
+      </span>
+      <span id="infoRitmoEdit" style="display:none" class="phone-edit-wrap">
+        <input id="ritmoInput" placeholder="p/min (ej: 4)" style="width:80px" type="number" min="1" max="30" />
+        <button onclick="saveRitmo()" class="phone-save-btn">ok</button>
+        <button onclick="cancelRitmoEdit()" class="phone-cancel-btn">\u2715</button>
       </span>
     </div>
     <div style="border-top:1px solid var(--border);margin:4px 0"></div>
@@ -1609,6 +1623,9 @@ async function refresh(){
         document.getElementById('infoPhoneDisplay').style.display='none';
         document.getElementById('infoPhoneAdd').style.display='';
       }
+      document.getElementById('infoRitmoEdit').style.display='none';
+      document.getElementById('infoRitmoDisplay').style.display='';
+      renderRitmo(bot);
       var infoActRow=document.getElementById('infoActivatedRow');
       if(bot.activatedAt){infoActRow.style.display='flex';var ad=new Date(bot.activatedAt);document.getElementById('infoActivated').textContent=fmtDs(ad.toISOString().slice(0,10))+' '+ad.toLocaleTimeString('es-CO',{timeZone:'America/Bogota',hour:'2-digit',minute:'2-digit',hour12:false});}else{infoActRow.style.display='none';}
       var infoOrigRow=document.getElementById('infoOrigDateRow');
@@ -3303,6 +3320,35 @@ function savePhone(){
   fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({notificationPhone:v})})
     .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
     .then(function(){refresh()})
+    .catch(function(e){alert('Error: '+e.message)});
+}
+
+/* ── Ritmo (targetPollsPerMin) ── */
+function renderRitmo(bot){
+  var el=document.getElementById('infoRitmo');
+  if(!el) return;
+  var v=bot&&bot.targetPollsPerMin!=null?bot.targetPollsPerMin+' p/min':'auto';
+  el.textContent=v;
+  el.style.color=bot&&bot.targetPollsPerMin!=null?'var(--amber)':'var(--dim)';
+}
+function editRitmo(){
+  document.getElementById('infoRitmoDisplay').style.display='none';
+  document.getElementById('infoRitmoEdit').style.display='flex';
+  var inp=document.getElementById('ritmoInput');
+  inp.value=lastBot&&lastBot.targetPollsPerMin!=null?lastBot.targetPollsPerMin:'';
+  inp.focus();
+}
+function cancelRitmoEdit(){
+  document.getElementById('infoRitmoEdit').style.display='none';
+  document.getElementById('infoRitmoDisplay').style.display='';
+}
+function saveRitmo(){
+  var raw=document.getElementById('ritmoInput').value.trim();
+  var v=raw===''?null:parseInt(raw,10);
+  if(v!==null&&(isNaN(v)||v<1||v>30)){alert('1-30 p/min (o vacío para auto)');return;}
+  fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetPollsPerMin:v})})
+    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
+    .then(function(){cancelRitmoEdit();refresh()})
     .catch(function(e){alert('Error: '+e.message)});
 }
 
