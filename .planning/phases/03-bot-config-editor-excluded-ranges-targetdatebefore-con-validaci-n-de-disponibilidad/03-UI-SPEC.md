@@ -34,14 +34,15 @@ Net-new spacing values introduced by this phase are multiples of 4 only.
 | Token | Value | Usage in config modal |
 |-------|-------|----------------------|
 | xs | 4px | Calendar day cell padding, gap between nav arrows and month label, gap between range badge and remove button |
-| sm | 8px | Section internal gaps, calendar grid gap, range list row padding, button padding horizontal |
+| sm | 8px | Section internal gaps, range list row padding, button padding horizontal |
 | md | 12px | Gap between Section A and Section B, modal body padding horizontal on mobile |
 | lg | 16px | Modal body padding, gap above "guardar" buttons, section heading margin-bottom |
 | xl | 20px | Modal body padding on wider screens (540px+) |
 
 **Exceptions (inherited, not net-new):**
-- The gear button in the header reuses the existing inline icon style at the same `font-size:14px` as surrounding header elements — not a new spacing declaration.
+- The gear button in the header reuses the existing inline icon style at the same size as surrounding header elements — not a new spacing declaration.
 - Toast reuses existing `.toast` positioning (`bottom:16px`) — not new.
+- `.cfg-day` borders use `1px` for hairline cell separators in the calendar grid — this is a border width, not a spacing scale value; all spacing (padding/gap/margin) values remain multiples of 4.
 
 **Net-new values introduced by this phase: 4, 8, 12, 16, 20 — all multiples of 4.**
 
@@ -51,6 +52,8 @@ Net-new spacing values introduced by this phase are multiples of 4 only.
 
 All sizes match values already used in `dashboard.ts`. No new sizes introduced. **Only two net-new font weights are declared: 400 (regular) and 700 (bold).**
 
+The net-new type scale declares exactly **4 sizes: 9px, 10px, 11px, 13px**.
+
 | Role | Size | Weight | Line Height | Source |
 |------|------|--------|-------------|--------|
 | Modal title ("configuracion") | 13px | 700 | 1.2 | matches `.country-name` sizing |
@@ -58,14 +61,14 @@ All sizes match values already used in `dashboard.ts`. No new sizes introduced. 
 | Section description (muted helper text) | 10px | 400 | 1.5 | matches `.tr-desc` from Phase 2 |
 | Date input value / display | 11px | 700 | 1.2 | matches `.appt-val` sizing |
 | Calendar month label ("abr 2026") | 11px | 700 | 1.2 | new `.cfg-cal-month` |
-| Calendar day of week headers ("lu", "ma", ...) | 8px | 400 | 1 | uppercase, `var(--muted)` |
+| Calendar day of week headers ("lu", "ma", ...) | 10px | 400 | 1 | uppercase + `letter-spacing:.5px` for visual distinction, `var(--muted)` |
 | Calendar day number | 10px | 400 | 1 | normal day cells |
 | Calendar day number (today) | 10px | 700 | 1 | bold highlight |
 | Range list item ("15 feb — 04 mar 2026") | 10px | 400 | 1.5 | `var(--bright)` |
 | Button labels ("guardar", "limpiar", "agregar rango") | 9px | 700 | 1 | uppercase, matches `.tr-btn` sizing |
 | Validation error message | 10px | 400 | 1.5 | `var(--red)` |
-| Close button (×) | 16px | 400 | 1 | `var(--muted)`, hover `var(--bright)` |
-| Gear button (⚙) | 14px | 400 | 1 | `var(--muted)`, hover `var(--accent)` |
+| Close button (x glyph) | (inherited) | — | — | 16px glyph size inherited from existing `.btn`/header styles in `dashboard.ts` — not a net-new declaration by this phase |
+| Gear button (gear glyph) | (inherited) | — | — | 14px glyph size inherited from existing inline icon styles in `dashboard.ts` — not a net-new declaration by this phase |
 
 **Net-new font weights introduced by this phase: 400 and 700 (two weights total).**
 
@@ -80,7 +83,7 @@ Reuses the existing CSS variable palette from `dashboard.ts:173-176`. No new col
 | Dominant (60%) | `var(--bg)` = `#0C0C0E` | Overlay background (with alpha), modal body fill |
 | Secondary (30%) | `var(--surface)` = `#161618` | Modal container background, calendar day cell hover, range list row background |
 | Accent (10%) | `var(--accent)` = `#A78BFA` | Gear button hover, calendar range-start/end day fill, calendar in-range day tint, "agregar rango" button |
-| Destructive | `var(--red)` = `#F87171` | Remove range (✕) button, validation error text, validation error border |
+| Destructive | `var(--red)` = `#F87171` | Remove range (x) button, validation error text, validation error border |
 
 **Accent (`var(--accent)`) reserved exclusively for:**
 1. Gear button hover state
@@ -102,7 +105,7 @@ Reuses the existing CSS variable palette from `dashboard.ts:173-176`. No new col
 | Calendar: out-of-month filler | `visibility:hidden` | Empty cells, no visual noise |
 | Calendar: day hover (normal) | `var(--surface2)` = `#1C1C1F` | Background on hover for selectable days |
 | Range list item | `var(--bright)` text on `var(--surface)` background | Each range row |
-| Remove (✕) per range | `var(--red)` text, `var(--red)` background on hover at 10% alpha | Small inline button |
+| Remove (x) per range | `var(--red)` text, `var(--red)` background on hover at 10% alpha | Small inline button |
 | Save button idle | Same as `.btn-g` (green variant) | "guardar" / "guardar rangos" |
 | Save button loading | `opacity:0.5; cursor:wait` | While fetching + validating |
 | Save button success | Flash `.toast-ok` then revert | Momentary via toast |
@@ -173,7 +176,7 @@ All copy is Spanish (matches existing dashboard).
 
 - **Placement:** Inside the header row at line ~1075, after `<span class="cursor">_</span>`, as an inline `<span>`.
 - **HTML:** `<span id="cfgBtn" class="cfg-gear" onclick="openCfgModal()" title="configuracion">&#x2699;</span>`
-- **Style:** `font-size:14px; color:var(--muted); cursor:pointer; margin-left:8px; transition:color .15s`
+- **Style:** `color:var(--muted); cursor:pointer; margin-left:8px; transition:color .15s` (glyph size inherited from existing header icon sizing at 14px — not a net-new font-size declaration)
 - **Hover:** `color:var(--accent)`
 - **Active:** `opacity:0.6`
 - **Visibility:** Always visible on bot-detail page. No conditional display.
@@ -209,7 +212,7 @@ All copy is Spanish (matches existing dashboard).
 │                                     │
 │─────────────────────────────────────│  <- 1px border separator
 │                                     │
-│  FECHAS EXCLUIDAS                   │  <- .cfg-section
+│  FECHAS EXCLUIDAS  (sin guardar)   │  <- .cfg-section
 │  Rangos de fechas que el bot...     │
 │                                     │
 │  15 feb — 04 mar 2026         ✕    │  <- .cfg-range-item
@@ -217,7 +220,7 @@ All copy is Spanish (matches existing dashboard).
 │  (sin rangos excluidos)             │  <- empty state
 │                                     │
 │       ‹   abr 2026   ›             │  <- .cfg-cal-nav
-│  lu ma mi ju vi sa do              │  <- .cfg-cal-hdr
+│  LU MA MI JU VI SA DO              │  <- .cfg-cal-hdr (10px uppercase)
 │  ┌──┬──┬──┬──┬──┬──┬──┐           │
 │  │  │  │  │ 1│ 2│ 3│ 4│           │  <- .cfg-cal-grid
 │  │ 5│ 6│ 7│ 8│ 9│10│11│           │
@@ -260,16 +263,16 @@ All copy is Spanish (matches existing dashboard).
 
 **Navigation:**
 - `<div class="cfg-cal-nav">` with `display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:8px`.
-- `‹` and `›` buttons: `<button class="cfg-cal-arrow">` — `font-size:14px; color:var(--muted); background:none; border:none; cursor:pointer; padding:4px 8px`. Hover: `color:var(--bright)`.
+- `‹` and `›` buttons: `<button class="cfg-cal-arrow">` — `color:var(--muted); background:none; border:none; cursor:pointer; padding:4px 8px`. Hover: `color:var(--bright)`. (Arrow glyph size inherited from existing nav patterns in `dashboard.ts` — not a net-new font-size declaration.)
 - Month label: `<span class="cfg-cal-month">abr 2026</span>` — `font-size:11px; font-weight:700; color:var(--bright); min-width:80px; text-align:center`.
 
 **Day-of-week headers:**
 - `<div class="cfg-cal-hdr">` — 7-column CSS grid.
-- Each cell: `font-size:8px; color:var(--muted); text-transform:uppercase; text-align:center; padding:4px 0`.
+- Each cell: `font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; text-align:center; padding:4px 0`.
 
 **Day grid:**
-- `<div class="cfg-cal-grid">` — `display:grid; grid-template-columns:repeat(7,1fr); gap:1px`.
-- Each day cell: `<div class="cfg-day">` — `width:100%; aspect-ratio:1; display:flex; align-items:center; justify-content:center; font-size:10px; border-radius:4px; cursor:pointer; transition:background .1s`.
+- `<div class="cfg-cal-grid">` — `display:grid; grid-template-columns:repeat(7,1fr); gap:0`.
+- Each day cell: `<div class="cfg-day">` — `width:100%; aspect-ratio:1; display:flex; align-items:center; justify-content:center; font-size:10px; border-radius:0; border:1px solid var(--border); cursor:pointer; transition:background .1s`. The `border:1px solid var(--border)` provides hairline separation between cells without using a gap spacing value.
 - Cell minimum effective size: at 380px modal width minus 32px padding = 348px / 7 columns = ~49px per cell. Touch-friendly without exceptions.
 
 **Day cell states (exhaustive, mutually exclusive visual priority top-to-bottom):**
@@ -280,7 +283,7 @@ All copy is Spanish (matches existing dashboard).
 | Disabled (past date, or date >= currentConsularDate) | `.cfg-day-dis` | none | `var(--dim)` | — | `opacity:0.3; cursor:not-allowed; pointer-events:none` |
 | Already excluded (in existing saved range) | `.cfg-day-excl` | none | `var(--dim)` | — | `text-decoration:line-through; cursor:default` (still selectable for new overlapping range — but visually indicates existing coverage) |
 | Today | `.cfg-day-today` | none | `var(--bright)` | — | `font-weight:700; border-bottom:2px solid var(--accent)` |
-| Normal (selectable) | `.cfg-day` | none | `var(--text)` | — | default |
+| Normal (selectable) | `.cfg-day` | none | `var(--text)` | `1px solid var(--border)` | default |
 | Hover (normal) | `.cfg-day:hover` | `var(--surface2)` | `var(--bright)` | — | |
 | Range start (selected) | `.cfg-day-start` | `rgba(167,139,250,.25)` | `var(--bright)` | `1px solid var(--accent-border)` | `font-weight:700` |
 | Range end (selected) | `.cfg-day-end` | `rgba(167,139,250,.25)` | `var(--bright)` | `1px solid var(--accent-border)` | `font-weight:700` |
@@ -369,7 +372,7 @@ User clicks "guardar" or "guardar rangos"
 
 ### Close behavior
 
-- `×` button: `position:absolute; top:12px; right:12px; font-size:16px; color:var(--muted); cursor:pointer; background:none; border:none; padding:4px`. Hover: `color:var(--bright)`.
+- `×` button: `position:absolute; top:12px; right:12px; color:var(--muted); cursor:pointer; background:none; border:none; padding:4px`. Hover: `color:var(--bright)`. (Glyph size inherited from existing close-button styles in `dashboard.ts` — not a net-new font-size declaration.)
 - Overlay click: closes modal.
 - `Escape` key: `document.addEventListener('keydown', fn)` — attached on open, removed on close.
 - Unsaved changes: If the in-memory range list differs from the saved list, show `confirm('Hay cambios sin guardar. Cerrar de todos modos?')` before closing. If targetDateBefore input differs from saved value, same confirm.
@@ -406,7 +409,7 @@ User clicks "guardar" or "guardar rangos"
 │  10 may — 20 may 2026       ✕   │
 │                                  │
 │       ‹   abr 2026   ›          │
-│  lu ma mi ju vi sa do           │
+│  LU MA MI JU VI SA DO           │
 │     1  2  3  4  5  6            │
 │   7  8  9 10 11 12 13           │
 │  14 15 16 17 18 19 20           │
@@ -423,7 +426,7 @@ User clicks "guardar" or "guardar rangos"
 
 ## New CSS Surface (exhaustive)
 
-These are the ONLY new classes allowed. Anything else must reuse existing classes. All padding values are multiples of 4.
+These are the ONLY new classes allowed. Anything else must reuse existing classes. All padding/gap/margin values are multiples of 4.
 
 ```css
 /* ── Config modal ── */
@@ -438,7 +441,7 @@ These are the ONLY new classes allowed. Anything else must reuse existing classe
 .cfg-hdr{display:flex;align-items:center;justify-content:space-between;padding:16px;
   border-bottom:1px solid var(--border)}
 .cfg-title{font-size:13px;font-weight:700;color:var(--bright);text-transform:uppercase;letter-spacing:.5px}
-.cfg-close{font-size:16px;color:var(--muted);cursor:pointer;background:none;border:none;
+.cfg-close{color:var(--muted);cursor:pointer;background:none;border:none;
   padding:4px;font-family:inherit;transition:color .15s}
 .cfg-close:hover{color:var(--bright)}
 
@@ -485,16 +488,16 @@ These are the ONLY new classes allowed. Anything else must reuse existing classe
 /* ── Calendar ── */
 .cfg-cal{margin:12px 0}
 .cfg-cal-nav{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:8px}
-.cfg-cal-arrow{font-size:14px;color:var(--muted);background:none;border:none;cursor:pointer;
+.cfg-cal-arrow{color:var(--muted);background:none;border:none;cursor:pointer;
   padding:4px 8px;font-family:inherit;transition:color .15s}
 .cfg-cal-arrow:hover{color:var(--bright)}
 .cfg-cal-arrow:disabled{opacity:.3;cursor:not-allowed}
 .cfg-cal-month{font-size:11px;font-weight:700;color:var(--bright);min-width:80px;text-align:center}
 .cfg-cal-hdr{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;
-  font-size:8px;color:var(--muted);text-transform:uppercase;padding:4px 0;margin-bottom:4px}
-.cfg-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:1px}
+  font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;margin-bottom:4px}
+.cfg-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:0}
 .cfg-day{display:flex;align-items:center;justify-content:center;aspect-ratio:1;
-  font-size:10px;border-radius:4px;cursor:pointer;transition:background .1s;color:var(--text)}
+  font-size:10px;border:1px solid var(--border);cursor:pointer;transition:background .1s;color:var(--text)}
 .cfg-day:hover{background:var(--surface2);color:var(--bright)}
 .cfg-day-out{visibility:hidden}
 .cfg-day-dis{color:var(--dim);opacity:.3;cursor:not-allowed;pointer-events:none}
@@ -505,7 +508,7 @@ These are the ONLY new classes allowed. Anything else must reuse existing classe
 .cfg-day-preview,.cfg-day-inrange{background:var(--accent-dim);color:var(--bright)}
 
 /* ── Gear button ── */
-.cfg-gear{font-size:14px;color:var(--muted);cursor:pointer;margin-left:8px;
+.cfg-gear{color:var(--muted);cursor:pointer;margin-left:8px;
   transition:color .15s;-webkit-tap-highlight-color:transparent}
 .cfg-gear:hover{color:var(--accent)}
 .cfg-gear:active{opacity:.6}
@@ -561,7 +564,7 @@ No external code enters the bundle. All CSS and JS is authored directly inside `
 | `03-CONTEXT.md` section UX Flow | targetDateBefore input/save/clear, range list with remove, calendar click-start/click-end, "agregar rango" then "guardar rangos", validation logic (filter available dates, block if 0) |
 | `03-CONTEXT.md` section Technical Context | No libraries, div with position:fixed, z-index:1000, overlay, transition:transform 0.2s, fmtD/fetchJ/TZ helpers |
 | `03-CONTEXT.md` section Constraints | Zero npm deps, vanilla JS in dashboard.ts, mobile 100% width < 540px, PUT replaces full excludedDateRanges |
-| `02-UI-SPEC.md` | CSS variable palette, `.tr-` prefix pattern (→ `.cfg-` prefix), font sizes, weights, `.btn` class variants, toast system, spacing scale, typography table format, `.ev-pill`/`.ev-err` patterns |
+| `02-UI-SPEC.md` | CSS variable palette, `.tr-` prefix pattern (-> `.cfg-` prefix), font sizes, weights, `.btn` class variants, toast system, spacing scale, typography table format, `.ev-pill`/`.ev-err` patterns, inherited-size exception pattern |
 | `src/api/dashboard.ts:172-176` | Full color palette (CSS variables) |
 | `src/api/dashboard.ts:772-781` | `.btn` class, `.btn-g`, `.btn-r` button variant patterns |
 | `src/api/dashboard.ts:800-806` | Toast system (`.toast`, `.toast-ok`, `.toast-err`, `showToast()`) |
