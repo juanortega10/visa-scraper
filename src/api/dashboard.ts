@@ -2838,6 +2838,83 @@ function cfgNextMonth(){
   renderCfgCalendar();
 }
 
+function cfgDayClick(dateStr){
+  if(cfgCalState===0){
+    cfgRangeStart=dateStr; cfgRangeEnd=null; cfgCalState=1;
+  }else if(cfgCalState===1){
+    if(dateStr<cfgRangeStart){
+      cfgRangeStart=dateStr; cfgRangeEnd=null; cfgCalState=1;
+    }else{
+      cfgRangeEnd=dateStr; cfgCalState=2;
+    }
+  }else{
+    cfgRangeStart=dateStr; cfgRangeEnd=null; cfgCalState=1;
+  }
+  renderCfgCalendar();
+  var addBtn=document.getElementById('cfgAddRange');
+  if(addBtn) addBtn.disabled=cfgCalState!==2;
+}
+
+function cfgDayHover(dateStr){
+  if(cfgCalState!==1||!cfgRangeStart||dateStr<=cfgRangeStart)return;
+  var cells=document.querySelectorAll('#cfgCal .cfg-day[data-date]');
+  for(var i=0;i<cells.length;i++){
+    var d=cells[i].getAttribute('data-date');
+    if(d>cfgRangeStart&&d<=dateStr&&!cells[i].classList.contains('cfg-day-dis')){
+      cells[i].classList.add('cfg-day-preview');
+    }
+  }
+}
+function cfgDayHoverOut(){
+  var cells=document.querySelectorAll('#cfgCal .cfg-day-preview');
+  for(var i=0;i<cells.length;i++) cells[i].classList.remove('cfg-day-preview');
+}
+
+function cfgAddRange(){
+  if(cfgCalState!==2||!cfgRangeStart||!cfgRangeEnd)return;
+  cfgPendingRanges.push({startDate:cfgRangeStart,endDate:cfgRangeEnd});
+  cfgCalState=0; cfgRangeStart=null; cfgRangeEnd=null;
+  renderCfgRangesSection();
+}
+
+function cfgRemoveRange(index){
+  cfgPendingRanges.splice(index,1);
+  renderCfgRangesSection();
+}
+
+function cfgSaveRanges(){
+  var btn=document.getElementById('cfgRangesSave');
+  var errEl=document.getElementById('cfgRangesErr');
+  if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
+  if(errEl)errEl.style.display='none';
+  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
+    var inp=document.getElementById('cfgDateInput');
+    var proposedTarget=(inp&&inp.value)?inp.value:cfgSavedTarget;
+    var filtered=cfgFilterDates(data.dates,proposedTarget||null,lastBot.currentConsularDate,cfgPendingRanges);
+    if(filtered.length===0){
+      if(errEl){errEl.textContent='Sin esta configuracion el bot no podria reagendar a ninguna fecha disponible. Ajusta los rangos o la fecha limite.';errEl.style.display='block';}
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
+      return;
+    }
+    if(errEl)errEl.style.display='none';
+    return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({excludedDateRanges:cfgPendingRanges})})
+    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+    .then(function(){
+      showToast('Rangos guardados',true);
+      lastBot.excludedDateRanges=JSON.parse(JSON.stringify(cfgPendingRanges));
+      cfgSavedRanges=JSON.parse(JSON.stringify(cfgPendingRanges));
+      renderCfgRangesSection();
+    })
+    .catch(function(){
+      showToast('Error al guardar. Reintenta.',false);
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
+    });
+  }).catch(function(){
+    if(errEl){errEl.textContent='Error al verificar disponibilidad. Reintenta.';errEl.style.display='block';}
+    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
+  });
+}
+
 /* ── CAS Changes ── */
 function renderCasChanges(logs){
   var el=document.getElementById('casChanges');
