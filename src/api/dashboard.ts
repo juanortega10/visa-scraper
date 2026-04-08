@@ -546,6 +546,28 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .appt-days{font-size:10px;color:var(--muted);margin-left:6px;font-weight:400}
 .appt-cas .appt-val{font-size:12px;color:var(--text);font-weight:700}
 
+/* ── Tracker tab ── */
+.tr-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px}
+.tr-title{font-size:11px;font-weight:700;color:var(--bright);text-transform:uppercase;letter-spacing:.5px}
+.tr-desc{font-size:10px;color:var(--muted);line-height:1.5;margin-bottom:12px}
+.tr-tbl-wrap{overflow-x:auto}
+.tr-tbl{width:100%;border-collapse:collapse;font-size:11px}
+.tr-tbl th{text-align:left;color:var(--muted);font-weight:400;font-size:9px;text-transform:uppercase;letter-spacing:.5px;padding:4px 4px;border-bottom:1px solid var(--border)}
+.tr-tbl td{padding:8px 4px;border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:middle}
+.tr-tbl .num{text-align:right;font-weight:700}
+.tr-tbl .num-0{color:var(--dim);font-weight:400}
+.tr-tbl .num-pos{color:var(--bright)}
+.tr-date{color:var(--bright);font-weight:700}
+.tr-ago{color:var(--muted);font-size:10px}
+.tr-badge{font-size:9px;font-weight:700;padding:4px 8px;border-radius:4px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap}
+.tr-badge-block{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.2)}
+.tr-badge-obs{background:rgba(252,211,77,.1);color:var(--amber);border:1px solid rgba(252,211,77,.2)}
+.tr-badge-fade{color:var(--dim);border:1px solid var(--border)}
+.tr-btn{font-family:inherit;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;padding:4px 8px;border-radius:4px;cursor:pointer;-webkit-tap-highlight-color:transparent;background:rgba(248,113,113,.08);color:var(--red);border:1px solid rgba(248,113,113,.2);min-height:24px}
+.tr-btn:active{opacity:.6}
+.tr-btn:disabled{opacity:.3;cursor:not-allowed}
+.tr-none{color:var(--dim);text-align:center}
+
 /* ── Tabs ── */
 .tabs{display:flex;gap:2px;margin-bottom:8px}
 .tab{flex:1;padding:7px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;
@@ -1000,6 +1022,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   <div class="tab" onclick="switchTab(2)">eventos</div>
   <div class="tab" onclick="switchTab(3)">calendario</div>
   <div class="tab" onclick="switchTab(4)">cobros</div>
+  <div class="tab" onclick="switchTab(5)">tracker</div>
 </div>
 
 
@@ -1185,6 +1208,18 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 <!-- ═══ COBROS TAB ═══ -->
 <div id="t4" class="tab-c">
   <div id="cobrosContent" class="cobro-empty">selecciona el tab para cargar</div>
+</div>
+
+<!-- ═══ TRACKER TAB ═══ -->
+<div id="t5" class="tab-c">
+  <div class="tr-head">
+    <div>
+      <div class="tr-title">Failure Tracker</div>
+    </div>
+    <button id="trClearAll" class="tr-btn" style="display:none" onclick="clearTracker()">limpiar todo</button>
+  </div>
+  <div class="tr-desc">Fechas bloqueadas por fallas repetidas en la ventana de 1h. El bot evita estas fechas hasta que el cooldown expire o CAS vuelva a estar disponible.</div>
+  <div id="trackerContent"></div>
 </div>
 
 <div class="foot">tap header to refresh &middot; auto 60s</div>
