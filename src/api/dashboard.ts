@@ -2818,7 +2818,7 @@ function renderCfgCalendar(){
     if(disabled){
       html+='<div class="'+cls+'">'+d+'</div>';
     }else{
-      html+='<div class="'+cls+'" data-date="'+ds+'" onclick="cfgDayClick(\''+ds+'\')" onmouseover="cfgDayHover(\''+ds+'\')" onmouseout="cfgDayHoverOut()">'+d+'</div>';
+      html+='<div class="'+cls+'" data-date="'+ds+'" onclick="cfgDayClick(\\''+ds+'\\')" onmouseover="cfgDayHover(\\''+ds+'\\')" onmouseout="cfgDayHoverOut()">'+d+'</div>';
     }
   }
   html+='</div>';
