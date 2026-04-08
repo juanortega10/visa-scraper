@@ -10,7 +10,8 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 
 ## Phases
 
-- [ ] **Phase 1: Cross-Poll Failure Tracker Migration** — Migrate `dateCooldowns` from task payload to `casCacheJson.dateFailureTracking`, relax reset rule, add CAS escape hatch, delete dead code.
+- [x] **Phase 1: Cross-Poll Failure Tracker Migration** — Migrate `dateCooldowns` from task payload to `casCacheJson.dateFailureTracking`, relax reset rule, add CAS escape hatch, delete dead code.
+- [ ] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
 
 ## Phase Details
 
@@ -43,7 +44,8 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Cross-Poll Failure Tracker Migration | 0/3 | Not started | - |
+| 1. Cross-Poll Failure Tracker Migration | 3/3 | ✓ Complete | 2026-04-07 |
+| 2. Tracker Dashboard | 0/? | Not started | - |
 
 ## Coverage Validation
 
@@ -51,6 +53,29 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 - Mapped: 35
 - Orphans: 0
 - Status: Complete
+
+### Phase 2: Tracker Dashboard
+
+**Goal**: Operadores pueden ver en el dashboard el estado del `dateFailureTracking` sin acceder a la DB — fechas bloqueadas, contadores por dimensión, tiempo restante del bloqueo. Pueden desbloquear manualmente una fecha si saben que el problema se resolvió.
+
+**Depends on**: Phase 1 (tracker en producción)
+
+**Scope**:
+- Landing page: pill "⊘ N fechas bloqueadas" por bot cuando hay bloqueos activos
+- Bot-detail: nueva tab 5 "tracker" con tabla completa + botón desbloquear por fecha
+- Backend: endpoint DELETE (o POST clear) para desbloqueo manual
+- Sin cambios al worker (poll-visa / prefetch-cas)
+
+**Success Criteria**:
+1. Landing muestra resumen de bloqueos activos por bot
+2. Tab tracker muestra tabla con estado correcto (bloqueada / en observación)
+3. Botón desbloquear elimina entrada del tracker y recarga tabla
+4. `npm test` verde sin regresiones
+
+**Plans:** 3 plans
+- [ ] 02-01-PLAN.md — Backend: expose dateFailureTracking on GET /:id, add trackerSummary to /landing, add DELETE /:id/tracker[/:date] + tests
+- [ ] 02-02-PLAN.md — Bot-detail tab 5 "tracker" — CSS, table, renderTracker, manual unblock + clear-all
+- [ ] 02-03-PLAN.md — Landing-page pill "⊘ N fechas bloqueadas" driven by trackerSummary
 
 ---
 *Roadmap created: 2026-04-06*
