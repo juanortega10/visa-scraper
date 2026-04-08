@@ -1,3 +1,16 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: unknown
+last_updated: "2026-04-08T13:48:51.448Z"
+progress:
+  total_phases: 2
+  completed_phases: 1
+  total_plans: 6
+  completed_plans: 4
+---
+
 # STATE: visa-scraper — Cross-Poll Failure Tracker Migration
 
 ## Project Reference
@@ -8,11 +21,11 @@
 
 ## Current Position
 
-- **Milestone**: Cross-Poll Failure Tracker Migration
-- **Phase**: 1 — Cross-Poll Failure Tracker Migration
-- **Plan**: (none yet — awaiting `/gsd:plan-phase 1`)
-- **Status**: Roadmap approved, ready for planning
-- **Progress**: `[                    ]` 0%
+- **Milestone**: Cross-Poll Failure Tracker Migration + Dashboard
+- **Phase**: 2 — Tracker Dashboard
+- **Current Plan**: 02-02 (next) — 02-01 complete
+- **Status**: 02-01 merged; backend tracker API ready for UI plans
+- **Progress**: `[######              ]` 33% of phase 2 (1/3 plans)
 
 ## Performance Metrics
 
@@ -24,6 +37,7 @@
 | Plans completed | 0 |
 | Tests passing | baseline (167+) |
 | Coverage gaps | 0 |
+| Phase 02 P01 | 4min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -54,9 +68,22 @@
 5. Single nested `jsonb_set` write per poll (Pitfall 3 — concurrent write safety).
 6. Test under `TZ=America/Bogota` (Pitfall 6).
 
+### Roadmap Evolution
+
+- Phase 2 added: Tracker Dashboard — failure tracker tab + landing summary
+
+### Phase 2 Decisions (added 2026-04-08 during 02-01)
+
+- `trackerSummary.blockedCount` computed at request-time in JS (not SQL) — keeps /landing aggregator consistent with existing events/health derivations
+- Clear-all sets `dateFailureTracking={}` rather than removing the key — preserves Phase 1 shape invariant
+- DASH-API-* requirement IDs referenced in 02-01-PLAN.md are NOT yet in REQUIREMENTS.md; traceability gap to address in Phase 2 finalization
+
 ### Open Todos
 
-- Run `/gsd:plan-phase 1` to decompose the phase into executable plans.
+- Phase 1 COMPLETE (deployed 2026-04-07, RPi + cloud, 196/196 tests)
+- Phase 2 Plan 01 COMPLETE (2026-04-08, 206/206 tests)
+- Next: execute 02-02 (tracker tab UI) and 02-03 (landing summary UI)
+- Backfill DASH-API-01..04 into REQUIREMENTS.md traceability when Phase 2 wraps
 
 ### Blockers
 
@@ -64,9 +91,9 @@ None.
 
 ## Session Continuity
 
-**Last session**: 2026-04-06 — Roadmap created from research outputs and locked PROJECT.md decisions.
+**Last session**: 2026-04-08 — Completed 02-01-PLAN.md (tracker API exposure).
 
-**Next session entry point**: `/gsd:plan-phase 1`
+**Next session entry point**: `/gsd:execute-plan 02-02` or `/gsd:execute-phase 02`
 
 **Files of record**:
 - `.planning/PROJECT.md`
