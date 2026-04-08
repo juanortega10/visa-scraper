@@ -428,6 +428,10 @@ function renderBotList(bots,events){
       if(b.consecutiveErrors>=3){
         evPills+='<span class="ev-pill ev-err">\u2717 '+b.consecutiveErrors+' errores</span>';
       }
+      if(b.trackerSummary&&b.trackerSummary.blockedCount>0){
+        var bc=b.trackerSummary.blockedCount;
+        evPills+='<span class="ev-pill ev-err">\u2298 '+bc+(bc===1?' fecha bloqueada':' fechas bloqueadas')+'</span>';
+      }
       html+='<a class="bot-card" href="/dashboard/'+b.id+'">';
       html+='<span class="bot-id">#'+b.id+'</span>';
       html+='<span class="bot-info">';
