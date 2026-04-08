@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
 import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, asc, gte, sql } from 'drizzle-orm';
+import { eq, and, desc, asc, gte, sql, isNotNull } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
@@ -814,6 +814,33 @@ botsRouter.delete('/:id/tracker', async (c) => {
     updatedAt: new Date(),
   }).where(eq(bots.id, id));
   return c.json({ ok: true, cleared });
+});
+
+// Get available dates from latest poll data
+botsRouter.get('/:id/available-dates', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  if (isNaN(id)) return c.json({ error: 'Invalid bot ID' }, 400);
+
+  const [row] = await db.select({
+    allDates: pollLogs.allDates,
+    createdAt: pollLogs.createdAt,
+  })
+    .from(pollLogs)
+    .where(and(
+      eq(pollLogs.botId, id),
+      eq(pollLogs.status, 'ok'),
+      isNotNull(pollLogs.allDates),
+    ))
+    .orderBy(desc(pollLogs.createdAt))
+    .limit(1);
+
+  if (!row) {
+    return c.json({ dates: [], stale: true, message: 'No recent poll data' });
+  }
+
+  const dates = (row.allDates as Array<{ date: string; business_day: boolean }>).map(d => d.date);
+  const pollAge = Math.round((Date.now() - new Date(row.createdAt!).getTime()) / 60000);
+  return c.json({ dates, pollAge, stale: pollAge > 60 });
 });
 
 // Get bot
