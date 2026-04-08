@@ -11,7 +11,8 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 ## Phases
 
 - [x] **Phase 1: Cross-Poll Failure Tracker Migration** — Migrate `dateCooldowns` from task payload to `casCacheJson.dateFailureTracking`, relax reset rule, add CAS escape hatch, delete dead code.
-- [ ] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
+- [x] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
+- [ ] **Phase 3: Bot Config Editor** — Modal desde bot-detail para editar `targetDateBefore` y rangos de exclusión, con mini-calendar range picker y validación de disponibilidad pre-save.
 
 ## Phase Details
 
@@ -44,8 +45,9 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Cross-Poll Failure Tracker Migration | 3/3 | ✓ Complete | 2026-04-07 |
+| 1. Cross-Poll Failure Tracker Migration | 3/3 | Complete | 2026-04-07 |
 | 2. Tracker Dashboard | 0/? | Not started | - |
+| 3. Bot Config Editor | 0/3 | Planned | - |
 
 ## Coverage Validation
 
@@ -61,7 +63,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 **Depends on**: Phase 1 (tracker en producción)
 
 **Scope**:
-- Landing page: pill "⊘ N fechas bloqueadas" por bot cuando hay bloqueos activos
+- Landing page: pill "N fechas bloqueadas" por bot cuando hay bloqueos activos
 - Bot-detail: nueva tab 5 "tracker" con tabla completa + botón desbloquear por fecha
 - Backend: endpoint DELETE (o POST clear) para desbloqueo manual
 - Sin cambios al worker (poll-visa / prefetch-cas)
@@ -75,7 +77,35 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 **Plans:** 3 plans
 - [ ] 02-01-PLAN.md — Backend: expose dateFailureTracking on GET /:id, add trackerSummary to /landing, add DELETE /:id/tracker[/:date] + tests
 - [ ] 02-02-PLAN.md — Bot-detail tab 5 "tracker" — CSS, table, renderTracker, manual unblock + clear-all
-- [ ] 02-03-PLAN.md — Landing-page pill "⊘ N fechas bloqueadas" driven by trackerSummary
+- [ ] 02-03-PLAN.md — Landing-page pill "N fechas bloqueadas" driven by trackerSummary
+
+### Phase 3: Bot Config Editor
+
+**Goal**: El operador puede editar `targetDateBefore` y los rangos de exclusión de fechas de cada bot directamente desde el dashboard, sin tocar la DB ni la API a mano. Un modal abre un editor con mini-calendar range picker. Antes de guardar, el sistema valida que la nueva configuración deja al menos 1 fecha disponible para reagendar — si no, bloquea el save con un mensaje explicativo.
+
+**Depends on**: Phase 2 (bot-detail page en producción)
+
+**Requirements**: CFG-MODAL-01, CFG-MODAL-02, CFG-CSS-01, CFG-AVAIL-01, CFG-TARGET-01, CFG-TARGET-02, CFG-TARGET-03, CFG-VALID-01, CFG-RANGE-01, CFG-RANGE-02, CFG-RANGE-03, CFG-CAL-01, CFG-VALID-02, CFG-TEST-01
+
+**Scope**:
+- Modal desde botón en header del bot-detail
+- Sección A: `targetDateBefore` — input date + guardar + limpiar
+- Sección B: `Fechas excluidas` — lista con remove por rango + mini-calendar vanilla JS para agregar rangos
+- Validación pre-save: GET available-dates + filtrar con restricciones propuestas + bloquear si 0 fechas
+- New endpoint: GET /api/bots/:id/available-dates (reads latest poll_log allDates)
+- Sin nuevas dependencias npm, sin nuevas tablas, PUT /api/bots/:id ya soporta ambos campos
+
+**Success Criteria**:
+1. Modal abre/cierra correctamente desde bot-detail
+2. targetDateBefore editable y guardable con validación
+3. Rangos: agregar via mini-calendar, eliminar con remove, guardar lista completa
+4. Validación bloquea save si 0 fechas quedarían disponibles
+5. `npm test` verde sin regresiones
+
+**Plans:** 3 plans
+- [ ] 03-01-PLAN.md — Backend available-dates endpoint + gear button + modal scaffold + all .cfg- CSS classes
+- [ ] 03-02-PLAN.md — targetDateBefore section: date input, save with validation, clear with confirmation
+- [ ] 03-03-PLAN.md — Excluded ranges section: range list/remove, mini-calendar picker, save with validation + human verification
 
 ---
 *Roadmap created: 2026-04-06*
