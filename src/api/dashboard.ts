@@ -2584,6 +2584,10 @@ function showToast(msg,ok){
 var cfgSavedRanges=null;
 var cfgPendingRanges=null;
 var cfgSavedTarget=null;
+var cfgCalMonth=null;
+var cfgRangeStart=null;
+var cfgRangeEnd=null;
+var cfgCalState=0;
 
 function openCfgModal(){
   if(!lastBot)return;
@@ -2619,6 +2623,8 @@ function openCfgModal(){
   });
   document.addEventListener('keydown',cfgEscHandler);
   renderCfgTargetSection();
+  cfgCalState=0; cfgRangeStart=null; cfgRangeEnd=null;
+  renderCfgRangesSection();
 }
 
 function cfgHasUnsavedChanges(){
@@ -2735,6 +2741,101 @@ function cfgClearTarget(){
     renderCfgTargetSection();
   })
   .catch(function(){showToast('Error al guardar. Reintenta.',false);});
+}
+
+/* -- Config Modal: Excluded Ranges (Plan 03) -- */
+var cfgMonthNames=['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+
+function cfgFmtRange(r){
+  var s=r.startDate.split('-').map(Number), e=r.endDate.split('-').map(Number);
+  return s[2]+' '+cfgMonthNames[s[1]-1]+' — '+e[2]+' '+cfgMonthNames[e[1]-1]+' '+e[0];
+}
+
+function renderCfgRangesSection(){
+  var el=document.getElementById('cfgRangesContent');
+  if(!el)return;
+  var html='';
+  html+='<div class="cfg-range-list" id="cfgRangeList">';
+  if(cfgPendingRanges.length===0){
+    html+='<div class="cfg-range-empty">sin rangos excluidos</div>';
+  }else{
+    for(var i=0;i<cfgPendingRanges.length;i++){
+      html+='<div class="cfg-range-item"><span class="cfg-range-text">'+cfgFmtRange(cfgPendingRanges[i])+'</span><button class="cfg-range-rm" title="eliminar rango" onclick="cfgRemoveRange('+i+')">&#x2715;</button></div>';
+    }
+  }
+  html+='</div>';
+  html+='<div class="cfg-cal" id="cfgCal"></div>';
+  html+='<button class="cfg-btn cfg-btn-accent" id="cfgAddRange" onclick="cfgAddRange()" disabled>agregar rango</button>';
+  html+='<button class="cfg-btn cfg-btn-save" id="cfgRangesSave" onclick="cfgSaveRanges()">guardar rangos</button>';
+  html+='<div class="cfg-err" id="cfgRangesErr" style="display:none"></div>';
+  el.innerHTML=html;
+  document.getElementById('cfgUnsaved').style.display=(JSON.stringify(cfgPendingRanges)!==JSON.stringify(cfgSavedRanges))?'':'none';
+  var now=new Date();
+  if(!cfgCalMonth)cfgCalMonth={year:now.getFullYear(),month:now.getMonth()};
+  renderCfgCalendar();
+}
+
+function renderCfgCalendar(){
+  var el=document.getElementById('cfgCal');
+  if(!el)return;
+  var now=new Date();
+  var isMinMonth=(cfgCalMonth.year===now.getFullYear()&&cfgCalMonth.month===now.getMonth());
+  var html='<div class="cfg-cal-nav">';
+  html+='<button class="cfg-cal-arrow" onclick="cfgPrevMonth()"'+(isMinMonth?' disabled':'')+'>&#8249;</button>';
+  html+='<span class="cfg-cal-month">'+cfgMonthNames[cfgCalMonth.month]+' '+cfgCalMonth.year+'</span>';
+  html+='<button class="cfg-cal-arrow" onclick="cfgNextMonth()">&#8250;</button>';
+  html+='</div>';
+  html+='<div class="cfg-cal-hdr">';
+  var dayHdrs=['lu','ma','mi','ju','vi','sa','do'];
+  for(var h=0;h<7;h++)html+='<div>'+dayHdrs[h]+'</div>';
+  html+='</div>';
+  html+='<div class="cfg-cal-grid">';
+  var first=new Date(cfgCalMonth.year,cfgCalMonth.month,1);
+  var startDow=(first.getDay()+6)%7;
+  var daysInMonth=new Date(cfgCalMonth.year,cfgCalMonth.month+1,0).getDate();
+  for(var p=0;p<startDow;p++)html+='<div class="cfg-day cfg-day-out"></div>';
+  var todayStr=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  var consular=lastBot.currentConsularDate||null;
+  var target=lastBot.targetDateBefore||null;
+  for(var d=1;d<=daysInMonth;d++){
+    var ds=cfgCalMonth.year+'-'+String(cfgCalMonth.month+1).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    var cls='cfg-day';
+    var disabled=false;
+    if(ds<todayStr){cls+=' cfg-day-dis';disabled=true;}
+    else if(consular&&ds>=consular){cls+=' cfg-day-dis';disabled=true;}
+    else if(target&&ds>=target){cls+=' cfg-day-dis';disabled=true;}
+    if(!disabled){
+      var inRange=false;
+      for(var ri=0;ri<cfgPendingRanges.length;ri++){
+        if(ds>=cfgPendingRanges[ri].startDate&&ds<=cfgPendingRanges[ri].endDate){inRange=true;break;}
+      }
+      if(inRange)cls+=' cfg-day-excl';
+    }
+    if(ds===todayStr&&!disabled)cls+=' cfg-day-today';
+    if(cfgCalState>=1&&ds===cfgRangeStart)cls+=' cfg-day-start';
+    if(cfgCalState===2&&ds===cfgRangeEnd)cls+=' cfg-day-end';
+    if(cfgCalState===2&&cfgRangeStart&&cfgRangeEnd&&ds>cfgRangeStart&&ds<cfgRangeEnd)cls+=' cfg-day-inrange';
+    if(disabled){
+      html+='<div class="'+cls+'">'+d+'</div>';
+    }else{
+      html+='<div class="'+cls+'" data-date="'+ds+'" onclick="cfgDayClick(\''+ds+'\')" onmouseover="cfgDayHover(\''+ds+'\')" onmouseout="cfgDayHoverOut()">'+d+'</div>';
+    }
+  }
+  html+='</div>';
+  el.innerHTML=html;
+}
+
+function cfgPrevMonth(){
+  var now=new Date();
+  if(cfgCalMonth.year===now.getFullYear()&&cfgCalMonth.month===now.getMonth())return;
+  cfgCalMonth.month--;
+  if(cfgCalMonth.month<0){cfgCalMonth.month=11;cfgCalMonth.year--;}
+  renderCfgCalendar();
+}
+function cfgNextMonth(){
+  cfgCalMonth.month++;
+  if(cfgCalMonth.month>11){cfgCalMonth.month=0;cfgCalMonth.year++;}
+  renderCfgCalendar();
 }
 
 /* ── CAS Changes ── */
