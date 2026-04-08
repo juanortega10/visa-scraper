@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
 import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, gte, sql } from 'drizzle-orm';
+import { eq, and, desc, asc, gte, sql } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
@@ -229,7 +229,7 @@ botsRouter.get('/landing', async (c) => {
   const since1h = new Date(Date.now() - 60 * 60 * 1000);
   const since = since24; // kept for reschedule window
 
-  const [allBots, rescheduleRows, pollStats, pollStats1h] = await Promise.all([
+  const [allBots, rescheduleRows, pollStats, pollStats1h, uptimeBuckets, originalDates] = await Promise.all([
     db.select({
       id: bots.id, locale: bots.locale, status: bots.status,
       ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
@@ -239,6 +239,7 @@ botsRouter.get('/landing', async (c) => {
       targetDateBefore: bots.targetDateBefore,
       maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
       pollEnvironments: bots.pollEnvironments,
+      casCacheJson: bots.casCacheJson,
     }).from(bots),
 
     db.select({
@@ -268,13 +269,42 @@ botsRouter.get('/landing', async (c) => {
     }).from(pollLogs)
       .where(gte(pollLogs.createdAt, since1h))
       .groupBy(pollLogs.botId),
+
+    // Uptime: 5-min buckets — a bucket is "up" if it has ≥1 ok/filtered_out poll
+    db.select({
+      botId: pollLogs.botId,
+      totalBuckets: sql<number>`count(distinct floor(extract(epoch from ${pollLogs.createdAt}) / 300))::int`,
+      okBuckets: sql<number>`count(distinct case when ${pollLogs.status} in ('ok', 'filtered_out') then floor(extract(epoch from ${pollLogs.createdAt}) / 300) end)::int`,
+    }).from(pollLogs)
+      .where(gte(pollLogs.createdAt, since24))
+      .groupBy(pollLogs.botId),
+
+    // Original consular date: the oldConsularDate from the earliest reschedule_log per bot
+    db.select({
+      botId: rescheduleLogs.botId,
+      originalDate: sql<string>`min(old_consular_date)`,
+    }).from(rescheduleLogs)
+      .where(sql`old_consular_date is not null`)
+      .groupBy(rescheduleLogs.botId),
   ]);
+
+  // Build a lookup: botId → currentConsularDate (from allBots query already done above)
+  const botCurrentDate: Record<number, string | null> = {};
+  for (const b of allBots) botCurrentDate[b.id] = b.currentConsularDate ?? null;
 
   const events: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
   for (const r of rescheduleRows) {
     if (!events[r.botId]) events[r.botId] = { successes: [], failedCount: 0 };
-    if (r.success) events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
-    else events[r.botId].failedCount++;
+    if (r.success) {
+      // Only show success badge if the rescheduled date still matches the current appointment.
+      // If the portal reverted the appointment, currentConsularDate will differ from newConsularDate
+      // and the badge should not show a stale victory.
+      if (r.newConsularDate === botCurrentDate[r.botId]) {
+        events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
+      }
+    } else {
+      events[r.botId].failedCount++;
+    }
   }
 
   const health: Record<number, { total: number; ok: number; tcp: number; error: number }> = {};
@@ -283,33 +313,66 @@ botsRouter.get('/landing', async (c) => {
   const health1h: Record<number, { total: number; ok: number; tcp: number }> = {};
   for (const r of pollStats1h) health1h[r.botId] = { total: r.total, ok: r.ok, tcp: r.tcp };
 
-  return c.json({ bots: allBots, events, health, health1h });
+  const uptime: Record<number, { totalBuckets: number; okBuckets: number }> = {};
+  for (const r of uptimeBuckets) uptime[r.botId] = { totalBuckets: r.totalBuckets, okBuckets: r.okBuckets };
+
+  const origDateByBot: Record<number, string | null> = {};
+  for (const r of originalDates) origDateByBot[r.botId] = r.originalDate ?? null;
+
+  const nowMs = Date.now();
+  const botsWithOrig = allBots.map(b => {
+    const cache = (b.casCacheJson as CasCacheData | null) ?? null;
+    const tracking = cache?.dateFailureTracking ?? {};
+    const entries = Object.values(tracking);
+    const totalEntries = entries.length;
+    const blockedCount = entries.filter(
+      (e) => e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs,
+    ).length;
+    // strip casCacheJson from the wire response — only summary leaves the API
+    const { casCacheJson: _omit, ...rest } = b;
+    return {
+      ...rest,
+      originalConsularDate: origDateByBot[b.id] ?? null,
+      trackerSummary: { blockedCount, totalEntries },
+    };
+  });
+
+  return c.json({ bots: botsWithOrig, events, health, health1h, uptime });
 });
 
 // Recent events — reschedule activity last 24h, grouped by botId
 botsRouter.get('/recent-events', async (c) => {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const logs = await db
-    .select({
-      botId: rescheduleLogs.botId,
-      success: rescheduleLogs.success,
-      newConsularDate: rescheduleLogs.newConsularDate,
-      newConsularTime: rescheduleLogs.newConsularTime,
-      createdAt: rescheduleLogs.createdAt,
-    })
-    .from(rescheduleLogs)
-    .where(gte(rescheduleLogs.createdAt, since))
-    .orderBy(desc(rescheduleLogs.createdAt));
+  const [logs, botRows] = await Promise.all([
+    db
+      .select({
+        botId: rescheduleLogs.botId,
+        success: rescheduleLogs.success,
+        newConsularDate: rescheduleLogs.newConsularDate,
+        newConsularTime: rescheduleLogs.newConsularTime,
+        createdAt: rescheduleLogs.createdAt,
+      })
+      .from(rescheduleLogs)
+      .where(gte(rescheduleLogs.createdAt, since))
+      .orderBy(desc(rescheduleLogs.createdAt)),
+    db.select({ id: bots.id, currentConsularDate: bots.currentConsularDate }).from(bots),
+  ]);
+
+  const currentDateByBot: Record<number, string | null> = {};
+  for (const b of botRows) currentDateByBot[b.id] = b.currentConsularDate ?? null;
 
   const result: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
   for (const log of logs) {
     if (!result[log.botId]) result[log.botId] = { successes: [], failedCount: 0 };
     if (log.success) {
-      result[log.botId].successes.push({
-        date: log.newConsularDate,
-        time: log.newConsularTime,
-        at: log.createdAt.toISOString(),
-      });
+      // Only show success badge when newConsularDate matches current appointment (guards against portal reversion)
+      if (log.newConsularDate === currentDateByBot[log.botId]) {
+        result[log.botId].successes.push({
+          date: log.newConsularDate,
+          time: log.newConsularTime,
+          at: log.createdAt.toISOString(),
+        });
+      }
     } else {
       result[log.botId].failedCount++;
     }
@@ -726,6 +789,7 @@ botsRouter.get('/:id', async (c) => {
     currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
     targetDateBefore: bots.targetDateBefore,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
+    maxCasGapDays: bots.maxCasGapDays,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     skipCas: bots.skipCas,
     consecutiveErrors: bots.consecutiveErrors,
@@ -751,6 +815,13 @@ botsRouter.get('/:id', async (c) => {
     endDate: excludedDates.endDate,
   }).from(excludedDates).where(eq(excludedDates.botId, id));
 
+  // Original consular date = oldConsularDate of the bot's first-ever reschedule log entry
+  const [firstRescheduleLog] = await db.select({ oldConsularDate: rescheduleLogs.oldConsularDate })
+    .from(rescheduleLogs)
+    .where(eq(rescheduleLogs.botId, id))
+    .orderBy(asc(rescheduleLogs.createdAt))
+    .limit(1);
+
   // Fetch Clerk registration email if clerkUserId exists
   let clerkEmail: string | null = null;
   if (bot.clerkUserId) {
@@ -772,9 +843,11 @@ botsRouter.get('/:id', async (c) => {
     currentConsularTime: bot.currentConsularTime,
     currentCasDate: bot.currentCasDate,
     currentCasTime: bot.currentCasTime,
+    originalConsularDate: firstRescheduleLog?.oldConsularDate ?? null,
     targetDateBefore: bot.targetDateBefore,
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
+    maxCasGapDays: bot.maxCasGapDays ?? null,
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
     skipCas: bot.skipCas,
@@ -805,6 +878,7 @@ botsRouter.get('/:id', async (c) => {
         fullDates: cache.fullDates,
         availableDates: cache.totalDates - cache.fullDates,
         entries: cache.entries ?? [],
+        dateFailureTracking: cache.dateFailureTracking ?? null,
       };
     })(),
   });
@@ -837,6 +911,7 @@ botsRouter.put('/:id', async (c) => {
   if (body.pollEnvironments !== undefined) updates.pollEnvironments = body.pollEnvironments;
   if (body.targetDateBefore !== undefined) updates.targetDateBefore = body.targetDateBefore;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
+  if (body.maxCasGapDays !== undefined) updates.maxCasGapDays = body.maxCasGapDays != null ? parseInt(body.maxCasGapDays as string, 10) : null;
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;
   if (body.skipCas !== undefined) updates.skipCas = !!body.skipCas;
@@ -881,7 +956,7 @@ botsRouter.post('/:id/activate', async (c) => {
   const [bot] = await db.select({ id: bots.id, status: bots.status }).from(bots).where(eq(bots.id, id));
   if (!bot) return c.json({ error: 'Not found' }, 404);
 
-  if (bot.status !== 'created' && bot.status !== 'error' && bot.status !== 'login_required' && bot.status !== 'paused') {
+  if (bot.status !== 'created' && bot.status !== 'error' && bot.status !== 'login_required' && bot.status !== 'paused' && bot.status !== 'invalid_credentials') {
     return c.json({ error: `Cannot activate bot in '${bot.status}' state` }, 409);
   }
 
@@ -998,8 +1073,8 @@ botsRouter.post('/:id/pause', async (c) => {
   }).from(bots).where(eq(bots.id, id));
   if (!bot) return c.json({ error: 'Not found' }, 404);
 
-  // Fix 1: Only allow pausing active bots
-  if (bot.status !== 'active' && bot.status !== 'login_required') {
+  // Fix 1: Only allow pausing active/error/invalid_credentials bots
+  if (bot.status !== 'active' && bot.status !== 'login_required' && bot.status !== 'error' && bot.status !== 'invalid_credentials') {
     return c.json({ error: `Cannot pause bot in '${bot.status}' state` }, 409);
   }
 
@@ -1079,6 +1154,8 @@ botsRouter.delete('/:id', async (c) => {
 
 // ── Kapso activation tracking ───────────────────────────
 
+const KAPSO_ACTIVATE_LEAD_FN = '127f5340-c96c-48cd-ab36-40b3195e795e';
+
 async function notifyKapsoActivation(phone: string, botId: number): Promise<void> {
   const apiKey = process.env.KAPSO_API_KEY;
   const baseUrl = process.env.KAPSO_API_BASE_URL;
@@ -1087,32 +1164,15 @@ async function notifyKapsoActivation(phone: string, botId: number): Promise<void
     return;
   }
 
-  const headers = {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json',
-  };
-
-  // 1. Update lead status
   try {
-    const res = await fetch(`${baseUrl}/api/v1/databases/leads/rows?phone=eq.${phone}`, {
-      method: 'PATCH',
-      headers,
-      body: JSON.stringify({ status: 'activated', bot_id: botId, updated_at: new Date().toISOString() }),
-    });
-    console.log(`[kapso] PATCH leads phone=${phone} botId=${botId} status=${res.status}`);
-  } catch (e) {
-    console.warn(`[kapso] PATCH leads failed phone=${phone}:`, e);
-  }
-
-  // 2. Log funnel event
-  try {
-    const res = await fetch(`${baseUrl}/api/v1/databases/funnel_events/rows`, {
+    const res = await fetch(`${baseUrl}/api/v1/functions/${KAPSO_ACTIVATE_LEAD_FN}/invoke`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ phone, event_type: 'wa_lead_activated', message_text: `bot:${botId}`, created_at: new Date().toISOString() }),
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, bot_id: String(botId) }),
     });
-    console.log(`[kapso] POST funnel_events phone=${phone} botId=${botId} status=${res.status}`);
+    const data = await res.json().catch(() => null);
+    console.log(`[kapso] activate-lead phone=${phone} botId=${botId} status=${res.status}`, data);
   } catch (e) {
-    console.warn(`[kapso] POST funnel_events failed phone=${phone}:`, e);
+    console.warn(`[kapso] activate-lead failed phone=${phone}:`, e);
   }
 }

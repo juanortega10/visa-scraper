@@ -22,7 +22,7 @@ vi.mock('@clerk/backend', () => ({
 vi.mock('../db/client.js', () => {
   function chain(rows: unknown[]) {
     const c: any = {};
-    for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning']) {
+    for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning', 'groupBy', 'innerJoin', 'leftJoin']) {
       c[m] = vi.fn(() => c);
     }
     c.then = (res: (v: unknown) => void) => Promise.resolve(rows).then(res);
@@ -93,7 +93,7 @@ function buildApp() {
 /** Override db.select() to return specific rows via the chainable mock */
 function mockDbRows(rows: unknown[]) {
   const chain: any = {};
-  for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning']) {
+  for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'set', 'values', 'returning', 'groupBy', 'innerJoin', 'leftJoin']) {
     chain[m] = vi.fn(() => chain);
   }
   chain.then = (res: (v: unknown) => void) => Promise.resolve(rows).then(res);
