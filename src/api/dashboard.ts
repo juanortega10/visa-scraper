@@ -2618,6 +2618,7 @@ function openCfgModal(){
     requestAnimationFrame(function(){panel.classList.add('open')});
   });
   document.addEventListener('keydown',cfgEscHandler);
+  renderCfgTargetSection();
 }
 
 function cfgHasUnsavedChanges(){
@@ -2645,6 +2646,96 @@ function closeCfgModal(){
 }
 
 function cfgEscHandler(e){if(e.key==='Escape')closeCfgModal()}
+
+function renderCfgTargetSection(){
+  var el=document.getElementById('cfgTargetContent');
+  if(!el)return;
+  var hasVal=cfgSavedTarget!=null;
+  var html='';
+  if(hasVal){
+    html+='<input type="date" id="cfgDateInput" class="cfg-date-input" value="'+cfgSavedTarget+'">';
+  }else{
+    html+='<div class="cfg-date-null" id="cfgDateNull">sin limite</div>';
+    html+='<input type="date" id="cfgDateInput" class="cfg-date-input" style="display:none" value="">';
+    html+='<span style="font-size:9px;color:var(--accent);cursor:pointer;text-decoration:underline" onclick="cfgShowDateInput()">establecer fecha limite</span>';
+  }
+  html+='<div class="cfg-btn-row">';
+  html+='<button class="cfg-btn cfg-btn-save" id="cfgTargetSave" onclick="cfgSaveTarget()">guardar</button>';
+  html+='<button class="cfg-btn cfg-btn-clear" id="cfgTargetClear" onclick="cfgClearTarget()" style="'+(hasVal?'':'display:none')+'">limpiar</button>';
+  html+='</div>';
+  html+='<div class="cfg-err" id="cfgTargetErr" style="display:none"></div>';
+  el.innerHTML=html;
+}
+
+function cfgShowDateInput(){
+  var n=document.getElementById('cfgDateNull');
+  var inp=document.getElementById('cfgDateInput');
+  var clr=document.getElementById('cfgTargetClear');
+  if(n)n.style.display='none';
+  if(inp){inp.style.display='block';inp.focus();}
+  if(clr)clr.style.display='';
+  var link=n&&n.nextElementSibling;
+  if(link&&link.tagName==='INPUT')link=link.nextElementSibling;
+  if(link&&link.tagName==='SPAN')link.style.display='none';
+}
+
+function cfgFilterDates(dates,target,consular,ranges){
+  return dates.filter(function(d){
+    if(target&&d>=target)return false;
+    if(consular&&d>=consular)return false;
+    for(var i=0;i<ranges.length;i++){
+      if(d>=ranges[i].startDate&&d<=ranges[i].endDate)return false;
+    }
+    return true;
+  });
+}
+
+function cfgSaveTarget(){
+  var inp=document.getElementById('cfgDateInput');
+  var newVal=inp?inp.value:'';
+  if(!newVal&&cfgSavedTarget==null){showToast('sin cambios',false);return;}
+  var btn=document.getElementById('cfgTargetSave');
+  var errEl=document.getElementById('cfgTargetErr');
+  if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
+  if(errEl)errEl.style.display='none';
+  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
+    var filtered=cfgFilterDates(data.dates,newVal||null,lastBot.currentConsularDate,cfgPendingRanges);
+    if(filtered.length===0){
+      if(errEl){errEl.textContent='Sin esta configuracion el bot no podria reagendar a ninguna fecha disponible. Ajusta los rangos o la fecha limite.';errEl.style.display='block';}
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+      return;
+    }
+    if(errEl)errEl.style.display='none';
+    return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDateBefore:newVal||null})})
+    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+    .then(function(){
+      showToast('Fecha limite guardada',true);
+      lastBot.targetDateBefore=newVal||null;
+      cfgSavedTarget=newVal||null;
+      renderCfgTargetSection();
+    })
+    .catch(function(){
+      showToast('Error al guardar. Reintenta.',false);
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+    });
+  }).catch(function(){
+    if(errEl){errEl.textContent='Error al verificar disponibilidad. Reintenta.';errEl.style.display='block';}
+    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+  });
+}
+
+function cfgClearTarget(){
+  if(!confirm('Quitar la fecha limite? El bot buscara cualquier fecha anterior a la cita actual.'))return;
+  fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDateBefore:null})})
+  .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+  .then(function(){
+    showToast('Fecha limite eliminada',true);
+    lastBot.targetDateBefore=null;
+    cfgSavedTarget=null;
+    renderCfgTargetSection();
+  })
+  .catch(function(){showToast('Error al guardar. Reintenta.',false);});
+}
 
 /* ── CAS Changes ── */
 function renderCasChanges(logs){
