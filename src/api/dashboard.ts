@@ -1342,7 +1342,86 @@ function switchTab(n){
     renderCalendar();
   }
   if(n===4) renderCobros();
+  if(n===5) renderTracker();
 }
+
+function renderTracker(){
+  var content=document.getElementById('trackerContent');
+  var clearBtn=document.getElementById('trClearAll');
+  if(!content) return;
+  var tracking=(lastBot&&lastBot.casCache&&lastBot.casCache.dateFailureTracking)||null;
+  var keys=tracking?Object.keys(tracking):[];
+  if(!tracking||keys.length===0){
+    if(clearBtn) clearBtn.style.display='none';
+    content.innerHTML='<div class="empty-msg"><div style="font-size:13px;color:var(--bright);margin-bottom:4px">sin bloqueos activos</div><div style="font-size:10px;color:var(--muted);line-height:1.5">El bot no tiene fechas en cooldown. Las entradas aparecen cuando una fecha falla 5 veces en 1h.</div></div>';
+    return;
+  }
+  if(clearBtn) clearBtn.style.display='inline-block';
+  var nowMs=Date.now();
+  var rows=keys.map(function(k){return {date:k,e:tracking[k]};});
+  rows.sort(function(a,b){
+    var ablock=a.e.blockedUntil&&new Date(a.e.blockedUntil).getTime()>nowMs?1:0;
+    var bblock=b.e.blockedUntil&&new Date(b.e.blockedUntil).getTime()>nowMs?1:0;
+    if(ablock!==bblock)return bblock-ablock;
+    if(a.e.totalCount!==b.e.totalCount)return b.e.totalCount-a.e.totalCount;
+    return a.date<b.date?-1:1;
+  });
+  var html='<div class="tr-tbl-wrap"><table class="tr-tbl"><thead><tr>'+
+    '<th>fecha</th><th class="num">total</th><th class="num">consularNoTimes</th><th class="num">casNoDays</th><th class="num">casNoTimes</th><th>última falla</th><th>estado</th><th>acción</th>'+
+    '</tr></thead><tbody>';
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i],e=r.e,bd=e.byDimension||{};
+    var c1=bd.consularNoTimes||0,c2=bd.casNoDays||0,c3=bd.casNoTimes||0;
+    var lastMs=new Date(e.lastFailureAt).getTime();
+    var blockMs=e.blockedUntil?new Date(e.blockedUntil).getTime():0;
+    var isBlocked=blockMs>nowMs;
+    var ageMin=(nowMs-lastMs)/60000;
+    var badge,action;
+    if(isBlocked){
+      badge='<span class="tr-badge tr-badge-block">● bloqueada '+fmtDur(blockMs-nowMs)+'</span>';
+      action='<button class="tr-btn" onclick="unblockTrackerDate(\\''+r.date+'\\')">desbloquear</button>';
+    } else if(ageMin>50){
+      badge='<span class="tr-badge tr-badge-fade">● expirando</span>';
+      action='<span style="color:var(--dim)">—</span>';
+    } else {
+      badge='<span class="tr-badge tr-badge-obs">● observación</span>';
+      action='<span style="color:var(--dim)">—</span>';
+    }
+    html+='<tr>'+
+      '<td class="tr-date">'+r.date+'</td>'+
+      '<td class="num num-pos">'+e.totalCount+'</td>'+
+      '<td class="num '+(c1>0?'num-pos':'num-0')+'">'+c1+'</td>'+
+      '<td class="num '+(c2>0?'num-pos':'num-0')+'">'+c2+'</td>'+
+      '<td class="num '+(c3>0?'num-pos':'num-0')+'">'+c3+'</td>'+
+      '<td class="tr-ago">'+timeAgo(e.lastFailureAt)+'</td>'+
+      '<td>'+badge+'</td>'+
+      '<td>'+action+'</td>'+
+    '</tr>';
+  }
+  html+='</tbody></table></div>';
+  content.innerHTML=html;
+}
+
+function unblockTrackerDate(date){
+  if(!lastBot) return;
+  if(!confirm('¿Desbloquear '+date+'? El bot volverá a intentar esta fecha en el próximo poll.')) return;
+  fetch('/api/bots/'+lastBot.id+'/tracker/'+date,{method:'DELETE'})
+    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json();})
+    .then(function(){showToast('Fecha desbloqueada',true);return refresh();})
+    .then(function(){renderTracker();})
+    .catch(function(){showToast('Error: no se pudo desbloquear. Reintenta.',false);});
+}
+
+function clearTracker(){
+  if(!lastBot) return;
+  if(!confirm('¿Limpiar TODAS las entradas del tracker? El bot volverá a probar todas las fechas en el próximo poll.')) return;
+  fetch('/api/bots/'+lastBot.id+'/tracker',{method:'DELETE'})
+    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json();})
+    .then(function(){showToast('Tracker limpiado',true);return refresh();})
+    .then(function(){renderTracker();})
+    .catch(function(){showToast('Error: no se pudo limpiar el tracker.',false);});
+}
+
 function toggle(el){el.closest('.card').classList.toggle('collapsed')}
 
 /* ── Formatters ── */
