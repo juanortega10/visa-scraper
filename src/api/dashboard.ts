@@ -1397,7 +1397,7 @@ function renderTracker(){
       '<td class="num '+(c1>0?'num-pos':'num-0')+'">'+c1+'</td>'+
       '<td class="num '+(c2>0?'num-pos':'num-0')+'">'+c2+'</td>'+
       '<td class="num '+(c3>0?'num-pos':'num-0')+'">'+c3+'</td>'+
-      '<td class="tr-ago">'+timeAgo(e.lastFailureAt)+'</td>'+
+      '<td class="tr-ago">'+fmtAgo(e.lastFailureAt)+'</td>'+
       '<td>'+badge+'</td>'+
       '<td>'+action+'</td>'+
     '</tr>';
