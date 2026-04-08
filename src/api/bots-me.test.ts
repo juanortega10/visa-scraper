@@ -388,3 +388,294 @@ describe('Clerk auth middleware error codes', () => {
     expect(body.code).toBe('no_token');
   });
 });
+
+// ── Tests: tracker endpoints (Phase 2 Plan 1) ──────────
+
+describe('tracker endpoints', () => {
+  let app: Hono;
+
+  const sampleEntry = {
+    windowStartedAt: '2026-04-08T10:00:00.000Z',
+    totalCount: 5,
+    byDimension: { consularNoTimes: 5 },
+    lastFailureAt: '2026-04-08T10:30:00.000Z',
+    blockedUntil: '2099-04-08T12:30:00.000Z', // far future → blocked
+  };
+
+  const sampleEntry2 = {
+    windowStartedAt: '2026-04-08T09:00:00.000Z',
+    totalCount: 2,
+    byDimension: { consularNoDays: 2 },
+    lastFailureAt: '2026-04-08T09:15:00.000Z',
+  };
+
+  function buildBotRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 6,
+      scheduleId: '72824354',
+      locale: 'es-co',
+      status: 'active',
+      proxyProvider: 'direct',
+      consularFacilityId: '25',
+      ascFacilityId: '26',
+      currentConsularDate: '2026-06-01',
+      currentConsularTime: '08:00',
+      currentCasDate: null,
+      currentCasTime: null,
+      targetDateBefore: null,
+      maxReschedules: null,
+      rescheduleCount: 0,
+      maxCasGapDays: null,
+      pollIntervalSeconds: null,
+      targetPollsPerMin: null,
+      skipCas: false,
+      consecutiveErrors: 0,
+      activeRunId: null,
+      activeCloudRunId: null,
+      pollEnvironments: ['dev'],
+      cloudEnabled: false,
+      notificationEmail: null,
+      ownerEmail: null,
+      notificationPhone: null,
+      webhookUrl: null,
+      visaEmail: 'enc_test@test.com',
+      applicantIds: ['1'],
+      clerkUserId: null,
+      activatedAt: '2026-04-01T00:00:00.000Z',
+      createdAt: '2026-04-01T00:00:00.000Z',
+      updatedAt: '2026-04-07T00:00:00.000Z',
+      casCacheJson: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = buildApp();
+  });
+
+  // ── GET /:id exposes dateFailureTracking ─────────────
+
+  it('GET /api/bots/:id exposes dateFailureTracking from casCacheJson', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 5,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: { '2026-05-10': sampleEntry },
+    };
+    mockDbRows([buildBotRow({ casCacheJson })]);  // bot select
+    mockDbRows([]); // session
+    mockDbRows([]); // excludedDates
+    mockDbRows([]); // firstRescheduleLog
+
+    const res = await app.request('/api/bots/6');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.casCache).not.toBeNull();
+    expect(body.casCache.dateFailureTracking).toBeDefined();
+    expect(body.casCache.dateFailureTracking['2026-05-10']).toBeDefined();
+    expect(body.casCache.dateFailureTracking['2026-05-10'].totalCount).toBe(5);
+  });
+
+  it('GET /api/bots/:id returns dateFailureTracking as null when cache has no tracking', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 5,
+      fullDates: 0,
+      entries: [],
+    };
+    mockDbRows([buildBotRow({ casCacheJson })]);
+    mockDbRows([]);
+    mockDbRows([]);
+    mockDbRows([]);
+
+    const res = await app.request('/api/bots/6');
+    const body = await res.json();
+    expect(body.casCache.dateFailureTracking).toBeNull();
+  });
+
+  // ── GET /landing trackerSummary ──────────────────────
+
+  it('GET /api/bots/landing returns trackerSummary per bot', async () => {
+    const bot1 = {
+      id: 6,
+      locale: 'es-co',
+      status: 'active',
+      ownerEmail: null,
+      notificationPhone: null,
+      currentConsularDate: '2026-06-01',
+      currentConsularTime: '08:00',
+      consecutiveErrors: 0,
+      targetDateBefore: null,
+      maxReschedules: null,
+      rescheduleCount: 0,
+      pollEnvironments: ['dev'],
+      casCacheJson: {
+        refreshedAt: '2026-04-08T10:00:00.000Z',
+        windowDays: 21,
+        totalDates: 5,
+        fullDates: 0,
+        entries: [],
+        dateFailureTracking: { '2026-05-10': sampleEntry, '2026-05-15': sampleEntry2 },
+      },
+    };
+    const bot2 = {
+      id: 7,
+      locale: 'es-pe',
+      status: 'active',
+      ownerEmail: null,
+      notificationPhone: null,
+      currentConsularDate: null,
+      currentConsularTime: null,
+      consecutiveErrors: 0,
+      targetDateBefore: null,
+      maxReschedules: null,
+      rescheduleCount: 0,
+      pollEnvironments: ['dev'],
+      casCacheJson: {
+        refreshedAt: '2026-04-08T10:00:00.000Z',
+        windowDays: 21,
+        totalDates: 0,
+        fullDates: 0,
+        entries: [],
+        dateFailureTracking: {},
+      },
+    };
+
+    mockDbRows([bot1, bot2]); // allBots
+    mockDbRows([]); // rescheduleRows
+    mockDbRows([]); // pollStats
+    mockDbRows([]); // pollStats1h
+    mockDbRows([]); // uptimeBuckets
+    mockDbRows([]); // originalDates
+
+    const res = await app.request('/api/bots/landing');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.bots).toHaveLength(2);
+    const b1 = body.bots.find((b: { id: number }) => b.id === 6);
+    const b2 = body.bots.find((b: { id: number }) => b.id === 7);
+    expect(b1.trackerSummary).toEqual({ blockedCount: 1, totalEntries: 2 });
+    expect(b2.trackerSummary).toEqual({ blockedCount: 0, totalEntries: 0 });
+    // casCacheJson must NOT leak out on the wire
+    expect(b1).not.toHaveProperty('casCacheJson');
+    expect(b2).not.toHaveProperty('casCacheJson');
+  });
+
+  it('GET /api/bots/landing returns trackerSummary zeros when cache is null', async () => {
+    mockDbRows([{
+      id: 6,
+      locale: 'es-co',
+      status: 'active',
+      ownerEmail: null,
+      notificationPhone: null,
+      currentConsularDate: null,
+      currentConsularTime: null,
+      consecutiveErrors: 0,
+      targetDateBefore: null,
+      maxReschedules: null,
+      rescheduleCount: 0,
+      pollEnvironments: ['dev'],
+      casCacheJson: null,
+    }]);
+    mockDbRows([]); mockDbRows([]); mockDbRows([]); mockDbRows([]); mockDbRows([]);
+
+    const res = await app.request('/api/bots/landing');
+    const body = await res.json();
+    expect(body.bots[0].trackerSummary).toEqual({ blockedCount: 0, totalEntries: 0 });
+  });
+
+  // ── DELETE /:id/tracker/:date ────────────────────────
+
+  it('DELETE /api/bots/:id/tracker/:date removes the entry and returns ok', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 5,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: { '2026-05-10': sampleEntry, '2026-05-15': sampleEntry2 },
+    };
+    mockDbRows([{ casCacheJson }]);
+
+    const res = await app.request('/api/bots/6/tracker/2026-05-10', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ ok: true });
+    expect(vi.mocked(db.update)).toHaveBeenCalled();
+  });
+
+  it('DELETE /api/bots/:id/tracker/:date returns 404 when date not in tracker', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 5,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: { '2026-05-10': sampleEntry },
+    };
+    mockDbRows([{ casCacheJson }]);
+
+    const res = await app.request('/api/bots/6/tracker/2026-05-99', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe('Date not in tracker');
+  });
+
+  it('DELETE /api/bots/:id/tracker/:date returns 404 for unknown bot', async () => {
+    mockDbRows([]); // no bot
+
+    const res = await app.request('/api/bots/999/tracker/2026-05-10', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe('Bot not found');
+  });
+
+  // ── DELETE /:id/tracker (clear all) ─────────────────
+
+  it('DELETE /api/bots/:id/tracker clears all entries and returns count', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 5,
+      fullDates: 0,
+      entries: [],
+      dateFailureTracking: { '2026-05-10': sampleEntry, '2026-05-15': sampleEntry2 },
+    };
+    mockDbRows([{ casCacheJson }]);
+
+    const res = await app.request('/api/bots/6/tracker', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ ok: true, cleared: 2 });
+    expect(vi.mocked(db.update)).toHaveBeenCalled();
+  });
+
+  it('DELETE /api/bots/:id/tracker returns cleared=0 when tracking missing', async () => {
+    const casCacheJson = {
+      refreshedAt: '2026-04-08T10:00:00.000Z',
+      windowDays: 21,
+      totalDates: 0,
+      fullDates: 0,
+      entries: [],
+    };
+    mockDbRows([{ casCacheJson }]);
+
+    const res = await app.request('/api/bots/6/tracker', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ ok: true, cleared: 0 });
+  });
+
+  it('DELETE /api/bots/:id/tracker returns 404 for unknown bot', async () => {
+    mockDbRows([]);
+
+    const res = await app.request('/api/bots/999/tracker', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe('Bot not found');
+  });
+});
