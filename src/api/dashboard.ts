@@ -3352,7 +3352,7 @@ function renderTimelines(){
   /* Summary */
   var spanH=Math.round((tMax-tMin)/36e5*10)/10;
   var burstStr='';
-  for(var i=0;i<data.bursts.length;i++){
+  for(var i=0;data.bursts&&i<data.bursts.length;i++){
     var b=data.bursts[i];
     var bt=new Date(b.time);
     var bs=bt.toLocaleString('en-US',Object.assign({},TZ,{hour:'2-digit',minute:'2-digit',hour12:false}));
