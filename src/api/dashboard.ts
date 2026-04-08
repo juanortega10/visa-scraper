@@ -805,6 +805,76 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 .toast-ok{background:rgba(74,222,128,.9);color:#000}
 .toast-err{background:rgba(248,113,113,.9);color:#fff}
 
+/* -- Config modal -- */
+.cfg-overlay{position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.7);cursor:pointer}
+.cfg-panel{position:fixed;top:0;right:0;bottom:0;width:380px;max-width:100%;z-index:9999;
+  background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;
+  transform:translateX(100%);transition:transform .2s ease-out;
+  -webkit-overflow-scrolling:touch;font-family:inherit}
+.cfg-panel.open{transform:translateX(0)}
+@media(max-width:540px){.cfg-panel{width:100%;border-left:none}}
+.cfg-hdr{display:flex;align-items:center;justify-content:space-between;padding:16px;
+  border-bottom:1px solid var(--border)}
+.cfg-title{font-size:13px;font-weight:700;color:var(--bright);text-transform:uppercase;letter-spacing:.5px}
+.cfg-close{color:var(--muted);cursor:pointer;background:none;border:none;
+  padding:4px;font-family:inherit;transition:color .15s}
+.cfg-close:hover{color:var(--bright)}
+.cfg-section{padding:16px}
+.cfg-section+.cfg-section{border-top:1px solid var(--border)}
+.cfg-section-title{font-size:11px;font-weight:700;color:var(--bright);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:4px}
+.cfg-section-desc{font-size:10px;color:var(--muted);line-height:1.5;margin-bottom:12px}
+.cfg-unsaved{font-size:9px;color:var(--amber);margin-left:8px;font-weight:400;text-transform:none;letter-spacing:0}
+.cfg-date-input{font-family:inherit;font-size:11px;font-weight:700;color:var(--bright);
+  background:var(--bg);border:1px solid var(--border);border-radius:4px;
+  padding:8px;width:100%;box-sizing:border-box;outline:none}
+.cfg-date-input:focus{border-color:var(--accent-border)}
+.cfg-date-null{font-size:11px;color:var(--muted);font-style:italic;padding:8px 0}
+.cfg-btn-row{display:flex;gap:8px;margin-top:12px}
+.cfg-btn{font-family:inherit;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;
+  padding:8px 16px;border-radius:6px;cursor:pointer;-webkit-tap-highlight-color:transparent;
+  transition:opacity .15s;min-height:32px;border:none}
+.cfg-btn:active{opacity:.6}
+.cfg-btn:disabled{opacity:.3;cursor:not-allowed}
+.cfg-btn-save{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.2)}
+.cfg-btn-clear{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.2)}
+.cfg-btn-accent{background:rgba(167,139,250,.1);color:var(--accent);border:1px solid rgba(167,139,250,.2)}
+.cfg-btn-loading{opacity:.5;cursor:wait}
+.cfg-err{font-size:10px;color:var(--red);line-height:1.5;margin-top:8px;padding:8px;
+  background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:4px}
+.cfg-range-list{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.cfg-range-item{display:flex;align-items:center;justify-content:space-between;padding:8px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:4px}
+.cfg-range-text{font-size:10px;color:var(--bright)}
+.cfg-range-rm{font-size:10px;color:var(--red);background:none;border:none;cursor:pointer;
+  padding:4px;font-family:inherit;transition:opacity .15s;flex-shrink:0}
+.cfg-range-rm:hover{background:rgba(248,113,113,.1);border-radius:3px}
+.cfg-range-empty{font-size:10px;color:var(--muted);font-style:italic;padding:8px 0}
+.cfg-cal{margin:12px 0}
+.cfg-cal-nav{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:8px}
+.cfg-cal-arrow{color:var(--muted);background:none;border:none;cursor:pointer;
+  padding:4px 8px;font-family:inherit;transition:color .15s}
+.cfg-cal-arrow:hover{color:var(--bright)}
+.cfg-cal-arrow:disabled{opacity:.3;cursor:not-allowed}
+.cfg-cal-month{font-size:11px;font-weight:700;color:var(--bright);min-width:80px;text-align:center}
+.cfg-cal-hdr{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;
+  font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;margin-bottom:4px}
+.cfg-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:0}
+.cfg-day{display:flex;align-items:center;justify-content:center;aspect-ratio:1;
+  font-size:10px;border:1px solid var(--border);cursor:pointer;transition:background .1s;color:var(--text)}
+.cfg-day:hover{background:var(--surface2);color:var(--bright)}
+.cfg-day-out{visibility:hidden}
+.cfg-day-dis{color:var(--dim);opacity:.3;cursor:not-allowed;pointer-events:none}
+.cfg-day-excl{color:var(--dim);text-decoration:line-through;cursor:default}
+.cfg-day-today{color:var(--bright);font-weight:700;border-bottom:2px solid var(--accent)}
+.cfg-day-start,.cfg-day-end{background:rgba(167,139,250,.25);color:var(--bright);
+  border:1px solid var(--accent-border);font-weight:700}
+.cfg-day-preview,.cfg-day-inrange{background:var(--accent-dim);color:var(--bright)}
+.cfg-gear{color:var(--muted);cursor:pointer;margin-left:8px;
+  transition:color .15s;-webkit-tap-highlight-color:transparent}
+.cfg-gear:hover{color:var(--accent)}
+.cfg-gear:active{opacity:.6}
+
 /* ── CAS Changes ── */
 .chg-item{display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;flex-wrap:wrap}
 .chg-item:last-child{border-bottom:none}
@@ -1072,7 +1142,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 <!-- Header -->
 <div class="hdr">
   <a href="/dashboard" style="text-decoration:none;color:var(--muted);font-size:14px;margin-right:6px" title="todos los bots">‹</a>
-  <div class="hdr-title"><span id="botFlag"></span> visa bot <span>#${botId}</span><span class="cursor">_</span></div>
+  <div class="hdr-title"><span id="botFlag"></span> visa bot <span>#${botId}</span><span class="cursor">_</span><span id="cfgBtn" class="cfg-gear" onclick="openCfgModal()" title="configuracion">&#x2699;</span></div>
   <div class="hdr-clock" id="clock">--:--:--</div>
 </div>
 
@@ -2509,6 +2579,72 @@ function showToast(msg,ok){
   t.textContent=msg;t.className='toast show '+(ok?'toast-ok':'toast-err');
   setTimeout(function(){t.className='toast'},3000);
 }
+
+/* -- Config Modal -- */
+var cfgSavedRanges=null;
+var cfgPendingRanges=null;
+var cfgSavedTarget=null;
+
+function openCfgModal(){
+  if(!lastBot)return;
+  cfgSavedTarget=lastBot.targetDateBefore||null;
+  cfgSavedRanges=JSON.parse(JSON.stringify(lastBot.excludedDateRanges||[]));
+  cfgPendingRanges=JSON.parse(JSON.stringify(cfgSavedRanges));
+  var ov=document.createElement('div');
+  ov.id='cfgOverlay';ov.className='cfg-overlay';
+  ov.onclick=function(){closeCfgModal()};
+  document.body.appendChild(ov);
+  var panel=document.createElement('div');
+  panel.id='cfgPanel';panel.className='cfg-panel';
+  panel.onclick=function(e){e.stopPropagation()};
+  panel.innerHTML=
+    '<div class="cfg-hdr">'+
+      '<span class="cfg-title">configuracion</span>'+
+      '<button class="cfg-close" onclick="closeCfgModal()" title="cerrar">&times;</button>'+
+    '</div>'+
+    '<div class="cfg-section" id="cfgSectionA">'+
+      '<div class="cfg-section-title">fecha limite</div>'+
+      '<div class="cfg-section-desc">Solo reagendar a fechas anteriores a esta. Dejar vacio para sin limite.</div>'+
+      '<div id="cfgTargetContent"></div>'+
+    '</div>'+
+    '<div class="cfg-section" id="cfgSectionB">'+
+      '<div class="cfg-section-title">fechas excluidas<span id="cfgUnsaved" class="cfg-unsaved" style="display:none">(sin guardar)</span></div>'+
+      '<div class="cfg-section-desc">Rangos de fechas que el bot debe ignorar al reagendar.</div>'+
+      '<div id="cfgRangesContent"></div>'+
+    '</div>';
+  document.body.appendChild(panel);
+  document.body.style.overflow='hidden';
+  requestAnimationFrame(function(){
+    requestAnimationFrame(function(){panel.classList.add('open')});
+  });
+  document.addEventListener('keydown',cfgEscHandler);
+}
+
+function cfgHasUnsavedChanges(){
+  var panel=document.getElementById('cfgPanel');
+  if(!panel)return false;
+  var inp=document.getElementById('cfgDateInput');
+  if(inp&&inp.value!==(cfgSavedTarget||''))return true;
+  if(JSON.stringify(cfgPendingRanges)!==JSON.stringify(cfgSavedRanges))return true;
+  return false;
+}
+
+function closeCfgModal(){
+  if(cfgHasUnsavedChanges()){
+    if(!confirm('Hay cambios sin guardar. Cerrar de todos modos?'))return;
+  }
+  var panel=document.getElementById('cfgPanel');
+  var ov=document.getElementById('cfgOverlay');
+  if(panel){
+    panel.classList.remove('open');
+    setTimeout(function(){panel.remove()},200);
+  }
+  if(ov)ov.remove();
+  document.body.style.overflow='';
+  document.removeEventListener('keydown',cfgEscHandler);
+}
+
+function cfgEscHandler(e){if(e.key==='Escape')closeCfgModal()}
 
 /* ── CAS Changes ── */
 function renderCasChanges(logs){
