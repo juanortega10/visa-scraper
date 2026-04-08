@@ -256,6 +256,27 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .fh-rs-ok{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .fh-rs-fail{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 .fh-rs-none{color:var(--dim);border:1px solid var(--border)}
+.fh-filter{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 11px;margin-bottom:2px}
+.fh-filter-chips{display:flex;gap:4px;flex-shrink:0}
+.fh-chip{font-size:9px;font-weight:700;padding:3px 8px;border-radius:4px;cursor:pointer;border:1px solid var(--border);
+  background:var(--surface);color:var(--muted);letter-spacing:.3px;transition:all .15s;user-select:none;text-transform:uppercase}
+.fh-chip.active{background:rgba(99,102,241,.18);color:var(--accent);border-color:var(--accent)}
+.fh-chip-paused.active{background:rgba(156,163,175,.12);color:#9ca3af;border-color:#9ca3af}
+.fh-search{flex:1;min-width:100px;font-family:inherit;font-size:9px;padding:3px 8px;
+  background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--fg);outline:none;
+  transition:border-color .15s;letter-spacing:.2px}
+.fh-search::placeholder{color:var(--dim)}
+.fh-search:focus{border-color:var(--accent)}
+.fh-count{font-size:8px;color:var(--muted);flex-shrink:0;white-space:nowrap}
+.fh-row-paused{opacity:.55}
+.fh-top{display:flex;align-items:center;gap:6px;margin-bottom:4px;min-width:0}
+.fh-bot{display:flex;align-items:center;gap:9px}
+.fh-dates{display:flex;flex-direction:column;gap:1px;text-align:right;flex-shrink:0;font-size:8px}
+.fh-date-lbl{color:var(--dim);text-transform:uppercase;letter-spacing:.3px;font-size:7px}
+.fh-date-cur{color:var(--bright);font-weight:700}
+.fh-date-orig{color:var(--muted)}
+.fh-status-badge{font-size:7px;font-weight:700;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0}
+.fh-status-paused{background:rgba(156,163,175,.12);color:#9ca3af;border:1px solid #9ca3af}
 
 </style>
 </head>
@@ -319,18 +340,107 @@ function limitBar(count,max){
   return '<span class="limits">'+count+'/'+max+' <span class="bar"><span class="fill" style="width:'+pct+'%;background:'+color+'"></span></span></span>';
 }
 
-function renderFleetHealth(bots,health,events,health1h){
-  var active=bots.filter(function(b){return b.status==='active';});
-  if(!active.length){document.getElementById('fleet-health').innerHTML='';return;}
-  active.sort(function(a,b){return a.id-b.id;});
-  var html='<div class="fh-hdr">salud</div>';
+function timeAgo(iso){
+  if(!iso)return '';
+  var ms=Date.now()-new Date(iso).getTime();
+  var m=Math.floor(ms/60000);
+  if(m<60)return m+'m';
+  var h=Math.floor(m/60);
+  if(h<24)return h+'h';
+  return Math.floor(h/24)+'d';
+}
+
+/* Fleet health filter state — persists across 60s refreshes */
+var _fhFilter={status:'active',search:''};
+
+function renderFleetHealth(bots,health,events,health1h,uptime){
+  var container=document.getElementById('fleet-health');
+  if(!bots.length){container.innerHTML='';return;}
+
+  /* Build persistent filter bar (only once) */
+  if(!document.getElementById('fh-filter-bar')){
+    container.innerHTML='<div id="fh-filter-bar" class="fh-filter">'
+      +'<div class="fh-filter-chips">'
+        +'<span class="fh-chip" data-st="all" data-action="filter">Todos</span>'
+        +'<span class="fh-chip active" data-st="active" data-action="filter">Activos</span>'
+        +'<span class="fh-chip fh-chip-paused" data-st="paused" data-action="filter">Pausados</span>'
+      +'</div>'
+      +'<input id="fh-search" class="fh-search" type="text" placeholder="buscar wa: o correo...">'
+      +'<span id="fh-count" class="fh-count"></span>'
+      +'</div>'
+      +'<div id="fh-hdr-row"></div>'
+      +'<div id="fh-rows"></div>';
+    container.addEventListener('click',function(e){
+      var chip=e.target.closest('[data-action="filter"]');
+      if(chip)setFhStatus(chip.getAttribute('data-st'));
+    });
+    var searchEl=document.getElementById('fh-search');
+    if(searchEl)searchEl.addEventListener('input',function(){_fhFilter.search=this.value;if(window._fhLastArgs)applyFhFilter.apply(null,window._fhLastArgs);});
+  }
+
+  applyFhFilter(bots,health,events,health1h,uptime);
+}
+
+function setFhStatus(st){
+  _fhFilter.status=st;
+  document.querySelectorAll('.fh-chip').forEach(function(el){
+    el.classList.toggle('active',el.getAttribute('data-st')===st);
+  });
+  if(window._fhLastArgs)applyFhFilter.apply(null,window._fhLastArgs);
+}
+
+function applyFhFilter(bots,health,events,health1h,uptime){
+  var q=(_fhFilter.search||'').toLowerCase().trim();
+  var st=_fhFilter.status;
+  var eligible=bots.filter(function(b){return b.status==='active'||b.status==='paused';});
+  var visible=eligible.filter(function(b){
+    if(st==='active'&&b.status!=='active')return false;
+    if(st==='paused'&&b.status!=='paused')return false;
+    if(q){
+      var phone=(b.notificationPhone||'').toLowerCase();
+      var email=(b.ownerEmail||'').toLowerCase();
+      if(phone.indexOf(q)===-1&&email.indexOf(q)===-1)return false;
+    }
+    return true;
+  });
+  renderFleetHealthRows(visible,eligible,health,events,health1h,uptime);
+}
+
+function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
+  window._fhLastArgs=[allBots,health,events,health1h,uptime];
+
+  visible.sort(function(a,b){
+    var h1a=(health1h&&health1h[a.id])||{total:0,ok:0};
+    var h1b=(health1h&&health1h[b.id])||{total:0,ok:0};
+    var pctA=h1a.total>0?h1a.ok/h1a.total:1;
+    var pctB=h1b.total>0?h1b.ok/h1b.total:1;
+    var cautionA=(h1a.total>0&&pctA<0.5)||h1a.total===0?1:0;
+    var cautionB=(h1b.total>0&&pctB<0.5)||h1b.total===0?1:0;
+    if(cautionA!==cautionB)return cautionB-cautionA;
+    if(pctA!==pctB)return pctA-pctB;
+    return a.id-b.id;
+  });
+
+  var cautionCount=visible.filter(function(b){
+    if(b.status!=='active')return false;
+    var h=health1h&&health1h[b.id];
+    return !h||h.total===0||(h.total>0&&Math.round(h.ok/h.total*100)<50);
+  }).length;
+
+  var hdrEl=document.getElementById('fh-hdr-row');
+  if(hdrEl)hdrEl.innerHTML='<div class="fh-hdr">salud'+(cautionCount>0?' <span style="color:var(--amber);font-size:10px;margin-left:6px">\u26A0 '+cautionCount+' en precaución</span>':'')+'</div>';
+
+  var countEl=document.getElementById('fh-count');
+  if(countEl)countEl.textContent=visible.length+' / '+allBots.length;
 
   function barColor(pct){
     if(pct===null)return'var(--dim)';
     return pct>=80?'var(--green)':pct>=50?'var(--amber)':'var(--red)';
   }
 
-  active.forEach(function(b){
+  var html='';
+  visible.forEach(function(b){
+    var isPaused=b.status==='paused';
     var p24=health[b.id]||{total:0,ok:0,tcp:0};
     var p1=(health1h&&health1h[b.id])||{total:0,ok:0,tcp:0};
 
@@ -339,47 +449,71 @@ function renderFleetHealth(bots,health,events,health1h){
     var col1=barColor(pct1);
     var col24=barColor(pct24);
 
-    /* 1h bar */
     var pctTxt1=pct1!==null?'<span style="color:'+col1+'">'+pct1+'%</span>':'<span style="color:var(--dim)">--</span>';
-    var meta1=p1.total>0?'<span class="fh-meta">'+p1.total+'p</span>':'<span class="fh-meta" style="color:var(--dim)">sin polls</span>';
+    var ppm1=p1.total>0?(p1.total/60).toFixed(1):'';
+    var meta1=p1.total>0?'<span class="fh-meta">'+p1.total+'p <span style="color:var(--cyan)">'+ppm1+'/m</span></span>':'<span class="fh-meta" style="color:var(--dim)">sin polls</span>';
 
-    /* 24h bar */
+    var ut=uptime&&uptime[b.id]?uptime[b.id]:{totalBuckets:0,okBuckets:0};
+    var uptimePct=ut.totalBuckets>0?Math.round(ut.okBuckets/ut.totalBuckets*100):null;
+    var uptimeCol=barColor(uptimePct);
     var pctTxt24=pct24!==null?'<span style="color:'+col24+'">'+pct24+'%</span>':'<span style="color:var(--dim)">--</span>';
+    var uptimeTxt=uptimePct!==null?' <span style="color:'+uptimeCol+'">up:'+uptimePct+'%</span>':'';
+    var ppm24=p24.total>0?(p24.total/1440).toFixed(1):'';
     var tcpStr=p24.tcp>0?' <span style="color:var(--red)">'+p24.tcp+' tcp</span>':'';
-    var meta24=p24.total>0?'<span class="fh-meta">'+p24.total+'p'+tcpStr+'</span>':'<span class="fh-meta" style="color:var(--dim)">--</span>';
+    var meta24=p24.total>0?'<span class="fh-meta">'+p24.total+'p <span style="color:var(--cyan)">'+ppm24+'/m</span>'+tcpStr+uptimeTxt+'</span>':'<span class="fh-meta" style="color:var(--dim)">--</span>';
 
-    /* rsPill */
     var ev=events[b.id];
     var rsPill;
     if(ev&&ev.successes&&ev.successes.length>0){
-      rsPill='<span class="fh-rs fh-rs-ok">\u2713 '+fmtEvDate(ev.successes[0].date)+'</span>';
+      rsPill='<span class="fh-rs fh-rs-ok">\u2713 '+fmtEvDate(ev.successes[0].date)+' <span style="opacity:.6;font-size:7px">'+timeAgo(ev.successes[0].at)+'</span></span>';
     }else if(ev&&ev.failedCount>0){
       rsPill='<span class="fh-rs fh-rs-fail">\u2717 '+ev.failedCount+(ev.failedCount>1?' fallos':' fallo')+'</span>';
     }else{
       rsPill='<span class="fh-rs fh-rs-none">\u2014</span>';
     }
 
-    var ownerTxt=b.ownerEmail?'<span class="fh-owner">'+b.ownerEmail.split('@')[0]+'</span>':'';
-    var phoneTxt=b.notificationPhone?'<span class="fh-phone">wa:'+b.notificationPhone.slice(-4)+'</span>':'';
-    html+='<div class="fh-row">'
-      +'<a href="/dashboard/'+b.id+'" class="fh-bid">#'+b.id+ownerTxt+phoneTxt+'</a>'
-      +'<span class="fh-bar-wrap">'
-        +'<div class="fh-win-row">'
-          +'<span class="fh-win">1h</span>'
-          +'<span class="fh-pct">'+pctTxt1+'</span>'
-          +'<div class="fh-bar"><div class="fh-fill" style="width:'+(pct1||0)+'%;background:'+col1+'"></div></div>'
-          +meta1
-        +'</div>'
-        +'<div class="fh-win-row">'
-          +'<span class="fh-win">24h</span>'
-          +'<span class="fh-pct">'+pctTxt24+'</span>'
-          +'<div class="fh-bar"><div class="fh-fill" style="width:'+(pct24||0)+'%;background:'+col24+'"></div></div>'
-          +meta24
-        +'</div>'
-      +'</span>'
-      +rsPill+'</div>';
+    var curD=b.currentConsularDate?fmtD(b.currentConsularDate):null;
+    var origD=b.originalConsularDate?fmtD(b.originalConsularDate):null;
+    var datesDifferent=curD&&origD&&curD!==origD;
+    var datesPanel='<div class="fh-dates">'
+      +(curD?'<span class="fh-date-cur">'+curD+'</span>':'<span class="fh-date-cur" style="color:var(--dim)">sin cita</span>')
+      +(datesDifferent?'<span class="fh-date-orig">\u2192 '+origD+'</span>':'')
+    +'</div>';
+
+    var statusBadge=isPaused?'<span class="fh-status-badge fh-status-paused">PAUSED</span>':'';
+    var caution=!isPaused&&((p1.total>0&&pct1!==null&&pct1<50)||p1.total===0);
+    var ownerTxt=b.ownerEmail?' <span class="fh-owner">'+b.ownerEmail.split('@')[0]+'</span>':'';
+    var phoneTxt=b.notificationPhone?' <span class="fh-phone">wa:'+b.notificationPhone.slice(-4)+'</span>':'';
+
+    html+='<div class="fh-row'+(isPaused?' fh-row-paused':'')+'"'+(caution?' style="border-left:2px solid var(--amber);padding-left:9px"':'')+'>'
+      +'<div class="fh-top">'
+        +'<a href="/dashboard/'+b.id+'" class="fh-bid">'+(caution?'\u26A0 ':'')+'#'+b.id+ownerTxt+phoneTxt+'</a>'
+        +statusBadge
+        +'<span style="flex:1"></span>'
+        +datesPanel
+        +rsPill
+      +'</div>'
+      +'<div class="fh-bot">'
+        +'<span class="fh-bar-wrap">'
+          +'<div class="fh-win-row">'
+            +'<span class="fh-win">1h</span>'
+            +'<span class="fh-pct">'+pctTxt1+'</span>'
+            +'<div class="fh-bar"><div class="fh-fill" style="width:'+(pct1||0)+'%;background:'+col1+'"></div></div>'
+            +meta1
+          +'</div>'
+          +'<div class="fh-win-row">'
+            +'<span class="fh-win">24h</span>'
+            +'<span class="fh-pct">'+pctTxt24+'</span>'
+            +'<div class="fh-bar"><div class="fh-fill" style="width:'+(pct24||0)+'%;background:'+col24+'"></div></div>'
+            +meta24
+          +'</div>'
+        +'</span>'
+      +'</div>'
+    +'</div>';
   });
-  document.getElementById('fleet-health').innerHTML=html;
+
+  var rowsEl=document.getElementById('fh-rows');
+  if(rowsEl)rowsEl.innerHTML=html||'<div class="empty-msg" style="padding:8px 11px;font-size:10px;color:var(--dim)">sin bots que coincidan</div>';
 }
 
 function renderBotList(bots,events){
@@ -473,7 +607,7 @@ async function load(){
       '<div class="stat"><div class="stat-val">'+bots.length+'</div><div class="stat-lbl">bots</div></div>'+
       '<div class="stat"><div class="stat-val">'+active+'</div><div class="stat-lbl">activos</div></div>'+
       '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>';
-    renderFleetHealth(bots,health,events,health1h);
+    renderFleetHealth(bots,health,events,health1h,data.uptime||null);
     renderBotList(bots,events);
   }catch(e){
     console.error('fetch error',e);
