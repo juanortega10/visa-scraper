@@ -12,7 +12,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 
 - [x] **Phase 1: Cross-Poll Failure Tracker Migration** — Migrate `dateCooldowns` from task payload to `casCacheJson.dateFailureTracking`, relax reset rule, add CAS escape hatch, delete dead code.
 - [x] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
-- [ ] **Phase 3: Bot Config Editor** — Modal desde bot-detail para editar `targetDateBefore` y rangos de exclusión, con mini-calendar range picker y validación de disponibilidad pre-save.
+- [x] **Phase 3: Bot Config Editor** — Modal desde bot-detail para editar `targetDateBefore` y rangos de exclusión, con mini-calendar range picker y validación de disponibilidad pre-save. (completed 2026-04-08)
 
 ## Phase Details
 
@@ -47,7 +47,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 |-------|----------------|--------|-----------|
 | 1. Cross-Poll Failure Tracker Migration | 3/3 | Complete | 2026-04-07 |
 | 2. Tracker Dashboard | 0/? | Not started | - |
-| 3. Bot Config Editor | 0/3 | Planned | - |
+| 3. Bot Config Editor | 3/3 | Complete   | 2026-04-08 |
 
 ## Coverage Validation
 
@@ -102,7 +102,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 4. Validación bloquea save si 0 fechas quedarían disponibles
 5. `npm test` verde sin regresiones
 
-**Plans:** 3 plans
+**Plans:** 3/3 plans complete
 - [ ] 03-01-PLAN.md — Backend available-dates endpoint + gear button + modal scaffold + all .cfg- CSS classes
 - [ ] 03-02-PLAN.md — targetDateBefore section: date input, save with validation, clear with confirmation
 - [ ] 03-03-PLAN.md — Excluded ranges section: range list/remove, mini-calendar picker, save with validation + human verification
