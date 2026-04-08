@@ -776,6 +776,46 @@ botsRouter.get('/auth-logs', async (c) => {
   })));
 });
 
+// Manual tracker unblock — remove a single date entry from dateFailureTracking
+botsRouter.delete('/:id/tracker/:date', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  if (isNaN(id)) return c.json({ error: 'Invalid bot ID' }, 400);
+  const date = c.req.param('date');
+  const [bot] = await db.select({ casCacheJson: bots.casCacheJson }).from(bots).where(eq(bots.id, id));
+  if (!bot) return c.json({ error: 'Bot not found' }, 404);
+  const cache = bot.casCacheJson as CasCacheData | null;
+  const tracking = cache?.dateFailureTracking ?? {};
+  if (!tracking[date]) return c.json({ error: 'Date not in tracker' }, 404);
+  await db.update(bots).set({
+    casCacheJson: sql`jsonb_set(
+      coalesce(${bots.casCacheJson}, '{}'::jsonb),
+      '{dateFailureTracking}',
+      coalesce(${bots.casCacheJson}->'dateFailureTracking', '{}'::jsonb) - ${date}
+    )`,
+    updatedAt: new Date(),
+  }).where(eq(bots.id, id));
+  return c.json({ ok: true });
+});
+
+// Manual tracker clear — wipe all dateFailureTracking entries
+botsRouter.delete('/:id/tracker', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  if (isNaN(id)) return c.json({ error: 'Invalid bot ID' }, 400);
+  const [bot] = await db.select({ casCacheJson: bots.casCacheJson }).from(bots).where(eq(bots.id, id));
+  if (!bot) return c.json({ error: 'Bot not found' }, 404);
+  const cache = bot.casCacheJson as CasCacheData | null;
+  const cleared = Object.keys(cache?.dateFailureTracking ?? {}).length;
+  await db.update(bots).set({
+    casCacheJson: sql`jsonb_set(
+      coalesce(${bots.casCacheJson}, '{}'::jsonb),
+      '{dateFailureTracking}',
+      '{}'::jsonb
+    )`,
+    updatedAt: new Date(),
+  }).where(eq(bots.id, id));
+  return c.json({ ok: true, cleared });
+});
+
 // Get bot
 botsRouter.get('/:id', async (c) => {
   const id = parseInt(c.req.param('id'));
