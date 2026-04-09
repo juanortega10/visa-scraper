@@ -33,7 +33,7 @@ export const rescheduleVisaTask = task({
       currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
       casCacheJson: bots.casCacheJson,
       targetDateBefore: bots.targetDateBefore,
-      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback,
     }).from(bots).where(eq(bots.id, botId));
     if (!bot) throw new Error(`Bot ${botId} not found`);
     logger.info('Bot loaded', { botId, locale: bot.locale, consularFacility: bot.consularFacilityId, ascFacility: bot.ascFacilityId });

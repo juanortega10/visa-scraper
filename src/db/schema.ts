@@ -106,6 +106,7 @@ export const bots = pgTable(
     rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
+    speculativeTimeFallback: boolean('speculative_time_fallback').notNull().default(false), // true = try historical times when getConsularTimes returns empty (no-CAS only)
     pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
     targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),

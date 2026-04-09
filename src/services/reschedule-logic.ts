@@ -20,7 +20,12 @@ export interface RescheduleBot {
   targetDateBefore?: string | null;
   maxCasGapDays?: number | null;
   skipCas?: boolean;
+  speculativeTimeFallback?: boolean;
 }
+
+// Historical times seen at Lima facility 115 (es-pe). Used as fallback when
+// getConsularTimes returns empty for phantom dates. Order: most recent first.
+const SPECULATIVE_TIMES = ['10:15', '10:00', '07:30'];
 
 export interface RescheduleAttempt {
   date: string;
@@ -403,6 +408,14 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       const consularTimes = filterTimes(candidate.date, consularTimesData.available_times?.filter((t): t is string => !!t) ?? [], timeExclusions)
         .reverse(); // Try later times first — less competed than early morning slots
       logger.info('Consular times (reversed)', { botId, date: candidate.date, available: consularTimesData.available_times, afterFilter: consularTimes });
+      let isSpeculative = false;
+      if (consularTimes.length === 0 && !needsCas && bot.speculativeTimeFallback) {
+        consularTimes.push(...SPECULATIVE_TIMES);
+        isSpeculative = true;
+        logger.warn('No consular times -- using speculative fallback', {
+          botId, date: candidate.date, speculativeTimes: SPECULATIVE_TIMES,
+        });
+      }
       if (consularTimes.length === 0) {
         logger.warn('No consular times, re-fetching days', { botId });
         failedAttempts.push({ date: candidate.date, failReason: 'no_times', durationMs: Date.now() - attemptStart });
@@ -430,6 +443,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           logger.info('POSTING reschedule (no CAS)', {
             botId,
             consular: `${candidate.date} ${consularTime}`,
+            speculative: isSpeculative,
           });
 
           const postSuccess = await client.reschedule(candidate.date, consularTime);
@@ -443,7 +457,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
                 oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                 newConsularDate: candidate.date, newConsularTime: consularTime,
-                success: false, error: 'post_returned_false',
+                success: false, error: isSpeculative ? 'post_returned_false (speculative)' : 'post_returned_false',
               }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
             );
             failedAttempts.push({ date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
@@ -467,7 +481,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                   oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
                   oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                   newConsularDate: candidate.date, newConsularTime: consularTime,
-                  success: false, error: 'false_positive_verification',
+                  success: false, error: isSpeculative ? 'false_positive_verification (speculative)' : 'false_positive_verification',
                 }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
               );
               failedAttempts.push({ date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
@@ -487,7 +501,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             continue; // Try next time/date (slot still claimed for this date)
           }
 
-          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}`;
+          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isSpeculative ? ' (speculative)' : ''}`;
           pending.push(
             db.insert(rescheduleLogs).values({
               botId,

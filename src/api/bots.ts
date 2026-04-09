@@ -859,6 +859,7 @@ botsRouter.get('/:id', async (c) => {
     maxCasGapDays: bots.maxCasGapDays,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     skipCas: bots.skipCas,
+    speculativeTimeFallback: bots.speculativeTimeFallback,
     consecutiveErrors: bots.consecutiveErrors,
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
@@ -918,6 +919,7 @@ botsRouter.get('/:id', async (c) => {
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
     skipCas: bot.skipCas,
+    speculativeTimeFallback: bot.speculativeTimeFallback,
     notificationEmail: bot.notificationEmail ?? null,
     ownerEmail: bot.ownerEmail ?? null,
     notificationPhone: bot.notificationPhone ?? null,
@@ -982,6 +984,7 @@ botsRouter.put('/:id', async (c) => {
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;
   if (body.skipCas !== undefined) updates.skipCas = !!body.skipCas;
+  if (body.speculativeTimeFallback !== undefined) updates.speculativeTimeFallback = !!body.speculativeTimeFallback;
   if (body.notificationPhone !== undefined) updates.notificationPhone = body.notificationPhone;
   if (body.visaPassword !== undefined) updates.visaPassword = encrypt(body.visaPassword);
   await db.update(bots).set(updates).where(eq(bots.id, id));
