@@ -420,3 +420,243 @@ describe('Fix 3 — repeatedlyFailingDates (3+ failures → 1h cooldown)', () =>
     expect(result.repeatedlyFailingDates ?? []).not.toContain('2026-04-09');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speculative time fallback (no-CAS path, gated by bot.speculativeTimeFallback)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('Speculative time fallback', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  // Bot configured for no-CAS path WITH speculative fallback enabled
+  const SPECULATIVE_BOT: RescheduleBot = {
+    ...BASE_BOT,
+    ascFacilityId: '', // no CAS → no-CAS path
+    speculativeTimeFallback: true,
+  };
+
+  it('Test 1: uses SPECULATIVE_TIMES when getConsularTimes returns empty AND needsCas=false AND speculativeTimeFallback=true', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      getCurrentAppointment: vi.fn().mockResolvedValue({
+        consularDate: '2026-04-09',
+        consularTime: '10:15',
+      }),
+    });
+
+    setupDbMocks();
+
+    const result = await executeReschedule({
+      client,
+      botId: 7,
+      bot: SPECULATIVE_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    // Speculative fallback should have triggered — client.reschedule called with one of the speculative times
+    expect(client.reschedule).toHaveBeenCalled();
+    const calledTime = client.reschedule.mock.calls[0]![1];
+    expect(['10:15', '10:00', '07:30']).toContain(calledTime);
+  });
+
+  it('Test 2: speculative fallback does NOT activate for CAS bots (needsCas=true)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn(),
+    });
+
+    setupDbMocks();
+
+    const result = await executeReschedule({
+      client,
+      botId: 42,
+      bot: { ...BASE_BOT, ascFacilityId: '26', speculativeTimeFallback: true }, // CAS bot
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    // Should NOT have called reschedule (no speculative fallback for CAS bots)
+    expect(client.reschedule).not.toHaveBeenCalled();
+    // Should get no_times failure
+    expect(result.attempts?.some(a => a.failReason === 'no_times')).toBe(true);
+  });
+
+  it('Test 3: speculative fallback does NOT activate when speculativeTimeFallback=false', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn(),
+    });
+
+    setupDbMocks();
+
+    const result = await executeReschedule({
+      client,
+      botId: 7,
+      bot: { ...SPECULATIVE_BOT, speculativeTimeFallback: false },
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    expect(client.reschedule).not.toHaveBeenCalled();
+    expect(result.attempts?.some(a => a.failReason === 'no_times')).toBe(true);
+  });
+
+  it('Test 4: speculative fallback does NOT activate when speculativeTimeFallback is undefined', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn(),
+    });
+
+    setupDbMocks();
+
+    const result = await executeReschedule({
+      client,
+      botId: 7,
+      bot: { ...BASE_BOT, ascFacilityId: '' }, // no speculativeTimeFallback field at all
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    expect(client.reschedule).not.toHaveBeenCalled();
+  });
+
+  it('Test 5: dryRun=true blocks speculative POST', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn(),
+    });
+
+    // dryRun returns early with mock data, so speculative never fires
+    const result = await executeReschedule({
+      client,
+      botId: 7,
+      bot: SPECULATIVE_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: true,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    // dryRun produces a mock success; real reschedule is never called
+    expect(client.reschedule).not.toHaveBeenCalled();
+  });
+
+  it('Test 6: speculative times are logged with speculative marker in reschedule_logs', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn().mockResolvedValue(false), // POST fails
+    });
+
+    setupDbMocks();
+
+    const insertedValues: any[] = [];
+    mockDbInsert.mockImplementation(() => {
+      const c = chain([]);
+      const origValues = c.values.bind(c);
+      c.values = (v: any) => { insertedValues.push(v); return origValues(v); };
+      return c;
+    });
+
+    await executeReschedule({
+      client,
+      botId: 7,
+      bot: SPECULATIVE_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    // At least one reschedule_logs insert should have speculative marker
+    const speculativeLog = insertedValues.find(v => v.error && typeof v.error === 'string' && v.error.includes('speculative'));
+    expect(speculativeLog).toBeDefined();
+  });
+
+  it('Test 7: when getConsularTimes returns actual times, speculative fallback is NOT used', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00', '09:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      getCurrentAppointment: vi.fn().mockResolvedValue({
+        consularDate: '2026-04-09',
+        consularTime: '09:00',
+      }),
+    });
+
+    setupDbMocks();
+
+    const insertedValues: any[] = [];
+    mockDbInsert.mockImplementation(() => {
+      const c = chain([]);
+      const origValues = c.values.bind(c);
+      c.values = (v: any) => { insertedValues.push(v); return origValues(v); };
+      return c;
+    });
+
+    await executeReschedule({
+      client,
+      botId: 7,
+      bot: SPECULATIVE_BOT,
+      dateExclusions: [],
+      timeExclusions: [],
+      preFetchedDays: BETTER_DAYS,
+      casCacheJson: null,
+      dryRun: false,
+      maxAttempts: 3,
+      pending: [],
+    });
+
+    // Reschedule was called with actual time, not speculative
+    expect(client.reschedule).toHaveBeenCalled();
+    const calledTime = client.reschedule.mock.calls[0]![1];
+    expect(['08:00', '09:00']).toContain(calledTime);
+
+    // No speculative marker in any log
+    const speculativeLog = insertedValues.find(v => v.error && typeof v.error === 'string' && v.error.includes('speculative'));
+    expect(speculativeLog).toBeUndefined();
+  });
+});
