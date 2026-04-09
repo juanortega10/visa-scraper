@@ -13,6 +13,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 - [x] **Phase 1: Cross-Poll Failure Tracker Migration** — Migrate `dateCooldowns` from task payload to `casCacheJson.dateFailureTracking`, relax reset rule, add CAS escape hatch, delete dead code.
 - [x] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
 - [x] **Phase 3: Bot Config Editor** — Modal desde bot-detail para editar `targetDateBefore` y rangos de exclusión, con mini-calendar range picker y validación de disponibilidad pre-save. (completed 2026-04-08)
+- [ ] **Phase 4: Bot 7 Peru - research y plan para lograr reagendamiento exitoso** — Diagnose phantom dates, fix verification parser for es-pe, add speculative time fallback, switch to direct provider. (planned 2026-04-09)
 
 ## Phase Details
 
@@ -48,6 +49,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 | 1. Cross-Poll Failure Tracker Migration | 3/3 | Complete | 2026-04-07 |
 | 2. Tracker Dashboard | 0/? | Not started | - |
 | 3. Bot Config Editor | 3/3 | Complete   | 2026-04-08 |
+| 4. Bot 7 Peru Optimization | 0/3 | Planned | - |
 
 ## Coverage Validation
 
@@ -106,6 +108,28 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 - [ ] 03-01-PLAN.md — Backend available-dates endpoint + gear button + modal scaffold + all .cfg- CSS classes
 - [ ] 03-02-PLAN.md — targetDateBefore section: date input, save with validation, clear with confirmation
 - [ ] 03-03-PLAN.md — Excluded ranges section: range list/remove, mini-calendar picker, save with validation + human verification
+
+### Phase 4: Bot 7 Peru - research y plan para lograr reagendamiento exitoso
+
+**Goal**: Optimize Bot 7 (es-pe) to successfully reschedule by diagnosing phantom dates, fixing the verification parser for Peru, adding speculative time fallback, and switching to direct provider for lower latency.
+
+**Depends on:** Phase 3
+
+**Requirements**: DIAG-01, DIAG-02, FIX-01, FIX-02, FIX-03, TEST-01, CONFIG-01, CONFIG-02, VERIFY-01
+
+**Success Criteria**:
+1. Diagnostic logging captures raw times.json response and days-to-times latency for every reschedule attempt
+2. followRedirectChain recognizes Peru portal confirmation patterns (not just Colombia)
+3. Speculative time fallback tries historical times (10:15, 10:00, 07:30) when getConsularTimes returns empty for es-pe
+4. Bot 7 uses direct provider (lower latency than webshare)
+5. targetDateBefore widened to 2026-07-01 for more date sighting opportunities
+6. All tests pass (no regressions)
+7. Bot 7 poll chain is active and healthy after changes
+
+**Plans:** 3 plans
+- [ ] 04-01-PLAN.md — Diagnostic logging + Peru verification fix (visa-client.ts, reschedule-logic.ts)
+- [ ] 04-02-PLAN.md — Speculative time fallback for no-CAS path (reschedule-logic.ts + tests)
+- [ ] 04-03-PLAN.md — Deploy to RPi + switch Bot 7 config (direct provider, wider target window) + health verification
 
 ---
 *Roadmap created: 2026-04-06*
