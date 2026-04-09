@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-04-08T22:44:02.857Z"
+last_updated: "2026-04-09T17:56:16.165Z"
 progress:
-  total_phases: 3
+  total_phases: 4
   completed_phases: 3
-  total_plans: 9
-  completed_plans: 9
+  total_plans: 12
+  completed_plans: 10
 ---
 
 # STATE: visa-scraper — Cross-Poll Failure Tracker Migration
@@ -22,10 +22,10 @@ progress:
 ## Current Position
 
 - **Milestone**: Cross-Poll Failure Tracker Migration + Dashboard + Config Editor
-- **Phase**: 3 — Bot Config Editor (COMPLETE)
-- **Current Plan**: All plans complete
-- **Status**: Phase 03 complete; config modal fully functional (targetDateBefore + excluded ranges + calendar picker)
-- **Progress**: `[██████████] 100%` overall (9/9 plans)
+- **Phase**: 4 — Bot 7 Peru Research y Plan
+- **Current Plan**: 04-02 (04-01 complete)
+- **Status**: Phase 04 Plan 01 complete; diagnostic instrumentation + Peru verification diagnostics
+- **Progress**: `[████████░░] 83%` overall (10/12 plans)
 
 ## Performance Metrics
 
@@ -40,6 +40,7 @@ progress:
 | Phase 02 P01 | 4min | 2 tasks | 2 files |
 | Phase 03 P01 | 2min | 2 tasks | 2 files |
 | Phase 03 P03 | 12min | 3 tasks | 1 files |
+| Phase 04 P01 | 4min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,12 +74,19 @@ progress:
 ### Roadmap Evolution
 
 - Phase 2 added: Tracker Dashboard — failure tracker tab + landing summary
+- Phase 4 added: Bot 7 Peru - research y plan para lograr reagendamiento exitoso
 
 ### Phase 2 Decisions (added 2026-04-08 during 02-01)
 
 - `trackerSummary.blockedCount` computed at request-time in JS (not SQL) — keeps /landing aggregator consistent with existing events/health derivations
 - Clear-all sets `dateFailureTracking={}` rather than removing the key — preserves Phase 1 shape invariant
 - DASH-API-* requirement IDs referenced in 02-01-PLAN.md are NOT yet in REQUIREMENTS.md; traceability gap to address in Phase 2 finalization
+
+### Phase 4 Decisions (added 2026-04-09 during 04-01)
+
+- No guessed Peru patterns added to SUCCESS_PATTERNS — only confirmed patterns; reschedule_logs contained no captured HTML body
+- Added 'scheduled successfully' English fallback alongside es-co pattern
+- Preserved SessionExpiredError semantics in manual text+parse replacement for getConsularTimes diagnostic capture
 
 ### Open Todos
 
@@ -87,7 +95,8 @@ progress:
 - Phase 3 Plan 01 COMPLETE (2026-04-08, 206/206 tests) — modal scaffold + available-dates API
 - Phase 3 Plan 02 COMPLETE (2026-04-08, 206/206 tests) — targetDateBefore section + cfgFilterDates
 - Phase 3 Plan 03 COMPLETE (2026-04-08, 206/206 tests) — excluded ranges + mini-calendar picker
-- ALL PHASES COMPLETE (9/9 plans)
+- ALL PHASES 01-03 COMPLETE (9/9 plans)
+- Phase 04 Plan 01 COMPLETE (2026-04-09) — diagnostic instrumentation + Peru verification diagnostics
 - Backfill DASH-API-01..04 into REQUIREMENTS.md traceability when Phase 2 wraps
 
 ### Blockers
@@ -96,9 +105,9 @@ None.
 
 ## Session Continuity
 
-**Last session**: 2026-04-08 — Completed 03-03-PLAN.md (Phase 03 complete, 9/9 plans).
+**Last session**: 2026-04-09 — Completed 04-01-PLAN.md (diagnostic instrumentation + Peru verification).
 
-**Next session entry point**: All plans complete. Milestone v1.0 finished.
+**Next session entry point**: Continue with 04-02-PLAN.md.
 
 **Files of record**:
 - `.planning/PROJECT.md`
