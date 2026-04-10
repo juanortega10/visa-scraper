@@ -27,5 +27,12 @@ memory/
 # Script outputs (may contain personal HTML captures)
 scripts/output/
 
+# One-off analysis scripts (only core scripts are tracked)
+# Core scripts kept: login.ts, test-fetch.ts, test-reschedule-e2e.ts, monitor.ts,
+#   test-notifications.ts, session-duration-test.ts, session-idle-test.ts,
+#   activate-bot.ts, set-bot-active.ts, set-bot-status.ts, set-bot-provider.ts,
+#   deploy-rpi.sh
+# All other scripts/*.ts are personal/operational and intentionally untracked.
+
 # WhatsApp exports
 WhatsApp*
