@@ -960,16 +960,9 @@ export const pollVisaTask = task({
           const updatedBlocked = { ...activeBlocked };
 
           if (!result.success) {
-            const noCasDates = [...new Set(
-              (result.attempts ?? []).filter(a => a.failReason === 'no_cas_days').map(a => a.date),
-            )];
             const fpDates = result.falsePositiveDates ?? [];
             const rfDates = result.repeatedlyFailingDates ?? [];
-            if (noCasDates.length > 0) {
-              const blockUntil30m = new Date(nowMs + 30 * 60 * 1000).toISOString();
-              for (const d of noCasDates) updatedBlocked[d] = blockUntil30m;
-              logger.info('CAS blocker: blocked dates after no_cas_days', { botId, dates: noCasDates, until: blockUntil30m });
-            }
+            // no_cas_days: no short-term block — cross-poll tracker handles blocking after 5 failures in 1h
             if (fpDates.length > 0) {
               const blockUntil2h = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
               for (const d of fpDates) updatedBlocked[d] = blockUntil2h;
