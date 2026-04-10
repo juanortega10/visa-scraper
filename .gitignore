@@ -5,7 +5,8 @@ dist/
 captures/
 .playwright-mcp/
 .agents/
-.claude/
+.claude/*
+!.claude/commands/
 .firecrawl/
 src/services/__tests__/fixtures/
 
