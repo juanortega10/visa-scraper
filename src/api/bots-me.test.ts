@@ -171,8 +171,6 @@ describe('GET /api/bots/me', () => {
       {
         id: 42,
         status: 'active',
-        isScout: false,
-        isSubscriber: true,
         visaEmail: 'enc_user@example.com',
         scheduleId: '72824354',
         consularFacilityId: '25',
@@ -194,8 +192,6 @@ describe('GET /api/bots/me', () => {
     expect(bot.id).toBe(42);
     expect(bot.visaEmail).toBe('user@example.com'); // decrypted
     expect(bot.status).toBe('active');
-    expect(bot.isScout).toBe(false);
-    expect(bot.isSubscriber).toBe(true);
     expect(bot.scheduleId).toBe('72824354');
     expect(bot.consularFacilityId).toBe('25');
     expect(bot.locale).toBe('es-co');
@@ -212,8 +208,6 @@ describe('GET /api/bots/me', () => {
       {
         id: 10,
         status: 'active',
-        isScout: true,
-        isSubscriber: false,
         visaEmail: 'enc_corrupt', // triggers mock decrypt to throw
         scheduleId: '111',
         consularFacilityId: '25',
@@ -234,8 +228,8 @@ describe('GET /api/bots/me', () => {
   it('returns multiple bots ordered by createdAt DESC', async () => {
     mockVerifyToken.mockResolvedValueOnce({ sub: 'user_multi' });
     mockDbRows([
-      { id: 2, status: 'active', isScout: false, isSubscriber: true, visaEmail: 'enc_b@x.com', scheduleId: '2', consularFacilityId: '25', locale: 'es-co', currentConsularDate: null, currentConsularTime: null, currentCasDate: null, currentCasTime: null, createdAt: '2026-02-15T00:00:00Z' },
-      { id: 1, status: 'paused', isScout: true, isSubscriber: false, visaEmail: 'enc_a@x.com', scheduleId: '1', consularFacilityId: '115', locale: 'es-pe', currentConsularDate: '2027-01-13', currentConsularTime: '09:30', currentCasDate: null, currentCasTime: null, createdAt: '2026-02-10T00:00:00Z' },
+      { id: 2, status: 'active', visaEmail: 'enc_b@x.com', scheduleId: '2', consularFacilityId: '25', locale: 'es-co', currentConsularDate: null, currentConsularTime: null, currentCasDate: null, currentCasTime: null, createdAt: '2026-02-15T00:00:00Z' },
+      { id: 1, status: 'paused', visaEmail: 'enc_a@x.com', scheduleId: '1', consularFacilityId: '115', locale: 'es-pe', currentConsularDate: '2027-01-13', currentConsularTime: '09:30', currentCasDate: null, currentCasTime: null, createdAt: '2026-02-10T00:00:00Z' },
     ]);
 
     const res = await app.request('/api/bots/me', { headers: authHeader() });
@@ -256,8 +250,6 @@ describe('GET /api/bots/me', () => {
       {
         id: 5,
         status: 'active',
-        isScout: true,
-        isSubscriber: false,
         visaEmail: 'enc_test@test.com',
         scheduleId: '999',
         consularFacilityId: '25',
@@ -288,8 +280,6 @@ describe('GET /api/bots/me', () => {
     // Fields that SHOULD be present
     expect(bot).toHaveProperty('id');
     expect(bot).toHaveProperty('status');
-    expect(bot).toHaveProperty('isScout');
-    expect(bot).toHaveProperty('isSubscriber');
     expect(bot).toHaveProperty('visaEmail');
     expect(bot).toHaveProperty('scheduleId');
     expect(bot).toHaveProperty('locale');
@@ -304,8 +294,6 @@ describe('GET /api/bots/me', () => {
       {
         id: 99,
         status: 'login_required',
-        isScout: true,
-        isSubscriber: false,
         visaEmail: 'enc_new@test.com',
         scheduleId: '555',
         consularFacilityId: '115',

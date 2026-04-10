@@ -39,6 +39,8 @@ export interface CasCacheEntry {
   date: string;       // YYYY-MM-DD
   slots: number;      // available_times.length (-1 = error)
   times: string[];    // ["07:00", "07:15", ...] — only if slots > 0
+  forConsularDate?: string;  // consular date this CAS was fetched for (YYYY-MM-DD)
+  forConsularTime?: string;  // consular time used when fetching (HH:MM)
 }
 
 export type FailureDimension = 'consularNoTimes' | 'consularNoDays' | 'casNoTimes' | 'casNoDays';
@@ -92,8 +94,6 @@ export const bots = pgTable(
     status: botStatusEnum('status').notNull().default('created'),
     proxyProvider: proxyProviderEnum('proxy_provider').notNull().default('direct'),
     proxyUrls: jsonb('proxy_urls').$type<string[] | null>(),
-    isScout: boolean('is_scout').notNull().default(false),
-    isSubscriber: boolean('is_subscriber').notNull().default(true),
     userId: varchar('user_id', { length: 20 }),
     activeRunId: varchar('active_run_id', { length: 50 }),
     activeCloudRunId: varchar('active_cloud_run_id', { length: 50 }),

@@ -101,7 +101,7 @@ export const ensureChainSchedule = schedules.task({
   run: async () => {
     // SELECT only columns needed for chain management
     const targetBots = await db.select({
-      id: bots.id, status: bots.status, isScout: bots.isScout,
+      id: bots.id, status: bots.status,
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, locale: bots.locale,

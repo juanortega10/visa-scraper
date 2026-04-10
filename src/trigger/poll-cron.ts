@@ -14,7 +14,7 @@ type Source = 'dev' | 'cloud';
 async function triggerEligibleBots(source: Source): Promise<void> {
   // SELECT only columns needed for cron eligibility — omit casCacheJson, creds, etc.
   const activeBots = await db.select({
-    id: bots.id, status: bots.status, isScout: bots.isScout,
+    id: bots.id, status: bots.status,
     pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     activatedAt: bots.activatedAt,

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
-import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, dispatchLogs, bookableEvents, dateSightings, banEpisodes } from '../db/schema.js';
+import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, bookableEvents, dateSightings, banEpisodes } from '../db/schema.js';
 import { eq, desc, and, gte, lte, sql, isNotNull } from 'drizzle-orm';
 
 export const logsRouter = new Hono();
@@ -462,85 +462,6 @@ logsRouter.get('/bots/:id/logs/cas-prefetch', async (c) => {
     .offset(offset);
 
   return c.json(logs);
-});
-
-// Dispatch logs (for scout bots)
-logsRouter.get('/bots/:id/logs/dispatches', async (c) => {
-  const botId = parseInt(c.req.param('id'));
-  const limit = parseInt(c.req.query('limit') || '50');
-  const offset = parseInt(c.req.query('offset') || '0');
-
-  // Omit details JSONB (~15-100 KB/row) to reduce egress
-  const logs = await db
-    .select({
-      id: dispatchLogs.id, scoutBotId: dispatchLogs.scoutBotId,
-      facilityId: dispatchLogs.facilityId,
-      subscribersConsidered: dispatchLogs.subscribersConsidered,
-      subscribersAttempted: dispatchLogs.subscribersAttempted,
-      subscribersSucceeded: dispatchLogs.subscribersSucceeded,
-      subscribersFailed: dispatchLogs.subscribersFailed,
-      subscribersSkipped: dispatchLogs.subscribersSkipped,
-      durationMs: dispatchLogs.durationMs,
-      pollLogId: dispatchLogs.pollLogId, runId: dispatchLogs.runId,
-      createdAt: dispatchLogs.createdAt,
-    })
-    .from(dispatchLogs)
-    .where(eq(dispatchLogs.scoutBotId, botId))
-    .orderBy(desc(dispatchLogs.createdAt))
-    .limit(limit)
-    .offset(offset);
-
-  return c.json(logs);
-});
-
-// Dispatches received by a subscriber bot
-logsRouter.get('/bots/:id/logs/dispatches/received', async (c) => {
-  const botId = parseInt(c.req.param('id'));
-  const limit = parseInt(c.req.query('limit') || '20');
-  const offset = parseInt(c.req.query('offset') || '0');
-
-  // Get subscriber's facility to filter dispatch_logs
-  const [bot] = await db
-    .select({ consularFacilityId: bots.consularFacilityId })
-    .from(bots)
-    .where(eq(bots.id, botId))
-    .limit(1);
-  if (!bot) return c.json({ error: 'Bot not found' }, 404);
-
-  // Query dispatch_logs for this facility, then filter details in JS for this botId
-  const logs = await db
-    .select({
-      id: dispatchLogs.id,
-      scoutBotId: dispatchLogs.scoutBotId,
-      facilityId: dispatchLogs.facilityId,
-      availableDates: dispatchLogs.availableDates,
-      details: dispatchLogs.details,
-      durationMs: dispatchLogs.durationMs,
-      createdAt: dispatchLogs.createdAt,
-    })
-    .from(dispatchLogs)
-    .where(eq(dispatchLogs.facilityId, bot.consularFacilityId))
-    .orderBy(desc(dispatchLogs.createdAt))
-    .limit(limit * 3) // over-fetch since we filter in JS
-    .offset(offset);
-
-  // Filter to dispatches that include this subscriber and extract their detail
-  const result = [];
-  for (const log of logs) {
-    if (result.length >= limit) break;
-    const detail = (log.details || []).find((d) => d.botId === botId);
-    if (!detail) continue;
-    result.push({
-      id: log.id,
-      scoutBotId: log.scoutBotId,
-      availableDates: log.availableDates,
-      createdAt: log.createdAt,
-      durationMs: log.durationMs,
-      detail,
-    });
-  }
-
-  return c.json(result);
 });
 
 // Proxy pool health — derived from poll_logs.connectionInfo (cross-process safe)
