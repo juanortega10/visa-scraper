@@ -2,8 +2,11 @@ import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import { createHmac } from 'node:crypto';
 
-const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '1004232331';
-const COOKIE_SECRET = process.env.COOKIE_SECRET || 'visa-bot-dashboard-hmac-key';
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
+const COOKIE_SECRET = process.env.COOKIE_SECRET;
+if (!DASHBOARD_PASSWORD || !COOKIE_SECRET) {
+  throw new Error('DASHBOARD_PASSWORD and COOKIE_SECRET must be set in environment');
+}
 const AUTH_COOKIE = 'dashboard_auth';
 
 export function computeAuthToken(): string {
