@@ -14,6 +14,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 - [x] **Phase 2: Tracker Dashboard** — Nueva tab "tracker" en bot-detail + resumen global en landing. Visualiza fechas bloqueadas, contadores por dimensión, tiempo restante, desbloqueo manual.
 - [x] **Phase 3: Bot Config Editor** — Modal desde bot-detail para editar `targetDateBefore` y rangos de exclusión, con mini-calendar range picker y validación de disponibilidad pre-save. (completed 2026-04-08)
 - [ ] **Phase 4: Bot 7 Peru - research y plan para lograr reagendamiento exitoso** — Diagnose phantom dates, fix verification parser for es-pe, add speculative time fallback, switch to direct provider. (planned 2026-04-09)
+- [ ] **Phase 5: Open-source cleanup** — Secrets audit, .gitignore hardening, README, dead code removal, script cleanup for public repo readiness.
 
 ## Phase Details
 
@@ -50,6 +51,7 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 | 2. Tracker Dashboard | 0/? | Not started | - |
 | 3. Bot Config Editor | 3/3 | Complete   | 2026-04-08 |
 | 4. Bot 7 Peru Optimization | 1/3 | In Progress|  |
+| 5. Open-source cleanup | 0/3 | Not started | - |
 
 ## Coverage Validation
 
@@ -130,6 +132,29 @@ Nunca perder una fecha bookeable mejor que la actual por desperdiciar polls en f
 - [ ] 04-01-PLAN.md — Diagnostic logging + Peru verification fix (visa-client.ts, reschedule-logic.ts)
 - [ ] 04-02-PLAN.md — Speculative time fallback for no-CAS path (reschedule-logic.ts + tests)
 - [ ] 04-03-PLAN.md — Deploy to RPi + switch Bot 7 config (direct provider, wider target window) + health verification
+
+### Phase 5: Open-source cleanup: README, secrets audit, simplify logic, .gitignore hardening
+
+**Goal:** Make the repo public-ready by auditing and removing secrets/personal data from tracked files, hardening .gitignore, writing a comprehensive README, and removing legacy dead code (scout/subscriber architecture, one-off personal scripts).
+
+**Depends on:** Phase 4
+
+**Requirements**: SEC-01, SEC-02, SEC-03, SEC-04, SEC-05, DOC-01, DOC-02, CLEAN-01, CLEAN-02, CLEAN-03
+
+**Success Criteria**:
+1. No secrets, personal IDs, passwords, or emails in any tracked file
+2. .gitignore blocks .env, CLAUDE.md, .planning/, scripts/output/, images
+3. .env.example documents all required env vars with placeholder values
+4. README.md covers project overview, setup, API, configuration, safety guards (no personal data)
+5. Legacy isScout/isSubscriber columns removed from schema
+6. dispatch_logs query code removed (table definition preserved)
+7. Only core utility scripts tracked in git (personal analysis scripts untracked)
+8. `npm test` passes with no regressions
+
+**Plans:** 3 plans
+- [ ] 05-01-PLAN.md — Secrets audit + .gitignore hardening + .env.example
+- [ ] 05-02-PLAN.md — README.md for public consumption
+- [ ] 05-03-PLAN.md — Code simplification: remove legacy dead code + untrack personal scripts
 
 ---
 *Roadmap created: 2026-04-06*
