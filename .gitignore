@@ -1,6 +1,5 @@
 node_modules/
 dist/
-.env
 .trigger/
 *.log
 captures/
@@ -8,5 +7,25 @@ captures/
 .agents/
 .claude/
 .firecrawl/
-*.png
 src/services/__tests__/fixtures/
+
+# Secrets and env
+.env
+.env.*
+*.local
+
+# Personal operational data
+CLAUDE.md
+.planning/
+memory/
+
+# Screenshots and images (not code)
+*.png
+*.jpeg
+*.jpg
+
+# Script outputs (may contain personal HTML captures)
+scripts/output/
+
+# WhatsApp exports
+WhatsApp*
