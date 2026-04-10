@@ -223,13 +223,66 @@ botsRouter.get('/countries', (c) => {
   return c.json(countries);
 });
 
-// Landing — consolidated endpoint: bots + reschedule events + poll health stats (last 24h + 1h)
+// Shared helper: single poll_logs scan for 24h stats + 1h subset + uptime buckets
+async function fetchPollStats(since24: Date, since1h: Date) {
+  const rows = await db.select({
+    botId: pollLogs.botId,
+    total24h:      sql<number>`count(*)::int`,
+    ok24h:         sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+    tcp24h:        sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
+    error24h:      sql<number>`count(*) filter (where ${pollLogs.status} not in ('ok', 'filtered_out', 'tcp_blocked'))::int`,
+    total1h:       sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h})::int`,
+    ok1h:          sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h} and ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+    tcp1h:         sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h} and ${pollLogs.status} = 'tcp_blocked')::int`,
+    totalBuckets:  sql<number>`count(distinct floor(extract(epoch from ${pollLogs.createdAt}) / 300))::int`,
+    okBuckets:     sql<number>`count(distinct case when ${pollLogs.status} in ('ok', 'filtered_out') then floor(extract(epoch from ${pollLogs.createdAt}) / 300) end)::int`,
+  }).from(pollLogs)
+    .where(gte(pollLogs.createdAt, since24))
+    .groupBy(pollLogs.botId);
+
+  const health: Record<number, { total: number; ok: number; tcp: number; error: number }> = {};
+  const health1h: Record<number, { total: number; ok: number; tcp: number }> = {};
+  const uptime: Record<number, { totalBuckets: number; okBuckets: number }> = {};
+  for (const r of rows) {
+    health[r.botId]   = { total: r.total24h, ok: r.ok24h, tcp: r.tcp24h, error: r.error24h };
+    health1h[r.botId] = { total: r.total1h,  ok: r.ok1h,  tcp: r.tcp1h };
+    uptime[r.botId]   = { totalBuckets: r.totalBuckets, okBuckets: r.okBuckets };
+  }
+  return { health, health1h, uptime };
+}
+
+// Shared helper: recent reschedule events (24h), keyed by botId
+async function fetchRecentEvents(since24: Date, botCurrentDate: Record<number, string | null>) {
+  const rescheduleRows = await db.select({
+    botId: rescheduleLogs.botId, success: rescheduleLogs.success,
+    newConsularDate: rescheduleLogs.newConsularDate,
+    newConsularTime: rescheduleLogs.newConsularTime,
+    createdAt: rescheduleLogs.createdAt,
+  }).from(rescheduleLogs)
+    .where(gte(rescheduleLogs.createdAt, since24))
+    .orderBy(desc(rescheduleLogs.createdAt));
+
+  const events: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
+  for (const r of rescheduleRows) {
+    if (!events[r.botId]) events[r.botId] = { successes: [], failedCount: 0 };
+    if (r.success) {
+      if (r.newConsularDate === botCurrentDate[r.botId]) {
+        events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
+      }
+    } else {
+      events[r.botId].failedCount++;
+    }
+  }
+  return events;
+}
+
+// Landing — consolidated endpoint: bots + health stats
+// Bot list is stable; clients should cache it and use /health for periodic refreshes.
 botsRouter.get('/landing', async (c) => {
   const since24 = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const since1h = new Date(Date.now() - 60 * 60 * 1000);
-  const since = since24; // kept for reschedule window
+  const since1h  = new Date(Date.now() - 60 * 60 * 1000);
 
-  const [allBots, rescheduleRows, pollStats, pollStats1h, uptimeBuckets, originalDates] = await Promise.all([
+  const [allBots, originalDates, { health, health1h, uptime }] = await Promise.all([
     db.select({
       id: bots.id, locale: bots.locale, status: bots.status,
       ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
@@ -243,101 +296,58 @@ botsRouter.get('/landing', async (c) => {
     }).from(bots),
 
     db.select({
-      botId: rescheduleLogs.botId, success: rescheduleLogs.success,
-      newConsularDate: rescheduleLogs.newConsularDate,
-      newConsularTime: rescheduleLogs.newConsularTime,
-      createdAt: rescheduleLogs.createdAt,
-    }).from(rescheduleLogs)
-      .where(gte(rescheduleLogs.createdAt, since))
-      .orderBy(desc(rescheduleLogs.createdAt)),
-
-    db.select({
-      botId: pollLogs.botId,
-      total: sql<number>`count(*)::int`,
-      ok:    sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
-      tcp:   sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
-      error: sql<number>`count(*) filter (where ${pollLogs.status} not in ('ok', 'filtered_out', 'tcp_blocked'))::int`,
-    }).from(pollLogs)
-      .where(gte(pollLogs.createdAt, since24))
-      .groupBy(pollLogs.botId),
-
-    db.select({
-      botId: pollLogs.botId,
-      total: sql<number>`count(*)::int`,
-      ok:    sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
-      tcp:   sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
-    }).from(pollLogs)
-      .where(gte(pollLogs.createdAt, since1h))
-      .groupBy(pollLogs.botId),
-
-    // Uptime: 5-min buckets — a bucket is "up" if it has ≥1 ok/filtered_out poll
-    db.select({
-      botId: pollLogs.botId,
-      totalBuckets: sql<number>`count(distinct floor(extract(epoch from ${pollLogs.createdAt}) / 300))::int`,
-      okBuckets: sql<number>`count(distinct case when ${pollLogs.status} in ('ok', 'filtered_out') then floor(extract(epoch from ${pollLogs.createdAt}) / 300) end)::int`,
-    }).from(pollLogs)
-      .where(gte(pollLogs.createdAt, since24))
-      .groupBy(pollLogs.botId),
-
-    // Original consular date: the oldConsularDate from the earliest reschedule_log per bot
-    db.select({
       botId: rescheduleLogs.botId,
       originalDate: sql<string>`min(old_consular_date)`,
     }).from(rescheduleLogs)
       .where(sql`old_consular_date is not null`)
       .groupBy(rescheduleLogs.botId),
+
+    fetchPollStats(since24, since1h),
   ]);
 
-  // Build a lookup: botId → currentConsularDate (from allBots query already done above)
   const botCurrentDate: Record<number, string | null> = {};
   for (const b of allBots) botCurrentDate[b.id] = b.currentConsularDate ?? null;
-
-  const events: Record<number, { successes: { date: string; time: string; at: string }[]; failedCount: number }> = {};
-  for (const r of rescheduleRows) {
-    if (!events[r.botId]) events[r.botId] = { successes: [], failedCount: 0 };
-    if (r.success) {
-      // Only show success badge if the rescheduled date still matches the current appointment.
-      // If the portal reverted the appointment, currentConsularDate will differ from newConsularDate
-      // and the badge should not show a stale victory.
-      if (r.newConsularDate === botCurrentDate[r.botId]) {
-        events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
-      }
-    } else {
-      events[r.botId].failedCount++;
-    }
-  }
-
-  const health: Record<number, { total: number; ok: number; tcp: number; error: number }> = {};
-  for (const r of pollStats) health[r.botId] = { total: r.total, ok: r.ok, tcp: r.tcp, error: r.error };
-
-  const health1h: Record<number, { total: number; ok: number; tcp: number }> = {};
-  for (const r of pollStats1h) health1h[r.botId] = { total: r.total, ok: r.ok, tcp: r.tcp };
-
-  const uptime: Record<number, { totalBuckets: number; okBuckets: number }> = {};
-  for (const r of uptimeBuckets) uptime[r.botId] = { totalBuckets: r.totalBuckets, okBuckets: r.okBuckets };
 
   const origDateByBot: Record<number, string | null> = {};
   for (const r of originalDates) origDateByBot[r.botId] = r.originalDate ?? null;
 
+  const events = await fetchRecentEvents(since24, botCurrentDate);
+
   const nowMs = Date.now();
-  const botsWithOrig = allBots.map(b => {
+  const botsOut = allBots.map(b => {
     const cache = (b.casCacheJson as CasCacheData | null) ?? null;
     const tracking = cache?.dateFailureTracking ?? {};
     const entries = Object.values(tracking);
-    const totalEntries = entries.length;
-    const blockedCount = entries.filter(
-      (e) => e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs,
-    ).length;
-    // strip casCacheJson from the wire response — only summary leaves the API
     const { casCacheJson: _omit, ...rest } = b;
     return {
       ...rest,
       originalConsularDate: origDateByBot[b.id] ?? null,
-      trackerSummary: { blockedCount, totalEntries },
+      trackerSummary: {
+        blockedCount: entries.filter(e => e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs).length,
+        totalEntries: entries.length,
+      },
     };
   });
 
-  return c.json({ bots: botsWithOrig, events, health, health1h, uptime });
+  return c.json({ bots: botsOut, events, health, health1h, uptime });
+});
+
+// Health-only endpoint — volatile stats without the bot list.
+// Clients refresh this every 60s to update health bars without re-fetching bots.
+botsRouter.get('/health-stats', async (c) => {
+  const since24 = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const since1h  = new Date(Date.now() - 60 * 60 * 1000);
+
+  const [{ health, health1h, uptime }, currentDates] = await Promise.all([
+    fetchPollStats(since24, since1h),
+    db.select({ id: bots.id, currentConsularDate: bots.currentConsularDate }).from(bots),
+  ]);
+
+  const botCurrentDate: Record<number, string | null> = {};
+  for (const b of currentDates) botCurrentDate[b.id] = b.currentConsularDate ?? null;
+
+  const events = await fetchRecentEvents(since24, botCurrentDate);
+  return c.json({ health, health1h, uptime, events });
 });
 
 // Recent events — reschedule activity last 24h, grouped by botId

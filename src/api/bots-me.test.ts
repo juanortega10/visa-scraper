@@ -534,11 +534,9 @@ describe('tracker endpoints', () => {
     };
 
     mockDbRows([bot1, bot2]); // allBots
-    mockDbRows([]); // rescheduleRows
-    mockDbRows([]); // pollStats
-    mockDbRows([]); // pollStats1h
-    mockDbRows([]); // uptimeBuckets
-    mockDbRows([]); // originalDates
+    mockDbRows([]);            // originalDates (rescheduleLogs min)
+    mockDbRows([]);            // fetchPollStats (merged pollLogs query)
+    mockDbRows([]);            // fetchRecentEvents (rescheduleLogs last 24h)
 
     const res = await app.request('/api/bots/landing');
     expect(res.status).toBe(200);
@@ -569,7 +567,9 @@ describe('tracker endpoints', () => {
       pollEnvironments: ['dev'],
       casCacheJson: null,
     }]);
-    mockDbRows([]); mockDbRows([]); mockDbRows([]); mockDbRows([]); mockDbRows([]);
+    mockDbRows([]); // originalDates
+    mockDbRows([]); // fetchPollStats
+    mockDbRows([]); // fetchRecentEvents
 
     const res = await app.request('/api/bots/landing');
     const body = await res.json();

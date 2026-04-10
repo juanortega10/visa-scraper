@@ -594,37 +594,45 @@ function renderBotList(bots,events){
   document.getElementById('content').innerHTML=html;
 }
 
-async function load(){
+var _bots=[];
+async function loadFull(){
   try{
     var res=await fetch('/api/bots/landing');
     var data=res.ok?await res.json():{bots:[],events:{},health:{}};
-    var bots=data.bots||[];
-    var events=data.events||{};
-    var health=data.health||{};
-    var health1h=data.health1h||{};
-    if(!bots.length){
+    _bots=data.bots||[];
+    if(!_bots.length){
       document.getElementById('content').innerHTML='<div class="empty-msg">no hay bots configurados</div>';
       document.getElementById('summary').innerHTML='';
       document.getElementById('fleet-health').innerHTML='';
       return;
     }
-    var active=bots.filter(function(b){return b.status==='active';}).length;
-    var countries=new Set(bots.map(function(b){return cc(b.locale);})).size;
+    var active=_bots.filter(function(b){return b.status==='active';}).length;
+    var countries=new Set(_bots.map(function(b){return cc(b.locale);})).size;
     document.getElementById('summary').innerHTML=
-      '<div class="stat"><div class="stat-val">'+bots.length+'</div><div class="stat-lbl">bots</div></div>'+
+      '<div class="stat"><div class="stat-val">'+_bots.length+'</div><div class="stat-lbl">bots</div></div>'+
       '<div class="stat"><div class="stat-val">'+active+'</div><div class="stat-lbl">activos</div></div>'+
       '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>';
-    renderFleetHealth(bots,health,events,health1h,data.uptime||null);
-    renderBotList(bots,events);
+    renderFleetHealth(_bots,data.health||{},data.events||{},data.health1h||{},data.uptime||null);
+    renderBotList(_bots,data.events||{});
   }catch(e){
     console.error('fetch error',e);
     document.getElementById('content').innerHTML='<div class="empty-msg">error cargando bots</div>';
   }
 }
+async function loadHealth(){
+  if(!_bots.length){loadFull();return;}
+  try{
+    var res=await fetch('/api/bots/health-stats');
+    if(!res.ok)return;
+    var data=await res.json();
+    renderFleetHealth(_bots,data.health||{},data.events||{},data.health1h||{},data.uptime||null);
+  }catch(e){console.error('health fetch error',e);}
+}
 
-tickClock();load();
+tickClock();loadFull();
 setInterval(tickClock,1000);
-setInterval(load,60000);
+setInterval(loadHealth,60000);
+setInterval(loadFull,300000);
 </script>
 </body>
 </html>`;
