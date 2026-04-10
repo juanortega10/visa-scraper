@@ -53,6 +53,7 @@ export const prefetchCasSchedule = schedules.task({
       visaEmail: bots.visaEmail, visaPassword: bots.visaPassword,
       casCacheJson: bots.casCacheJson,
       skipCas: bots.skipCas,
+      currentConsularDate: bots.currentConsularDate,
     }).from(bots).where(eq(bots.status, 'active'));
     logger.info('prefetch-cas cron START', { botCount: activeBots.length });
 
@@ -125,6 +126,7 @@ interface PrefetchBot {
   visaEmail: string;
   visaPassword: string;
   casCacheJson: CasCacheData | null;
+  currentConsularDate: string | null;
 }
 
 export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> {
@@ -247,8 +249,7 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
   );
 
   const WINDOW_DAYS = 30;
-  const MAX_PROBES = 8;
-  const PROBE_INTERVAL = 5;
+  const MAX_CONSULAR_PROBES = 5;   // max earlier consular dates to probe
   const MAX_REQUESTS = 45;
 
   const entries: CasCacheEntry[] = [];
@@ -257,7 +258,7 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
   const failedProbes: string[] = [];
   const failedTimeFetches: string[] = [];
 
-  // -- Phase 1: Get a consular time from any real consular date --
+  // -- Phase 1: Get real consular dates and pick probes --
   let consularDays;
   try {
     consularDays = await client.getConsularDays();
@@ -274,73 +275,116 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
 
   logger.info('Consular days', { botId, total: consularDays.length, first: consularDays[0]?.date });
 
-  let sampleTime: string | null = null;
-  for (const cd of consularDays.slice(0, 3)) {
+  // Prefer consular dates earlier than bot's current appointment (what it would reschedule to).
+  // Fallback to first 3 consular dates if none are earlier (general cache).
+  const currentConsular = bot.currentConsularDate;
+  const earlierDates = currentConsular
+    ? consularDays.filter(d => d.date < currentConsular)
+    : [];
+  const probeDates = earlierDates.length > 0
+    ? earlierDates.slice(0, MAX_CONSULAR_PROBES)
+    : consularDays.slice(0, 3);
+
+  logger.info('Consular probes', {
+    botId, currentConsular, earlierCount: earlierDates.length,
+    probeCount: probeDates.length, probeDates: probeDates.map(d => d.date),
+  });
+
+  if (probeDates.length === 0) {
+    logger.warn('No consular dates to probe, aborting', { botId });
+    return logAndReturn('no_consular_dates');
+  }
+
+  // -- Phase 2: For each probe consular date, get times + CAS days + CAS times --
+  const todayStr = new Date().toISOString().split('T')[0]!;
+  const seenCasDates = new Set<string>(); // dedup across consular probes
+
+  for (const probeDay of probeDates) {
+    if (requestCount >= MAX_REQUESTS) {
+      logger.warn('Request budget exhausted', { botId, requestCount });
+      break;
+    }
+
+    // Get consular times for this date
+    let consularTimes: string[];
     try {
-      const timesData = await client.getConsularTimes(cd.date);
+      const timesData = await client.getConsularTimes(probeDay.date);
       requestCount++;
-      if (timesData.available_times?.length > 0) {
-        sampleTime = timesData.available_times[0]!;
-        logger.info('Using consular time', { botId, date: cd.date, time: sampleTime });
-        break;
-      }
+      consularTimes = timesData.available_times ?? [];
     } catch (err) {
       requestCount++;
       if (err instanceof SessionExpiredError) {
         logger.error('Session expired fetching consular times', { botId });
-        return logAndReturn('session_expired_times');
+        break;
       }
-      logger.warn('getConsularTimes failed', { botId, date: cd.date, error: String(err) });
+      failedProbes.push(probeDay.date);
+      errorCount++;
+      logger.warn('getConsularTimes failed', { botId, date: probeDay.date, error: err instanceof Error ? err.message : String(err) });
+      await sleep(3000);
+      continue;
     }
-    await sleep(3000);
-  }
 
-  if (!sampleTime) {
-    logger.warn('No consular times available, aborting', { botId, consularDaysCount: consularDays.length });
-    return logAndReturn('no_consular_times');
-  }
+    if (consularTimes.length === 0) {
+      logger.info(`No consular times for ${probeDay.date}, skip`, { botId });
+      await sleep(3000);
+      continue;
+    }
 
-  // -- Phase 2: Generate probe dates for CAS discovery --
-  const probes: string[] = [];
-  const today = new Date();
-  for (let offset = PROBE_INTERVAL; offset <= WINDOW_DAYS + 10; offset += PROBE_INTERVAL) {
-    const d = new Date(today.getTime() + offset * 86400000);
-    if (d.getDay() === 0) d.setDate(d.getDate() + 1);
-    probes.push(d.toISOString().split('T')[0]!);
-  }
-  const samples = probes.slice(0, MAX_PROBES);
-  logger.info('Probe dates', { botId, samples });
+    // Use first available time as representative
+    const probeTime = consularTimes[0]!;
 
-  // -- Phase 3: Discover CAS dates via getCasDays --
-  const todayStr = today.toISOString().split('T')[0]!;
-  const cutoffDate = new Date(today.getTime() + WINDOW_DAYS * 86400000).toISOString().split('T')[0]!;
-  const discoveredCasDates = new Set<string>();
-
-  for (let i = 0; i < samples.length; i++) {
-    const probeDate = samples[i]!;
+    // Get CAS days for this specific consular date+time
+    let casDays;
     try {
-      const casDays = await client.getCasDays(probeDate, sampleTime);
+      casDays = await client.getCasDays(probeDay.date, probeTime);
       requestCount++;
-      const inWindow = casDays.filter((d) => d.date >= todayStr && d.date <= cutoffDate);
-      for (const d of inWindow) discoveredCasDates.add(d.date);
-      logger.info(`getCasDays(${probeDate}): ${casDays.length} total, ${inWindow.length} in window`, { botId });
     } catch (err) {
       requestCount++;
       if (err instanceof SessionExpiredError) {
-        logger.error('Session expired during CAS discovery', { botId, fetched: i });
+        logger.error('Session expired during CAS discovery', { botId });
         break;
       }
+      failedProbes.push(probeDay.date);
       errorCount++;
-      failedProbes.push(probeDate);
-      logger.warn(`getCasDays error for ${probeDate}`, { botId, error: err instanceof Error ? err.message : String(err) });
+      logger.warn(`getCasDays error for ${probeDay.date}`, { botId, error: err instanceof Error ? err.message : String(err) });
+      await sleep(3000);
+      continue;
     }
-    if (i < samples.length - 1) await sleep(3000);
+
+    const validCasDays = casDays.filter(d => d.date >= todayStr && !seenCasDates.has(d.date));
+    logger.info(`getCasDays(${probeDay.date}, ${probeTime}): ${casDays.length} total, ${validCasDays.length} new valid`, { botId });
+
+    // Fetch CAS times for each discovered date WITH consular context
+    for (const casDay of validCasDays) {
+      if (requestCount >= MAX_REQUESTS) break;
+      seenCasDates.add(casDay.date);
+      try {
+        const timesData = await client.getCasTimes(casDay.date, probeDay.date, probeTime);
+        requestCount++;
+        const times = timesData.available_times ?? [];
+        entries.push({ date: casDay.date, slots: times.length, times, forConsularDate: probeDay.date, forConsularTime: probeTime });
+        logger.info(`CAS ${casDay.date} (for ${probeDay.date}@${probeTime}): ${times.length} slots`, { botId });
+      } catch (err) {
+        requestCount++;
+        if (err instanceof SessionExpiredError) break;
+        errorCount++;
+        failedTimeFetches.push(casDay.date);
+        entries.push({ date: casDay.date, slots: -1, times: [], forConsularDate: probeDay.date, forConsularTime: probeTime });
+        logger.warn(`CAS ${casDay.date}: error`, { botId, error: err instanceof Error ? err.message : String(err) });
+      }
+      await sleep(3000);
+    }
+
+    if (validCasDays.length === 0) {
+      logger.info(`No CAS days for consular ${probeDay.date}@${probeTime}`, { botId });
+    }
+
+    await sleep(3000);
   }
 
-  const uniqueCasDates = [...discoveredCasDates].sort();
-  logger.info('CAS dates discovered', { botId, count: uniqueCasDates.length, window: `${todayStr}..${cutoffDate}` });
+  logger.info('CAS discovery done', { botId, totalEntries: entries.length, requestCount });
 
-  if (uniqueCasDates.length === 0) {
+  if (entries.length === 0) {
     const durationMs = Date.now() - startMs;
     // Don't overwrite good cache with empty results (likely soft ban or transient error)
     if (existingCache && existingCache.entries.length > 0) {
@@ -350,48 +394,27 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
       await db.insert(casPrefetchLogs).values({ botId, totalDates: 0, fullDates: 0, lowDates: 0, durationMs, requestCount, error: 'empty_result_kept_old_cache' });
       return { updated: false, reason: 'empty_result_kept_old_cache' };
     }
-    logger.info('No CAS dates in window, saving empty cache', { botId });
-    const activeBlocked = getActiveBlockedConsularDates(existingCache);
-    const cacheData: CasCacheData = {
+    logger.info('No CAS dates found, saving empty cache', { botId });
+    // Use jsonb merge (||) to update only metadata fields — preserves blockedConsularDates
+    // and dateFailureTracking already in the DB (written by poll-visa via jsonb_set).
+    // A full db.update replacement would wipe those fields even if poll-visa just wrote them.
+    const emptyMeta = {
       refreshedAt: new Date().toISOString(),
       windowDays: WINDOW_DAYS,
       totalDates: 0,
       fullDates: 0,
-      entries: [],
-      ...(Object.keys(activeBlocked).length > 0 ? { blockedConsularDates: activeBlocked } : {}),
+      entries: [] as CasCacheEntry[],
     };
     await Promise.all([
-      db.update(bots).set({ casCacheJson: cacheData, updatedAt: new Date() }).where(eq(bots.id, botId)),
+      db.execute(sql`
+        UPDATE bots SET
+          cas_cache_json = COALESCE(cas_cache_json, '{}'::jsonb) || ${JSON.stringify(emptyMeta)}::jsonb,
+          updated_at = NOW()
+        WHERE id = ${botId}
+      `),
       db.insert(casPrefetchLogs).values({ botId, totalDates: 0, fullDates: 0, lowDates: 0, durationMs, requestCount }),
     ]);
-    return { updated: true }; // empty but refreshed (no prior cache existed)
-  }
-
-  // -- Phase 4: Fetch CAS times for each discovered date --
-  for (let i = 0; i < uniqueCasDates.length; i++) {
-    if (requestCount >= MAX_REQUESTS) {
-      logger.warn('Request budget exhausted', { botId, requestCount, remaining: uniqueCasDates.length - i });
-      break;
-    }
-    const casDate = uniqueCasDates[i]!;
-    try {
-      const timesData = await client.getCasTimes(casDate);
-      requestCount++;
-      const times = timesData.available_times ?? [];
-      entries.push({ date: casDate, slots: times.length, times });
-      logger.info(`CAS ${casDate}: ${times.length} slots`, { botId });
-    } catch (err) {
-      requestCount++;
-      if (err instanceof SessionExpiredError) {
-        logger.error('Session expired fetching CAS times', { botId, fetched: i });
-        break;
-      }
-      errorCount++;
-      failedTimeFetches.push(casDate);
-      entries.push({ date: casDate, slots: -1, times: [] });
-      logger.warn(`CAS ${casDate}: error`, { botId, error: err instanceof Error ? err.message : String(err) });
-    }
-    if (i < uniqueCasDates.length - 1) await sleep(3000);
+    return { updated: true };
   }
 
   // -- Phase 5: Compute diff, persist cache + log --
@@ -474,8 +497,8 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
 
   logger.info('prefetch-cas bot DONE', {
     botId,
-    probes: samples.length,
-    uniqueCasDates: uniqueCasDates.length,
+    probes: probeDates.length,
+    uniqueCasDates: seenCasDates.size,
     totalEntries: entries.length,
     fullDates,
     lowDates,

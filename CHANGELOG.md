@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026-04-08] — CAS days fetch error tracking
+
+### Fixed
+- **fetch_error on getCasDays not bumping cross-poll tracker**: When the portal returns 5xx on `getCasDays` for near-future consular dates (e.g. Apr 13-15 where valid CAS window is mostly in the past), the error was classified as `fetch_error` and skipped both the per-call `repeatedlyFailingDates` threshold (each date only fails 1-2× per call, not 3×) and the cross-poll `dateFailureTracking` (bumpTracker was never called). Now calls `bumpTracker(date, 'casNoDays')` when `currentStep === 'parallel_cas_days'` so dates with no valid CAS window get blocked after 5 failures across polls.
+
+## [2026-04-07] — CAS consular context fix
+
+### Fixed
+- **CAS times fetched without consular context**: `getCasTimes()` was not passing `consulate_id`, `consulate_date`, `consulate_time` to the portal's `times.json` endpoint. The server returned unfiltered slots that were not actually valid for the target consular date, causing the bot to attempt POST reschedules with invalid consular+CAS pairs — always resulting in `false_positive_verification`. Now passes full consular context, matching the portal's own JS behavior.
+- **Prefetch-CAS used arbitrary probe dates**: The CAS prefetch cron generated probe dates every 5 days (arbitrary), ignoring the bot's actual consular availability. Now probes with real consular dates earlier than the bot's current appointment — the dates the bot would actually try to reschedule to. Each CAS cache entry stores `forConsularDate`/`forConsularTime` so the reschedule logic only uses entries valid for the target consular.
+- **CAS cache was not consular-context-aware**: `reschedule-logic.ts` used CAS cache entries regardless of which consular date they were fetched for. Now filters cache entries to match the candidate consular date, with backwards-compatible fallback for legacy entries without context.
+
+## [2026-04-05] — Dashboard fleet health improvements
+
+### Added
+- **Fleet health filter bar**: chips to filter by All / Activos / Pausados, plus free-text search by phone number (wa:) or email. Filter state persists across 60s auto-refreshes.
+- **Paused bots in fleet health**: paused bots now appear in the SALUD section (dimmed at 55% opacity) when the "Todos" or "Pausados" chip is selected.
+- **Consular dates in health cards**: each row now shows the current appointment date (`actual`) and — when different — the original date from the first reschedule log.
+- **Status badge**: paused bots show a PAUSED badge in their health card row.
+- **`originalConsularDate` in landing API**: `/api/bots/landing` now returns `originalConsularDate` (earliest `old_consular_date` from `reschedule_logs`) for each bot.
+
+---
+
 ## [2026-04-03] — Reschedule stability fixes
 
 ### Fixed

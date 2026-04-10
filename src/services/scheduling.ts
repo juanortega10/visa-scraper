@@ -2,11 +2,12 @@
  * 9s (0.135% ban-trigger) → 5s (0.578% ban-trigger, 4x increase after 3h A/B).
  * 7s = middle ground: ~7.5/min effective (+35% vs 9s) within safe 5-8/min bucket.
  * Response: 791ms direct, 1608ms webshare. Start-to-start timing subtracts elapsed. */
-export const DEFAULT_POLL_INTERVAL_S = 7;
+export const DEFAULT_POLL_INTERVAL_S = 9;
 
-/** Per-locale override for the normal polling interval.
- * Empty — all locales use DEFAULT_POLL_INTERVAL_S (7s). */
-const LOCALE_POLL_INTERVALS: Record<string, number> = {};
+/** Per-locale override for the normal polling interval. */
+const LOCALE_POLL_INTERVALS: Record<string, number> = {
+  'es-pe': 6, // test: 10 polls/min (was 9s ~6.7/min) — monitoring TCP blocks for 1h
+};
 
 export function getNormalInterval(locale?: string, override?: number): number {
   if (override != null && override > 0) return override;

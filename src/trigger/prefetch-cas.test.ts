@@ -88,6 +88,7 @@ function makeBot(proxyProvider = 'direct') {
     visaEmail: 'email@test.com',
     visaPassword: 'pass',
     casCacheJson: null,
+    currentConsularDate: '2026-08-01',
   };
 }
 
@@ -145,7 +146,7 @@ describe('prefetchForBot — always uses direct proxy', () => {
   it('writes a log entry to cas_prefetch_logs on early failure', async () => {
     const result = await prefetchForBot(makeBot('webshare') as any);
 
-    expect(result).toEqual({ updated: false, reason: 'no_consular_times' });
+    expect(result).toEqual({ updated: false, reason: 'no_consular_dates' });
     expect(mockDbInsert).toHaveBeenCalledOnce();
   });
 });

@@ -541,7 +541,7 @@ ${card(`<pre style="${F_BODY};font-size:13px;color:${C_MID};white-space:pre-wrap
 }
 
 // Events sent to notificationEmail (dev/admin) — operational noise excluded
-const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'reschedule_failed', 'bot_paused']);
+const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'bot_paused']);
 
 // Always receives reschedule_success regardless of bot owner
 const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;

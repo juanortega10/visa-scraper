@@ -185,18 +185,21 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   // Determine if this embassy requires CAS (biometrics) appointments
   let needsCas = !!bot.ascFacilityId && !bot.skipCas;
 
-  // Build CAS cache map for fast lookup (valid for up to 60 min, stale kept as fallback)
+  // Build CAS cache map for fast lookup (valid for up to 60 min, stale kept as fallback).
+  // Entries with forConsularDate are keyed by "casDate:consularDate"; legacy entries keyed by "casDate:".
+  // Lookup: try context-specific key first, then legacy key.
   const casCache = new Map<string, CasCacheEntry>();
   const staleCasCache = new Map<string, CasCacheEntry>();
   let casCacheAgeMin = Infinity;
+  const casCacheLookup = (cache: Map<string, CasCacheEntry>, casDate: string, consularDate: string): CasCacheEntry | undefined =>
+    cache.get(`${casDate}:${consularDate}`) ?? cache.get(`${casDate}:`);
   if (needsCas && casCacheJson?.entries) {
     casCacheAgeMin = (Date.now() - new Date(casCacheJson.refreshedAt).getTime()) / 60000;
     if (casCacheAgeMin < 60) {
-      for (const e of casCacheJson.entries) casCache.set(e.date, e);
+      for (const e of casCacheJson.entries) casCache.set(`${e.date}:${e.forConsularDate ?? ''}`, e);
       logger.info('CAS cache loaded', { botId, entries: casCache.size, ageMin: Math.round(casCacheAgeMin) });
     } else {
-      // Keep stale cache as fallback for TCP blocks
-      for (const e of casCacheJson.entries) staleCasCache.set(e.date, e);
+      for (const e of casCacheJson.entries) staleCasCache.set(`${e.date}:${e.forConsularDate ?? ''}`, e);
       logger.info('CAS cache too old for primary use, kept as fallback', { botId, entries: staleCasCache.size, ageMin: Math.round(casCacheAgeMin) });
     }
   }
@@ -573,9 +576,11 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       let casResults: { time: string; casDays: DaySlot[] }[];
       const CAS_WINDOW_DAYS = bot.maxCasGapDays ?? 8;
       const consularMs = new Date(candidate.date).getTime();
+      // Only use cache entries that were fetched for THIS consular date (or legacy entries without context)
       const cachedCasDays = [...casCache.values()]
         .filter(e => {
           if (e.slots <= 0) return false;
+          if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
           const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
           return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
         })
@@ -611,6 +616,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           const staleFallback = [...staleCasCache.values()]
             .filter(e => {
               if (e.slots <= 0) return false;
+              if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
               const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
               return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
             })
@@ -653,7 +659,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         const casDate = filteredCasDays[0]!.date;
 
         // Check CAS cache before fetching
-        const cached = casCache.get(casDate);
+        const cached = casCacheLookup(casCache, casDate, candidate.date);
         let casTimes: string[];
         if (cached) {
           if (cached.slots === 0) {
@@ -665,9 +671,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           logger.info('CAS times FROM CACHE', { botId, casDate, slots: cached.slots, afterFilter: casTimes.length });
         } else {
           currentStep = 'get_cas_times';
-          const casTimesData = await client.getCasTimes(casDate);
+          const casTimesData = await client.getCasTimes(casDate, candidate.date, consularTime);
           casTimes = filterTimes(casDate, casTimesData.available_times?.filter((t): t is string => !!t) ?? [], timeExclusions);
-          logger.info('CAS times', { botId, casDate, available: casTimesData.available_times?.length ?? 0, afterFilter: casTimes.length });
+          logger.info('CAS times', { botId, casDate, forConsular: `${candidate.date}@${consularTime}`, available: casTimesData.available_times?.length ?? 0, afterFilter: casTimes.length });
         }
         if (casTimes.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, casDate, failReason: 'no_cas_times', durationMs: Date.now() - attemptStart });
@@ -963,6 +969,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         durationMs: Date.now() - attemptStart,
       });
       dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
+      // CAS days fetch failing (5xx) is semantically "no CAS days" — bump cross-poll tracker so
+      // dates with no valid CAS window get blocked after 5 failures across polls.
+      if (currentStep === 'parallel_cas_days') bumpTracker(candidate.date, 'casNoDays');
       // Transient failure — allow 1 retry (don't add to exhaustedDates)
       transientFailCount.set(candidate.date, (transientFailCount.get(candidate.date) ?? 0) + 1);
       // Re-login before next attempt on network errors

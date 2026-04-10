@@ -142,13 +142,9 @@ export async function pureFetchLogin(
     ...(dispatcher ? { dispatcher } : {}),
   });
 
-  // Check for invalid credentials or account lock
   const postBody = await postResp.text();
-  if (postBody.includes('inválida') || postBody.includes('Invalid Email or password')) {
-    throw new InvalidCredentialsError();
-  }
 
-  // Check for explicit account lock message: "Your account is locked until 19 March, 2026, 20:19:09 -05."
+  // Check for explicit account lock message first (language-independent regex)
   const lockMatch = postBody.match(/account is locked until ([^<.]+)/i);
   if (lockMatch) {
     let lockedUntil: Date | undefined;
@@ -166,6 +162,7 @@ export async function pureFetchLogin(
       break;
     }
   }
+
   if (!newCookie) {
     throw new Error(`Login POST failed: status=${postResp.status}, no session cookie. Body: ${postBody.substring(0, 200)}`);
   }
@@ -177,9 +174,9 @@ export async function pureFetchLogin(
   // Verify success
   if (postResp.status === 200) {
     if (!postBody.includes('window.location')) {
-      // Account locked: form returned without error message (not "inválida" — already caught above)
+      // Structural check: sign_in_form re-rendered = credential failure (language-independent)
       if (postBody.includes('sign_in_form')) {
-        throw new AccountLockedError();
+        throw new InvalidCredentialsError();
       }
       throw new Error(`Login POST 200 but no redirect in body: ${postBody.substring(0, 200)}`);
     }

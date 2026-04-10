@@ -325,12 +325,13 @@ export class VisaClient {
 
   // ── CAS Times ──────────────────────────────────────────
 
-  async getCasTimes(date: string): Promise<TimeSlots> {
-    const resp = await this.fetchWithRetry(
-      `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/times/${this.config.ascFacilityId}.json?date=${date}&appointments[expedite]=false`,
-      { headers: this.ajaxHeaders() },
-      'CAS times',
-    );
+  async getCasTimes(date: string, consularDate?: string, consularTime?: string): Promise<TimeSlots> {
+    let url = `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/times/${this.config.ascFacilityId}.json?date=${date}`;
+    if (consularDate && consularTime) {
+      url += `&consulate_id=${this.config.consularFacilityId}&consulate_date=${consularDate}&consulate_time=${consularTime}`;
+    }
+    url += '&appointments[expedite]=false';
+    const resp = await this.fetchWithRetry(url, { headers: this.ajaxHeaders() }, 'CAS times');
     this.assertOk(resp, 'CAS times');
     return this.safeJson<TimeSlots>(resp, 'CAS times');
   }

@@ -171,7 +171,7 @@ export const loginVisaTask = task({
       if (e instanceof InvalidCredentialsError) {
         logger.error('Invalid credentials', { botId });
         logAuth({ email, action: 'login_visa', locale: creds.locale, result: 'invalid', botId });
-        await db.update(bots).set({ status: 'error', updatedAt: new Date() }).where(eq(bots.id, botId));
+        await db.update(bots).set({ status: 'invalid_credentials', updatedAt: new Date() }).where(eq(bots.id, botId));
         await notifyUserTask.trigger({
           botId,
           event: 'invalid_credentials',

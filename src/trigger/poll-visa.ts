@@ -925,6 +925,18 @@ export const pollVisaTask = task({
             logger.info('CAS blocker: skipping dates with no CAS availability', { botId, skipped, activeBlocked });
           }
 
+          // If all candidates were blocked, no point calling executeReschedule — skip silently.
+          const effectiveEarliest = daysForReschedule.find(
+            d => isAtLeastNDaysEarlier(d.date, bot.currentConsularDate!, 1),
+          )?.date;
+          if (!effectiveEarliest) {
+            logger.info('All earlier dates blocked — skipping reschedule', {
+              botId, earliest, blockedCount: blockedDateSet.size,
+            });
+            metadata.set("phase", "Esperando...");
+            // fall through to normal poll completion (no reschedule log written)
+          } else {
+
           const rescheduleStart = Date.now();
           const result = await executeReschedule({
             client,
@@ -1046,6 +1058,7 @@ export const pollVisaTask = task({
             );
           }
 
+          } // end else (effectiveEarliest found — ran executeReschedule)
           } // end else (no recent reschedule)
         } else if (earliest) {
           logger.info('No improvement — earliest is not ≥1 day before current', {
