@@ -1349,7 +1349,7 @@ export const pollVisaTask = task({
         } catch (loginErr) {
           if (loginErr instanceof InvalidCredentialsError) {
             logger.error('Inline re-login: invalid credentials', { botId });
-            logAuth({ email, action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: 'invalid_credentials', botId });
+            logAuth({ email: email ?? '', action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: 'invalid_credentials', botId });
             await db.update(bots).set({ status: 'invalid_credentials', updatedAt: new Date() }).where(eq(bots.id, botId));
             pending.push(
               notifyUserTask.trigger({
@@ -1366,7 +1366,7 @@ export const pollVisaTask = task({
               ? `Account locked until ${loginErr.lockedUntil.toISOString()}. Will auto-retry via cron.`
               : 'Account locked after too many failed login attempts. Will auto-retry in ~1h.';
             logger.error('Inline re-login: account locked — stopping chain', { botId, lockedUntil: loginErr.lockedUntil?.toISOString() });
-            logAuth({ email, action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: `account_locked${loginErr.lockedUntil ? ` until ${loginErr.lockedUntil.toISOString()}` : ''}`, botId });
+            logAuth({ email: email ?? '', action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: `account_locked${loginErr.lockedUntil ? ` until ${loginErr.lockedUntil.toISOString()}` : ''}`, botId });
             await db.update(bots).set({ status: 'login_required', updatedAt: new Date() }).where(eq(bots.id, botId));
             pending.push(
               notifyUserTask.trigger({
@@ -1381,7 +1381,7 @@ export const pollVisaTask = task({
           // Login failed — fall through to normal error handling below
           const loginErrMsg = loginErr instanceof Error ? loginErr.message : String(loginErr);
           logger.error(`Inline re-login FAILED: ${loginErrMsg}`, { botId });
-          logAuth({ email, action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: loginErrMsg, botId });
+          logAuth({ email: email ?? '', action: 'inline_relogin', locale: bot.locale ?? 'es-co', result: 'error', errorMessage: loginErrMsg, botId });
           // Trigger login-visa as last resort (cloud re-login)
           const handle = await loginVisaTask.trigger({ botId, chainId }, { tags: [`bot:${botId}`] });
           logger.info('Fallback: login-visa task triggered', { botId, runId: handle.id });

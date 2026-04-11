@@ -85,7 +85,6 @@ export async function pureFetchLogin(
       ...BROWSER_HEADERS,
     },
     redirect: 'follow',
-    // @ts-expect-error undici dispatcher
     ...(dispatcher ? { dispatcher } : {}),
   });
 
@@ -138,7 +137,6 @@ export async function pureFetchLogin(
       'commit': commitText,
     }).toString(),
     redirect: 'manual',
-    // @ts-expect-error undici dispatcher
     ...(dispatcher ? { dispatcher } : {}),
   });
 
@@ -147,9 +145,10 @@ export async function pureFetchLogin(
   // Check for explicit account lock message first (language-independent regex)
   const lockMatch = postBody.match(/account is locked until ([^<.]+)/i);
   if (lockMatch) {
+    const lockStr = lockMatch[1]!.trim();
     let lockedUntil: Date | undefined;
-    try { lockedUntil = new Date(lockMatch[1].trim()); } catch { /* unparseable */ }
-    throw new AccountLockedError(`Account locked until ${lockMatch[1].trim()}`, lockedUntil);
+    try { lockedUntil = new Date(lockStr); } catch { /* unparseable */ }
+    throw new AccountLockedError(`Account locked until ${lockStr}`, lockedUntil);
   }
 
   // Extract new session cookie from POST response
@@ -203,7 +202,6 @@ export async function pureFetchLogin(
         ...BROWSER_HEADERS,
       },
       redirect: 'manual',
-      // @ts-expect-error undici dispatcher
       ...(dispatcher ? { dispatcher } : {}),
     });
   } catch (fetchErr) {
@@ -307,7 +305,6 @@ export async function discoverAccount(
   const accountResp = await fetch(accountUrl, {
     headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
     redirect: 'follow',
-    // @ts-expect-error undici dispatcher
     ...(dispatcher ? { dispatcher } : {}),
   });
   if (accountResp.status !== 200) throw new Error(`Account page returned HTTP ${accountResp.status}`);
@@ -355,7 +352,6 @@ export async function discoverAccount(
   const apptResp = await fetch(appointmentUrl, {
     headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
     redirect: 'follow',
-    // @ts-expect-error undici dispatcher
     ...(dispatcher ? { dispatcher } : {}),
   });
   updateCookie(apptResp);
@@ -386,7 +382,6 @@ export async function discoverAccount(
       const retryResp = await fetch(appointmentUrl, {
         headers: { Cookie: `_yatri_session=${cookie}`, 'User-Agent': USER_AGENT, Accept: 'text/html' },
         redirect: 'follow',
-        // @ts-expect-error undici dispatcher
         ...(dispatcher ? { dispatcher } : {}),
       });
       updateCookie(retryResp);

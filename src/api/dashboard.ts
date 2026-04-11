@@ -10,7 +10,7 @@ if (!DASHBOARD_PASSWORD || !COOKIE_SECRET) {
 const AUTH_COOKIE = 'dashboard_auth';
 
 export function computeAuthToken(): string {
-  return createHmac('sha256', COOKIE_SECRET).update(DASHBOARD_PASSWORD).digest('hex');
+  return createHmac('sha256', COOKIE_SECRET!).update(DASHBOARD_PASSWORD!).digest('hex');
 }
 
 export const dashboardRouter = new Hono();

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { CasCacheData } from '../../db/schema.js';
 import type { DaySlot } from '../visa-client.js';
 import type { RescheduleBot, RescheduleParams } from '../reschedule-logic.js';

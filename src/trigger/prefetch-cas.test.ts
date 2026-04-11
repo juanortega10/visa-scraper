@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Mock @trigger.dev/sdk/v3 ─────────────────────────────
 vi.mock('@trigger.dev/sdk/v3', () => ({
@@ -116,21 +116,21 @@ describe('prefetchForBot — always uses direct proxy', () => {
   it('uses direct proxy when bot.proxyProvider is webshare', async () => {
     await prefetchForBot(makeBot('webshare') as any);
 
-    const [, config] = vi.mocked(VisaClient).mock.calls[0];
+    const [, config] = vi.mocked(VisaClient).mock.calls[0]!;
     expect((config as any).proxyProvider).toBe('direct');
   });
 
   it('uses direct proxy when bot.proxyProvider is brightdata', async () => {
     await prefetchForBot(makeBot('brightdata') as any);
 
-    const [, config] = vi.mocked(VisaClient).mock.calls[0];
+    const [, config] = vi.mocked(VisaClient).mock.calls[0]!;
     expect((config as any).proxyProvider).toBe('direct');
   });
 
   it('uses direct proxy when bot.proxyProvider is already direct', async () => {
     await prefetchForBot(makeBot('direct') as any);
 
-    const [, config] = vi.mocked(VisaClient).mock.calls[0];
+    const [, config] = vi.mocked(VisaClient).mock.calls[0]!;
     expect((config as any).proxyProvider).toBe('direct');
   });
 

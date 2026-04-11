@@ -128,7 +128,7 @@ describe('refreshTokens (bot 12 real fixture)', () => {
 
     await client.refreshTokens();
 
-    const url = mockProxyFetch.mock.calls[0][0] as string;
+    const url = mockProxyFetch.mock.calls[0]![0] as string;
     expect(url).toContain('applicants[]=85015928');
     expect(url).toContain('applicants[]=85015997');
     expect(url).toContain('applicants[]=85016085');
@@ -162,7 +162,7 @@ describe('getCurrentAppointment (bot 12 real fixture)', () => {
 
     await client.getCurrentAppointment();
 
-    const url = mockProxyFetch.mock.calls[0][0] as string;
+    const url = mockProxyFetch.mock.calls[0]![0] as string;
     expect(url).toBe('https://ais.usvisa-info.com/es-co/niv/groups/49983575');
   });
 });
@@ -255,7 +255,7 @@ describe('reschedule (bot 12)', () => {
 
     await client.reschedule('2026-10-21', '09:00', '2026-10-15', '08:00');
 
-    const call = mockProxyFetch.mock.calls[0];
+    const call = mockProxyFetch.mock.calls[0]!;
     const url = call[0] as string;
     const options = call[1] as RequestInit;
 
@@ -300,7 +300,7 @@ describe('reschedule (bot 12)', () => {
 
     await client.reschedule('2026-10-21', '09:00', '2026-10-15', '08:00');
 
-    const headers = mockProxyFetch.mock.calls[0][1].headers as Record<string, string>;
+    const headers = mockProxyFetch.mock.calls[0]![1].headers as Record<string, string>;
 
     expect(headers.Cookie).toBe('_yatri_session=my_session_value');
     expect(headers['Content-Type']).toBe('application/x-www-form-urlencoded');
@@ -334,7 +334,7 @@ describe('reschedule (bot 12)', () => {
     await client.reschedule('2026-10-21', '09:00', '2026-10-15', '08:00');
 
     // POST always uses 'direct' (3rd argument)
-    expect(mockProxyFetch.mock.calls[0][2]).toBe('direct');
+    expect(mockProxyFetch.mock.calls[0]![2]).toBe('direct');
   });
 
   it('uses redirect: manual (does not auto-follow)', async () => {
@@ -345,7 +345,7 @@ describe('reschedule (bot 12)', () => {
 
     await client.reschedule('2026-10-21', '09:00', '2026-10-15', '08:00');
 
-    expect(mockProxyFetch.mock.calls[0][1].redirect).toBe('manual');
+    expect(mockProxyFetch.mock.calls[0]![1].redirect).toBe('manual');
   });
 
   it('returns false for non-redirect non-success response', async () => {
@@ -498,7 +498,7 @@ describe('full flow: refreshTokens → getCurrentAppointment → reschedule', ()
     // Step 3: getConsularDays
     const days = await client.getConsularDays();
     expect(days).toHaveLength(2);
-    expect(days[0].date).toBe('2026-10-21');
+    expect(days[0]!.date).toBe('2026-10-21');
 
     // Step 4: getConsularTimes
     const times = await client.getConsularTimes('2026-10-21');
@@ -506,7 +506,7 @@ describe('full flow: refreshTokens → getCurrentAppointment → reschedule', ()
 
     // Step 5: getCasDays
     const casDays = await client.getCasDays('2026-10-21', '09:00');
-    expect(casDays[0].date).toBe('2026-10-15');
+    expect(casDays[0]!.date).toBe('2026-10-15');
 
     // Step 6: getCasTimes
     const casTimes = await client.getCasTimes('2026-10-15');

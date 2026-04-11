@@ -25,6 +25,8 @@ const BASE_CREDS = {
   email: 'test@example.com',
   password: 'testpass',
   locale: 'es-co',
+  scheduleId: '00000000',
+  applicantIds: ['00000000'],
   skipTokens: true as const,
 };
 

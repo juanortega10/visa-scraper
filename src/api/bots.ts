@@ -267,10 +267,10 @@ async function fetchRecentEvents(since24: Date, botCurrentDate: Record<number, s
     if (!events[r.botId]) events[r.botId] = { successes: [], failedCount: 0 };
     if (r.success) {
       if (r.newConsularDate === botCurrentDate[r.botId]) {
-        events[r.botId].successes.push({ date: r.newConsularDate, time: r.newConsularTime, at: r.createdAt.toISOString() });
+        events[r.botId]!.successes.push({ date: r.newConsularDate!, time: r.newConsularTime!, at: r.createdAt.toISOString() });
       }
     } else {
-      events[r.botId].failedCount++;
+      events[r.botId]!.failedCount++;
     }
   }
   return events;
@@ -377,14 +377,14 @@ botsRouter.get('/recent-events', async (c) => {
     if (log.success) {
       // Only show success badge when newConsularDate matches current appointment (guards against portal reversion)
       if (log.newConsularDate === currentDateByBot[log.botId]) {
-        result[log.botId].successes.push({
-          date: log.newConsularDate,
-          time: log.newConsularTime,
+        result[log.botId]!.successes.push({
+          date: log.newConsularDate!,
+          time: log.newConsularTime!,
           at: log.createdAt.toISOString(),
         });
       }
     } else {
-      result[log.botId].failedCount++;
+      result[log.botId]!.failedCount++;
     }
   }
   return c.json(result);
