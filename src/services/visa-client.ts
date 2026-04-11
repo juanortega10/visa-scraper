@@ -55,7 +55,7 @@ export class VisaClient {
   private collectsBiometrics: boolean | null = null;  // from data-collects-biometrics attr
   private hasAscFields: boolean | null = null;         // whether ASC form fields exist in HTML
   private capturedPages = new Map<string, string>();
-  private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null };
+  private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null, tcpSubcategory: null, poolExhausted: false, socketBytesRead: null };
 
   constructor(session: VisaSession, config: VisaClientConfig) {
     this.session = { ...session };
