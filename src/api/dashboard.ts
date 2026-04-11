@@ -3388,7 +3388,7 @@ function renderCalendar(){
   var monNext=document.getElementById('calMonNext');
   var monInfo=document.getElementById('calMonInfo');
 
-  /* Mode 3: Historia — tabla all-time una fila por día */
+  /* Mode 3: History — all-time table, one row per day */
   if(calMode===3){
     infoEl.textContent='';monInfo.textContent='';
     prevBtn.classList.add('dis');nextBtn.classList.add('dis');

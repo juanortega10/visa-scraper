@@ -48,7 +48,7 @@ logsRouter.get('/bots/:id/logs/polls/summary', async (c) => {
   function getEffectiveDate(r: typeof rows[number]): string | null {
     if (r.earliestDate) return r.earliestDate;
     const td = r.topDates as string[] | null;
-    return td && td.length > 0 ? td[0] : null;
+    return td && td.length > 0 ? td[0] ?? null : null;
   }
 
   // 30-min buckets (uses effective date — raw trend even for filtered_out)
@@ -116,14 +116,14 @@ logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
 
   // Reconstruct dateChanges from topDates for polls missing it (historical)
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i].dateChanges) continue;
-    const curTd = rows[i].topDates as string[] | null;
+    if (rows[i]!.dateChanges) continue;
+    const curTd = rows[i]!.topDates as string[] | null;
     if (!curTd || curTd.length === 0) continue;
     const curSet = new Set(curTd);
     // Find older poll with topDates
     const prevSet = new Set<string>();
     for (let k = i + 1; k < rows.length; k++) {
-      const ptd = rows[k].topDates as string[] | null;
+      const ptd = rows[k]!.topDates as string[] | null;
       if (ptd && ptd.length > 0) { ptd.forEach((d) => prevSet.add(d)); break; }
     }
     const appeared = [...curSet].filter((d) => !prevSet.has(d));
@@ -193,8 +193,8 @@ logsRouter.get('/bots/:id/logs/polls/cancellations', async (c) => {
     return c.json(null);
   }
 
-  const tMin = rows.length > 0 ? new Date(rows[rows.length - 1].createdAt!).getTime() : 0;
-  let tMax = rows.length > 0 ? new Date(rows[0].createdAt!).getTime() : 1;
+  const tMin = rows.length > 0 ? new Date(rows[rows.length - 1]!.createdAt!).getTime() : 0;
+  let tMax = rows.length > 0 ? new Date(rows[0]!.createdAt!).getTime() : 1;
   if (tMin === tMax) tMax = tMin + 1;
 
   const bursts = [...burstMap.values()]
@@ -534,7 +534,7 @@ logsRouter.get('/bots/:id/proxy-pool', async (c) => {
 
   // Seed unobserved Webshare IPs with zero stats
   for (const { ip } of websharePool) {
-    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '' };
+    if (!ipData[ip]) ipData[ip] = { polls: 0, tcpBlocked: 0, ok: 0, latencies: [], lastSeen: '', lastStatus: '', embassyBlock: 0, proxyInfra: 0, proxyQuota: 0 };
   }
 
   // Build response — attach Webshare metadata where available
@@ -634,8 +634,8 @@ logsRouter.get('/bots/:id/logs/date-sightings', async (c) => {
     totalEvents: rows.length,
     uniqueDates: new Set(rows.map(r => r.date)).size,
     closeCount: rows.filter(r => r.daysFromNow != null && r.daysFromNow < 60).length,
-    tMin: rows.length > 0 ? new Date(rows[rows.length - 1].appearedAt).getTime() : 0,
-    tMax: rows.length > 0 ? new Date(rows[0].appearedAt).getTime() : 1,
+    tMin: rows.length > 0 ? new Date(rows[rows.length - 1]!.appearedAt).getTime() : 0,
+    tMax: rows.length > 0 ? new Date(rows[0]!.appearedAt).getTime() : 1,
   };
   setCached(cacheKey, result, 60_000);
   return c.json(result);
