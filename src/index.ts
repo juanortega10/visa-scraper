@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
 import { botsRouter } from './api/bots.js';
+import { agenciesRouter } from './api/agencies.js';
 import { logsRouter } from './api/logs.js';
 import { devRouter } from './api/dev.js';
 import { dashboardRouter } from './api/dashboard.js';
@@ -13,7 +14,7 @@ const app = new Hono();
 app.use('/api/*', cors({
   origin: ['https://visagente.com', 'https://www.visagente.com', 'http://localhost:3001'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
 }));
 
 app.onError((err, c) => {
@@ -28,6 +29,7 @@ app.route('/dashboard', dashboardRouter);
 app.use('/api/*', apiAuth());
 
 app.route('/api/bots', botsRouter);
+app.route('/api/agencies', agenciesRouter);
 app.route('/api', logsRouter);
 app.route('/api/dev', devRouter);
 app.route('/api/blocks', blockIntelRouter);

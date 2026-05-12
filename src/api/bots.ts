@@ -1,13 +1,13 @@
 import { Hono } from 'hono';
-import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
-import { bots, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
+import { bots, agencies, botCredentialAttempts, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, asc, gte, sql, isNotNull } from 'drizzle-orm';
+import { eq, and, desc, asc, gte, sql, isNotNull, count } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
 import type { DiscoverResult } from '../services/login.js';
+import { setDiscoveryToken, consumeDiscoveryToken } from '../services/discovery-tokens.js';
 import { getEffectiveWebshareUrls } from '../services/proxy-fetch.js';
 import { pollVisaTask } from '../trigger/poll-visa.js';
 import { notifyUserTask } from '../trigger/notify-user.js';
@@ -31,21 +31,7 @@ const COUNTRY_DEFAULTS: Record<string, { maxReschedules?: number; targetDateBefo
   pe: { maxReschedules: 1, targetDateBefore: '2026-04-01' },
 };
 
-// ── Discovery token cache (in-memory, 5 min TTL) ────────
-
-interface DiscoveryCache {
-  result: DiscoverResult;
-  expiresAt: number;
-}
-
-const discoveryTokens = new Map<string, DiscoveryCache>();
-
-function cleanExpiredTokens(): void {
-  const now = Date.now();
-  for (const [key, entry] of discoveryTokens) {
-    if (entry.expiresAt < now) discoveryTokens.delete(key);
-  }
-}
+// Discovery token cache moved to ../services/discovery-tokens.ts (shared with agencies router).
 
 // ── Validation helpers ─────────────────────────────────────
 
@@ -195,6 +181,11 @@ botsRouter.get('/me', clerkAuth({ required: true }), async (c) => {
       currentConsularTime: bots.currentConsularTime,
       currentCasDate: bots.currentCasDate,
       currentCasTime: bots.currentCasTime,
+      rescheduleCount: bots.rescheduleCount,
+      maxReschedules: bots.maxReschedules,
+      targetDateBefore: bots.targetDateBefore,
+      activatedAt: bots.activatedAt,
+      agencyId: bots.agencyId,
       createdAt: bots.createdAt,
     })
     .from(bots)
@@ -419,23 +410,48 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     targetDateBefore,
     maxReschedules,
     notificationPhone,
+    agencyId: agencyIdFromBody,
+    credentialAttemptId,
   } = body;
 
-  // Check if discoveryToken has a cached session we can reuse
-  let cachedDiscovery: DiscoveryCache | undefined;
-  if (discoveryToken && typeof discoveryToken === 'string') {
-    cachedDiscovery = discoveryTokens.get(discoveryToken);
-    if (cachedDiscovery && cachedDiscovery.expiresAt < Date.now()) {
-      discoveryTokens.delete(discoveryToken);
-      cachedDiscovery = undefined;
-    }
-    if (cachedDiscovery) {
-      discoveryTokens.delete(discoveryToken); // one-time use
-    }
-  }
+  // Check if discoveryToken has a cached session we can reuse (one-time consume)
+  const cachedDiscovery: DiscoverResult | undefined =
+    typeof discoveryToken === 'string' ? consumeDiscoveryToken(discoveryToken) : undefined;
 
   // Validate credentials (skip if discoveryToken cached — already validated during discover)
   const clerkUser = c.get('clerkUser');
+
+  // ── Agency validation (ownership + maxBots cap) ─────────────────────────
+  let agency: typeof agencies.$inferSelect | undefined;
+  const parsedAgencyId =
+    typeof agencyIdFromBody === 'number'
+      ? agencyIdFromBody
+      : typeof agencyIdFromBody === 'string'
+      ? parseInt(agencyIdFromBody, 10)
+      : null;
+  if (parsedAgencyId != null && !isNaN(parsedAgencyId)) {
+    if (!clerkUser?.clerkUserId) {
+      return c.json({ error: 'authentication required to create bots under an agency' }, 401);
+    }
+    const [row] = await db.select().from(agencies).where(eq(agencies.id, parsedAgencyId));
+    if (!row) return c.json({ error: 'agency_not_found' }, 404);
+    if (row.clerkUserId !== clerkUser.clerkUserId) return c.json({ error: 'forbidden' }, 403);
+    const [{ existing = 0 } = { existing: 0 }] = await db
+      .select({ existing: count() })
+      .from(bots)
+      .where(eq(bots.agencyId, parsedAgencyId));
+    if (existing >= row.maxBots) {
+      return c.json(
+        {
+          error: 'agency_max_bots_reached',
+          message: `Tu plan cubre ${row.maxBots} cuentas. Contacta a Visagente para ampliar.`,
+        },
+        400,
+      );
+    }
+    agency = row;
+  }
+
   console.log(`[create-bot] email=${visaEmail} locale=${locale} facility=${consularFacilityId} clerk=${clerkUser?.clerkUserId ?? 'anon'} discovery=${!!cachedDiscovery}`);
   if (!cachedDiscovery) {
     try {
@@ -497,6 +513,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       notificationPhone: notificationPhone ?? null,
       proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
+      agencyId: agency?.id ?? null,
       status: 'login_required',
       activatedAt: new Date(),
     })
@@ -507,8 +524,25 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   // Log successful bot creation with botId
   logAuth({ email: visaEmail, action: 'create_bot', locale, result: 'ok', clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c), botId: bot.id });
 
-  // Notify Kapso (fire-and-forget)
-  if (notificationPhone) {
+  // Mark the credential attempt as used (links it to the bot for audit). No-op if the
+  // attemptId wasn't provided or doesn't belong to this agency.
+  if (agency && credentialAttemptId != null) {
+    const attemptIdNum = typeof credentialAttemptId === 'number'
+      ? credentialAttemptId
+      : parseInt(String(credentialAttemptId), 10);
+    if (!isNaN(attemptIdNum)) {
+      await db
+        .update(botCredentialAttempts)
+        .set({ status: 'used', botId: bot.id, updatedAt: new Date() })
+        .where(and(eq(botCredentialAttempts.id, attemptIdNum), eq(botCredentialAttempts.agencyId, agency.id)));
+    }
+  }
+
+  // Notify Kapso (fire-and-forget). Skip when the bot belongs to a free-tier agency
+  // so the WhatsApp sales funnel isn't polluted with non-paying activations.
+  // When v2 flips agency.billingMode to 'paid', notifications start flowing automatically.
+  const skipKapso = agency?.billingMode === 'free';
+  if (notificationPhone && !skipKapso) {
     notifyKapsoActivation(notificationPhone, bot.id).catch(() => {});
   }
 
@@ -541,7 +575,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     // Reuse session from discover-account → activate immediately + start poll chain
     await db.insert(sessions).values({
       botId: bot.id,
-      yatriCookie: encrypt(cachedDiscovery.result.cookie),
+      yatriCookie: encrypt(cachedDiscovery.cookie),
     });
     await db.update(bots)
       .set({ status: 'active', updatedAt: new Date() })
@@ -642,7 +676,7 @@ function classifyFetchError(e: unknown): { label: string; detail: string } {
 
 /** Tries discoverAccount direct, then up to 4 Webshare IPs (from WEBSHARE_API_KEY) on network error.
  *  Returns the result plus a compact `via` string summarising all attempts (persisted in auth_logs). */
-async function discoverWithFallback(
+export async function discoverWithFallback(
   email: string, password: string, locale: string,
 ): Promise<{ result: DiscoverResult; via: string }> {
   const attempts: string[] = [];
@@ -728,14 +762,9 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
     const { result, via } = await discoverWithFallback(email, password, locale);
 
     // Store discovery result with a token for session reuse when creating bot
-    cleanExpiredTokens();
     console.log(`[discover-account] OK email=${email} schedule=${result.scheduleId} applicants=${result.applicantIds.length} consular=${result.currentConsularDate} via=${via}`);
     logAuth({ email, action: 'discover', locale, result: 'ok', errorMessage: via, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
-    const discoveryToken = randomUUID();
-    discoveryTokens.set(discoveryToken, {
-      result,
-      expiresAt: Date.now() + 5 * 60 * 1000, // 5 min TTL
-    });
+    const discoveryToken = setDiscoveryToken(result);
 
     return c.json({
       discoveryToken,

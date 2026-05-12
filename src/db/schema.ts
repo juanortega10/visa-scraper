@@ -32,6 +32,16 @@ export const proxyProviderEnum = pgEnum('proxy_provider', [
   'webshare',
 ]);
 
+export const billingModeEnum = pgEnum('billing_mode', ['free', 'paid']);
+
+export const credentialAttemptStatusEnum = pgEnum('credential_attempt_status', [
+  'pending',
+  'discovering',
+  'ready',
+  'failed',
+  'used',
+]);
+
 
 // ── CAS Cache Types ──────────────────────────────────────
 
@@ -115,12 +125,14 @@ export const bots = pgTable(
     ownerEmail: text('owner_email'),                  // bot owner — only gets reschedule_success
     notificationPhone: text('notification_phone'),    // WhatsApp phone, digits only (e.g. "573142963759")
     activatedAt: timestamp('activated_at'),
+    agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
   },
   (table) => [
     index('bots_status_idx').on(table.status),
     index('bots_schedule_idx').on(table.scheduleId),
+    index('bots_agency_idx').on(table.agencyId),
   ],
 );
 
@@ -457,6 +469,78 @@ export interface BanPollDetail {
   err?: string;         // error message (truncated)
 }
 
+// ── Agencies ───────────────────────────────────────────
+// Source of truth for billing/contact info for agency-managed bots. Individual
+// users (no agency) have agency_id=null on their bots. Single Clerk user per
+// agency in v1; can migrate to Clerk Orgs later if multi-user access needed.
+
+export const agencies = pgTable(
+  'agencies',
+  {
+    id: serial('id').primaryKey(),
+    name: text('name').notNull(),
+    clerkUserId: varchar('clerk_user_id', { length: 50 }).notNull(),  // admin/contact
+    contactEmail: text('contact_email').notNull(),
+    contactPhone: text('contact_phone'),                              // WhatsApp, plain text (matches bots.notificationPhone convention)
+    billingMode: billingModeEnum('billing_mode').notNull().default('free'),  // v2 toggles to 'paid' here
+    maxBots: integer('max_bots').notNull().default(5),                // cap; paid agencies bumped via admin script
+    notes: text('notes'),                                              // internal notes (deal terms, who closed, etc.)
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (table) => [
+    index('agencies_clerk_idx').on(table.clerkUserId),
+  ],
+);
+
+// ── Bot Credential Attempts ────────────────────────────
+// Persists encrypted creds BEFORE attempting discovery against the visa portal.
+// If the portal is down or the user closes the tab, attempts survive and can
+// be retried from /agencias-piloto or the dashboard. Concurrency at the
+// frontend is capped at 2 simultaneous discoveries.
+
+export interface DiscoveredAttemptData {
+  scheduleId: string;
+  userId: string;
+  applicantIds: string[];
+  applicantNames: string[];
+  currentConsularDate: string | null;
+  currentConsularTime: string | null;
+  currentCasDate: string | null;
+  currentCasTime: string | null;
+  consularFacilityId: string;
+  ascFacilityId: string;
+  collectsBiometrics: boolean;
+  primaryVisaCategory?: string | null;
+  primaryVisaTypeRaw?: string | null;
+  applicantVisaTypes?: string[] | null;
+}
+
+export const botCredentialAttempts = pgTable(
+  'bot_credential_attempts',
+  {
+    id: serial('id').primaryKey(),
+    agencyId: integer('agency_id').notNull(),                         // FK to agencies.id (validated app-side)
+    visaEmail: text('visa_email').notNull(),                          // encrypted (AES-256-GCM)
+    visaPassword: text('visa_password').notNull(),                    // encrypted
+    country: varchar('country', { length: 2 }).notNull(),             // 2-letter code (co, pe, br, ...)
+    locale: varchar('locale', { length: 10 }),                        // resolved locale, populated after discover
+    status: credentialAttemptStatusEnum('status').notNull().default('pending'),
+    discoveryToken: varchar('discovery_token', { length: 64 }),       // links to discoveryTokens cache when status=ready
+    discoveredData: jsonb('discovered_data').$type<DiscoveredAttemptData | null>(),
+    lastError: text('last_error'),                                    // populated when status=failed
+    lastAttemptAt: timestamp('last_attempt_at'),
+    retryCount: integer('retry_count').notNull().default(0),
+    botId: integer('bot_id'),                                         // populated when status=used (links to created bot)
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (table) => [
+    index('credential_attempts_agency_idx').on(table.agencyId),
+    index('credential_attempts_status_idx').on(table.status),
+  ],
+);
+
 // ── Type exports ───────────────────────────────────────
 
 export type Bot = typeof bots.$inferSelect;
@@ -471,3 +555,7 @@ export type NotificationLog = typeof notificationLogs.$inferSelect;
 export type BookableEvent = typeof bookableEvents.$inferSelect;
 export type DateSighting = typeof dateSightings.$inferSelect;
 export type BanEpisode = typeof banEpisodes.$inferSelect;
+export type Agency = typeof agencies.$inferSelect;
+export type NewAgency = typeof agencies.$inferInsert;
+export type BotCredentialAttempt = typeof botCredentialAttempts.$inferSelect;
+export type NewBotCredentialAttempt = typeof botCredentialAttempts.$inferInsert;
