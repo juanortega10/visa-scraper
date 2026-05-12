@@ -19,7 +19,7 @@ async function triggerEligibleBots(source: Source): Promise<void> {
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     activatedAt: bots.activatedAt,
   }).from(bots)
-    .where(inArray(bots.status, ['active', 'error']));
+    .where(and(inArray(bots.status, ['active', 'error']), eq(bots.testMode, false)));
 
   if (activeBots.length === 0) {
     logger.info(`poll-cron-${source}: no eligible bots`);

@@ -514,7 +514,11 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
       agencyId: agency?.id ?? null,
-      status: 'login_required',
+      // Test-mode bots inherit from the agency: shown as active in the dashboard
+      // but never poll the embassy. Allows agency demos and Juan-side QA without
+      // burning visa-info.com sessions or triggering bans.
+      testMode: agency?.testMode ?? false,
+      status: agency?.testMode ? 'active' : 'login_required',
       activatedAt: new Date(),
     })
     .returning();
@@ -569,6 +573,14 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   }
 
   // ── Auto-activate ────────────────────────────────────────
+  // Test-mode bots short-circuit here: they're already inserted with status='active',
+  // we don't open a session, don't trigger pollVisaTask, don't trigger loginVisaTask.
+  // The dashboard sees an "active" bot but no embassy traffic happens.
+  if (bot.testMode) {
+    console.log(`[create-bot] testMode active — skipping trigger tasks for bot ${bot.id}`);
+    return c.json({ id: bot.id, status: 'active', testMode: true }, 201);
+  }
+
   let runId: string | undefined;
 
   if (cachedDiscovery) {

@@ -114,9 +114,17 @@ export const pollVisaTask = task({
       proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
+      testMode: bots.testMode,
     }).from(bots).where(eq(bots.id, botId));
     if (!bot || bot.status === 'paused') {
       logger.info('Bot not active, stopping poll chain', { botId, status: bot?.status });
+      return;
+    }
+    // Defensive guard: if a test-mode bot somehow gets enqueued (e.g. legacy cron
+    // or a flag-flip race), exit before contacting the embassy. The dashboard still
+    // shows the bot as 'active' but no portal traffic happens.
+    if (bot.testMode) {
+      logger.info('Bot in test mode, skipping poll', { botId });
       return;
     }
 

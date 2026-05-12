@@ -33,11 +33,12 @@ async function loadOwnedAgency(agencyId: number, clerkUserId: string) {
 
 agenciesRouter.post('/', clerkAuth({ required: true }), async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const { name, contactEmail, contactPhone, notes } = body as {
+  const { name, contactEmail, contactPhone, notes, testMode } = body as {
     name?: string;
     contactEmail?: string;
     contactPhone?: string;
     notes?: string;
+    testMode?: boolean;
   };
 
   if (!name || typeof name !== 'string' || name.trim().length < 2) {
@@ -67,6 +68,8 @@ agenciesRouter.post('/', clerkAuth({ required: true }), async (c) => {
 
   // billingMode and maxBots are NOT accepted from body — always 'free'/5 for public creation.
   // Upgrade to paid happens via admin-only path (script or env-token endpoint, future v2).
+  // testMode IS accepted from body — branded onboarding pages (e.g. /agencias/visasok)
+  // start agencies in demo mode so Juan can validate before flipping bots to real polling.
   const [agency] = await db
     .insert(agencies)
     .values({
@@ -77,10 +80,11 @@ agenciesRouter.post('/', clerkAuth({ required: true }), async (c) => {
       notes: notes ?? null,
       billingMode: 'free',
       maxBots: 5,
+      testMode: Boolean(testMode),
     })
     .returning();
 
-  console.log(`[agencies.create] id=${agency!.id} clerk=${clerkUser.clerkUserId} name="${name}"`);
+  console.log(`[agencies.create] id=${agency!.id} clerk=${clerkUser.clerkUserId} name="${name}" testMode=${agency!.testMode}`);
   return c.json(agency, 201);
 });
 

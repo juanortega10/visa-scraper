@@ -126,6 +126,7 @@ export const bots = pgTable(
     notificationPhone: text('notification_phone'),    // WhatsApp phone, digits only (e.g. "573142963759")
     activatedAt: timestamp('activated_at'),
     agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
+    testMode: boolean('test_mode').notNull().default(false),     // when true, bot is shown as active but never polls/contacts the embassy
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
   },
@@ -484,6 +485,7 @@ export const agencies = pgTable(
     contactPhone: text('contact_phone'),                              // WhatsApp, plain text (matches bots.notificationPhone convention)
     billingMode: billingModeEnum('billing_mode').notNull().default('free'),  // v2 toggles to 'paid' here
     maxBots: integer('max_bots').notNull().default(5),                // cap; paid agencies bumped via admin script
+    testMode: boolean('test_mode').notNull().default(false),          // when true, all bots created under this agency are demo bots (no embassy polling)
     notes: text('notes'),                                              // internal notes (deal terms, who closed, etc.)
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
