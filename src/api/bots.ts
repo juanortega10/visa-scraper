@@ -452,6 +452,27 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     agency = row;
   }
 
+  // ── Guard: refuse if the credential attempt already produced a bot ──────
+  // Prevents the agency from double-activating the same cuenta.
+  if (credentialAttemptId != null) {
+    const attemptIdNum = typeof credentialAttemptId === 'number'
+      ? credentialAttemptId
+      : parseInt(String(credentialAttemptId), 10);
+    if (!isNaN(attemptIdNum)) {
+      const [a] = await db
+        .select({ botId: botCredentialAttempts.botId, status: botCredentialAttempts.status })
+        .from(botCredentialAttempts)
+        .where(eq(botCredentialAttempts.id, attemptIdNum));
+      if (a?.botId) {
+        console.log(`[create-bot] attempt #${attemptIdNum} already has bot #${a.botId} — refusing duplicate`);
+        return c.json(
+          { error: 'attempt_already_used', existingBotId: a.botId, message: 'Esta cuenta ya está activa' },
+          409,
+        );
+      }
+    }
+  }
+
   console.log(`[create-bot] email=${visaEmail} locale=${locale} facility=${consularFacilityId} clerk=${clerkUser?.clerkUserId ?? 'anon'} discovery=${!!cachedDiscovery}`);
   if (!cachedDiscovery) {
     try {

@@ -196,30 +196,94 @@ agenciesRouter.post('/:id/credential-attempts', clerkAuth({ required: true }), a
     }
   }
 
-  const inserted = await db
-    .insert(botCredentialAttempts)
-    .values(
-      attempts.map((a) => ({
+  // ── Dedup by email ─────────────────────────────────────────────────────
+  // Prevents duplicate attempts from: (a) user pasting the same row twice,
+  // (b) race between eager-save on blur and explicit "Validar" click,
+  // (c) refresh-and-retype flows. Existing attempts are reused (we just
+  // update the password in case it changed), unless they're already 'used'.
+  const existingForAgency = await db
+    .select()
+    .from(botCredentialAttempts)
+    .where(eq(botCredentialAttempts.agencyId, agencyId));
+  const existingByEmail = new Map<string, typeof existingForAgency[number]>();
+  for (const ex of existingForAgency) {
+    try {
+      const e = decrypt(ex.visaEmail).toLowerCase();
+      const prev = existingByEmail.get(e);
+      if (!prev) {
+        existingByEmail.set(e, ex);
+      } else if (prev.status === 'used' && ex.status !== 'used') {
+        existingByEmail.set(e, ex);
+      } else if (prev.status !== 'used' && ex.status !== 'used' && ex.id > prev.id) {
+        existingByEmail.set(e, ex);
+      }
+    } catch { /* skip undecryptable */ }
+  }
+
+  type RespRow = {
+    id: number;
+    visaEmail: string;
+    country: string;
+    status: typeof botCredentialAttempts.$inferSelect.status;
+    createdAt: Date;
+    discoveredData?: typeof botCredentialAttempts.$inferSelect.discoveredData;
+    deduped?: boolean;
+  };
+  const responseRows: RespRow[] = [];
+  const toInsert: Array<{ agencyId: number; visaEmail: string; visaPassword: string; country: string; status: 'pending' }> = [];
+
+  for (const a of attempts) {
+    const key = a.visaEmail.toLowerCase();
+    const existing = existingByEmail.get(key);
+    if (existing) {
+      if (existing.status !== 'used') {
+        await db
+          .update(botCredentialAttempts)
+          .set({ visaPassword: encrypt(a.visaPassword), country: a.country.toLowerCase(), updatedAt: new Date() })
+          .where(eq(botCredentialAttempts.id, existing.id));
+      }
+      responseRows.push({
+        id: existing.id,
+        visaEmail: existing.visaEmail,
+        country: existing.country,
+        status: existing.status,
+        createdAt: existing.createdAt,
+        discoveredData: existing.discoveredData,
+        deduped: true,
+      });
+    } else {
+      toInsert.push({
         agencyId,
         visaEmail: encrypt(a.visaEmail),
         visaPassword: encrypt(a.visaPassword),
         country: a.country.toLowerCase(),
         status: 'pending' as const,
-      })),
-    )
-    .returning({
-      id: botCredentialAttempts.id,
-      visaEmail: botCredentialAttempts.visaEmail,
-      country: botCredentialAttempts.country,
-      status: botCredentialAttempts.status,
-      createdAt: botCredentialAttempts.createdAt,
-    });
+      });
+    }
+  }
 
-  console.log(`[agencies.attempts.bulk-create] agency=${agencyId} count=${inserted.length}`);
+  if (toInsert.length > 0) {
+    const inserted = await db
+      .insert(botCredentialAttempts)
+      .values(toInsert)
+      .returning({
+        id: botCredentialAttempts.id,
+        visaEmail: botCredentialAttempts.visaEmail,
+        country: botCredentialAttempts.country,
+        status: botCredentialAttempts.status,
+        createdAt: botCredentialAttempts.createdAt,
+      });
+    for (const ins of inserted) responseRows.push({ ...ins, discoveredData: null });
+  }
+
+  console.log(
+    `[agencies.attempts.bulk-create] agency=${agencyId} requested=${attempts.length}` +
+    ` new=${toInsert.length} deduped=${responseRows.length - toInsert.length}`,
+  );
 
   return c.json(
     {
-      attempts: inserted.map((row) => ({
+      attempts: responseRows.map((row) => ({
         ...row,
         visaEmail: (() => { try { return decrypt(row.visaEmail); } catch { return null; } })(),
       })),
