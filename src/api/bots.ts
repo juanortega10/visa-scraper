@@ -273,7 +273,7 @@ botsRouter.get('/landing', async (c) => {
   const since24 = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const since1h  = new Date(Date.now() - 60 * 60 * 1000);
 
-  const [allBots, originalDates, { health, health1h, uptime }] = await Promise.all([
+  const [allBots, originalDates, allAgencies, { health, health1h, uptime }] = await Promise.all([
     db.select({
       id: bots.id, locale: bots.locale, status: bots.status,
       ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
@@ -284,6 +284,10 @@ botsRouter.get('/landing', async (c) => {
       maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
       pollEnvironments: bots.pollEnvironments,
       casCacheJson: bots.casCacheJson,
+      agencyId: bots.agencyId,
+      testMode: bots.testMode,
+      activatedAt: bots.activatedAt,
+      visaEmail: bots.visaEmail,
     }).from(bots),
 
     db.select({
@@ -292,6 +296,17 @@ botsRouter.get('/landing', async (c) => {
     }).from(rescheduleLogs)
       .where(sql`old_consular_date is not null`)
       .groupBy(rescheduleLogs.botId),
+
+    db.select({
+      id: agencies.id,
+      name: agencies.name,
+      contactEmail: agencies.contactEmail,
+      contactPhone: agencies.contactPhone,
+      billingMode: agencies.billingMode,
+      testMode: agencies.testMode,
+      maxBots: agencies.maxBots,
+      createdAt: agencies.createdAt,
+    }).from(agencies).orderBy(desc(agencies.createdAt)),
 
     fetchPollStats(since24, since1h),
   ]);
@@ -309,9 +324,12 @@ botsRouter.get('/landing', async (c) => {
     const cache = (b.casCacheJson as CasCacheData | null) ?? null;
     const tracking = cache?.dateFailureTracking ?? {};
     const entries = Object.values(tracking);
-    const { casCacheJson: _omit, ...rest } = b;
+    const { casCacheJson: _omit, visaEmail: encEmail, ...rest } = b;
+    let visaEmailPlain = '';
+    try { visaEmailPlain = decrypt(encEmail); } catch { /* legacy rows or rotated key */ }
     return {
       ...rest,
+      visaEmail: visaEmailPlain,
       originalConsularDate: origDateByBot[b.id] ?? null,
       trackerSummary: {
         blockedCount: entries.filter(e => e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs).length,
@@ -320,7 +338,7 @@ botsRouter.get('/landing', async (c) => {
     };
   });
 
-  return c.json({ bots: botsOut, events, health, health1h, uptime });
+  return c.json({ bots: botsOut, agencies: allAgencies, events, health, health1h, uptime });
 });
 
 // Health-only endpoint — volatile stats without the bot list.

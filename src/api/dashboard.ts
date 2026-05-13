@@ -282,6 +282,58 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .fh-status-badge{font-size:7px;font-weight:700;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0}
 .fh-status-paused{background:rgba(156,163,175,.12);color:#9ca3af;border:1px solid #9ca3af}
 
+/* ── Agencias (encima del fleet) ── */
+.agy-section{margin:4px 0 14px}
+.agy-section-hdr{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:700;
+  text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px}
+.agy-section-hdr::after{content:'';flex:1;height:1px;background:var(--border)}
+.agy-section-hdr .pill{font-size:8px;font-weight:800;padding:1px 6px;border-radius:3px;
+  background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border);letter-spacing:.3px}
+.agy-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:10px 12px;margin-bottom:8px;border-left:2px solid var(--cyan)}
+.agy-card.agy-free{border-left-color:var(--cyan)}
+.agy-card.agy-paid{border-left-color:var(--green)}
+.agy-card.agy-testmode{border-left-color:var(--amber)}
+.agy-top{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.agy-name{font-size:13px;font-weight:800;color:var(--bright);letter-spacing:.3px}
+.agy-mode{font-size:7px;font-weight:800;padding:1px 5px;border-radius:3px;letter-spacing:.4px;text-transform:uppercase}
+.agy-mode-free{background:rgba(103,232,249,.1);color:var(--cyan);border:1px solid rgba(103,232,249,.25)}
+.agy-mode-paid{background:rgba(74,222,128,.1);color:var(--green);border:1px solid rgba(74,222,128,.25)}
+.agy-mode-test{background:rgba(252,211,77,.1);color:var(--amber);border:1px solid rgba(252,211,77,.25)}
+.agy-contact{font-size:9px;color:var(--muted);margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.agy-contact .em{color:var(--accent)}
+.agy-contact .wa{color:var(--green)}
+.agy-bots{display:flex;flex-direction:column;gap:4px}
+.agy-bot{display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--bg);
+  border:1px solid var(--border);border-radius:6px;text-decoration:none;color:inherit;
+  transition:border-color .15s,background .15s}
+.agy-bot:hover{border-color:var(--accent-border);background:var(--accent-dim)}
+.agy-bot-id{font-size:11px;font-weight:800;color:var(--accent);min-width:30px}
+.agy-bot-email{font-size:10px;color:var(--bright);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agy-bot-date{font-size:10px;font-weight:700;color:var(--bright);white-space:nowrap}
+.agy-bot-date.none{color:var(--dim);font-weight:400;font-style:italic}
+.agy-bot-days{font-size:9px;color:var(--muted);white-space:nowrap;min-width:28px;text-align:right}
+.agy-bot-chip{font-size:7px;font-weight:800;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+.agy-bot-chip-active{background:rgba(74,222,128,.1);color:var(--green)}
+.agy-bot-chip-paused{background:rgba(252,211,77,.1);color:var(--amber)}
+.agy-bot-chip-error{background:rgba(248,113,113,.1);color:var(--red)}
+.agy-bot-chip-login_required,.agy-bot-chip-created{background:rgba(96,165,250,.1);color:var(--blue)}
+.agy-bot-rs{font-size:8px;font-weight:700;color:var(--green);white-space:nowrap}
+.agy-bot-test{font-size:7px;color:var(--amber);font-style:italic;margin-left:2px}
+.agy-summary{display:flex;gap:10px;font-size:8px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
+.agy-summary span{font-weight:700}
+.agy-summary .ok{color:var(--green)}
+.agy-summary .warn{color:var(--amber)}
+.agy-summary .err{color:var(--red)}
+.agy-summary .neutral{color:var(--bright)}
+.agy-empty{font-size:10px;color:var(--dim);padding:6px 8px;text-align:center}
+
+.fh-agy-tag{font-size:7px;font-weight:800;padding:1px 4px;border-radius:3px;letter-spacing:.4px;
+  background:rgba(103,232,249,.1);color:var(--cyan);border:1px solid rgba(103,232,249,.25);
+  margin-left:4px;text-transform:uppercase;white-space:nowrap}
+.fh-agy-tag-paid{background:rgba(74,222,128,.1);color:var(--green);border-color:rgba(74,222,128,.25)}
+.fh-agy-tag-test{background:rgba(252,211,77,.1);color:var(--amber);border-color:rgba(252,211,77,.25)}
+
 </style>
 </head>
 <body>
@@ -296,6 +348,8 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
   <div class="stat"><div class="stat-val sk" style="height:24px;width:30px;margin:0 auto">&nbsp;</div><div class="stat-lbl">activos</div></div>
   <div class="stat"><div class="stat-val sk" style="height:24px;width:30px;margin:0 auto">&nbsp;</div><div class="stat-lbl">paises</div></div>
 </div>
+
+<div id="agencies-section" class="agy-section" style="display:none"></div>
 
 <div id="fleet-health"></div>
 
@@ -352,6 +406,118 @@ function timeAgo(iso){
   var h=Math.floor(m/60);
   if(h<24)return h+'h';
   return Math.floor(h/24)+'d';
+}
+
+function renderAgencies(agencies,bots,events){
+  var el=document.getElementById('agencies-section');
+  if(!el)return;
+  if(!agencies||!agencies.length){el.style.display='none';el.innerHTML='';return;}
+
+  var byAgency={};
+  for(var i=0;i<bots.length;i++){
+    var b=bots[i];
+    if(b.agencyId==null)continue;
+    if(!byAgency[b.agencyId])byAgency[b.agencyId]=[];
+    byAgency[b.agencyId].push(b);
+  }
+
+  var html='<div class="agy-section-hdr">agencias <span class="pill">'+agencies.length+'</span></div>';
+
+  var sortedAgencies=agencies.slice().sort(function(a,b){
+    var ca=(byAgency[a.id]||[]).length;
+    var cb=(byAgency[b.id]||[]).length;
+    if(ca!==cb)return cb-ca;
+    return new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime();
+  });
+
+  sortedAgencies.forEach(function(a){
+    var agencyBots=byAgency[a.id]||[];
+    var isTest=!!a.testMode;
+    var cardCls='agy-card '+(isTest?'agy-testmode':(a.billingMode==='paid'?'agy-paid':'agy-free'));
+    var modeChip=isTest
+      ?'<span class="agy-mode agy-mode-test">PILOTO</span>'
+      :(a.billingMode==='paid'
+          ?'<span class="agy-mode agy-mode-paid">PAID</span>'
+          :'<span class="agy-mode agy-mode-free">FREE</span>');
+
+    var contactBits=[];
+    if(a.contactPhone)contactBits.push('<span class="wa">wa:'+a.contactPhone.slice(-4)+'</span>');
+    if(a.contactEmail)contactBits.push('<span class="em">'+a.contactEmail.split('@')[0]+'</span>');
+    var contactHtml=contactBits.length?'<span class="agy-contact">'+contactBits.join(' <span style="color:var(--dim)">·</span> ')+'</span>':'';
+
+    var active=0,paused=0,errors=0,reschedSum=0;
+    agencyBots.forEach(function(b){
+      if(b.status==='active')active++;
+      else if(b.status==='paused')paused++;
+      if(b.status==='error'||(b.consecutiveErrors||0)>=3)errors++;
+      reschedSum+=(b.rescheduleCount||0);
+    });
+
+    var rowsHtml='';
+    if(!agencyBots.length){
+      rowsHtml='<div class="agy-empty">sin bots</div>';
+    }else{
+      agencyBots.sort(function(x,y){
+        var dx=x.currentConsularDate?new Date(x.currentConsularDate+'T00:00:00').getTime():Number.MAX_SAFE_INTEGER;
+        var dy=y.currentConsularDate?new Date(y.currentConsularDate+'T00:00:00').getTime():Number.MAX_SAFE_INTEGER;
+        if(dx!==dy)return dx-dy;
+        return x.id-y.id;
+      });
+      agencyBots.forEach(function(b){
+        var days=daysUntil(b.currentConsularDate);
+        var daysCol=days===''?'var(--dim)':(days<=7?'var(--red)':days<=30?'var(--amber)':'var(--muted)');
+        var dateHtml=b.currentConsularDate
+          ?'<span class="agy-bot-date">'+fmtD(b.currentConsularDate)+'</span>'
+          :'<span class="agy-bot-date none">sin cita</span>';
+        var daysHtml=days!==''?'<span class="agy-bot-days" style="color:'+daysCol+'">'+days+'d</span>':'';
+        var ev=events&&events[b.id];
+        var rsHtml='';
+        if(ev&&ev.successes&&ev.successes.length>0){
+          rsHtml='<span class="agy-bot-rs">↑ '+fmtEvDate(ev.successes[0].date)+'</span>';
+        }else if((b.rescheduleCount||0)>0){
+          rsHtml='<span class="agy-bot-rs" style="color:var(--muted)">'+b.rescheduleCount+'×</span>';
+        }
+        var testTag=b.testMode?' <span class="agy-bot-test">demo</span>':'';
+        var emailShort=(b.visaEmail||b.ownerEmail||'').split('@')[0]||'cuenta #'+b.id;
+        var statusChip='<span class="agy-bot-chip agy-bot-chip-'+b.status+'">'+b.status+'</span>';
+        rowsHtml+='<a class="agy-bot" href="/dashboard/'+b.id+'">'
+          +'<span class="agy-bot-id">#'+b.id+'</span>'
+          +'<span class="agy-bot-email">'+emailShort+testTag+'</span>'
+          +rsHtml
+          +dateHtml
+          +daysHtml
+          +statusChip
+        +'</a>';
+      });
+    }
+
+    var summaryBits=[];
+    summaryBits.push('<span class="neutral">'+agencyBots.length+'</span>/<span>'+a.maxBots+'</span> bots');
+    if(active>0)summaryBits.push('<span class="ok">'+active+' activos</span>');
+    if(paused>0)summaryBits.push('<span class="warn">'+paused+' pausados</span>');
+    if(errors>0)summaryBits.push('<span class="err">'+errors+' con errores</span>');
+    if(reschedSum>0)summaryBits.push('<span class="ok">'+reschedSum+' reagendados</span>');
+
+    html+='<div class="'+cardCls+'">'
+      +'<div class="agy-top">'
+        +'<span class="agy-name">'+a.name+'</span>'
+        +modeChip
+        +contactHtml
+      +'</div>'
+      +'<div class="agy-bots">'+rowsHtml+'</div>'
+      +'<div class="agy-summary">'+summaryBits.join(' <span style="color:var(--dim)">·</span> ')+'</div>'
+    +'</div>';
+  });
+
+  el.innerHTML=html;
+  el.style.display='block';
+}
+
+var _agencyById={};
+function indexAgencies(agencies){
+  _agencyById={};
+  if(!agencies)return;
+  for(var i=0;i<agencies.length;i++)_agencyById[agencies[i].id]=agencies[i];
 }
 
 /* Fleet health filter state — persists across 60s refreshes */
@@ -488,10 +654,17 @@ function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
     var caution=!isPaused&&((p1.total>0&&pct1!==null&&pct1<50)||p1.total===0);
     var ownerTxt=b.ownerEmail?' <span class="fh-owner">'+b.ownerEmail.split('@')[0]+'</span>':'';
     var phoneTxt=b.notificationPhone?' <span class="fh-phone">wa:'+b.notificationPhone.slice(-4)+'</span>':'';
+    var agyTag='';
+    if(b.agencyId&&_agencyById[b.agencyId]){
+      var agy=_agencyById[b.agencyId];
+      var tagCls=agy.testMode?'fh-agy-tag fh-agy-tag-test':(agy.billingMode==='paid'?'fh-agy-tag fh-agy-tag-paid':'fh-agy-tag');
+      var nameShort=(agy.name||'').length>10?(agy.name||'').substring(0,10)+'\u2026':(agy.name||'');
+      agyTag=' <span class="'+tagCls+'" title="'+agy.name+'">'+nameShort+'</span>';
+    }
 
     html+='<div class="fh-row'+(isPaused?' fh-row-paused':'')+'"'+(caution?' style="border-left:2px solid var(--amber);padding-left:10px"':'')+'>'
       +'<div class="fh-top">'
-        +'<a href="/dashboard/'+b.id+'" class="fh-bid">'+(caution?'\u26A0 ':'')+'#'+b.id+ownerTxt+phoneTxt+'</a>'
+        +'<a href="/dashboard/'+b.id+'" class="fh-bid">'+(caution?'\u26A0 ':'')+'#'+b.id+ownerTxt+phoneTxt+agyTag+'</a>'
         +'<div class="fh-top-right">'
           +datesPanel
           +'<div style="display:flex;gap:4px;align-items:center;justify-content:flex-end">'
@@ -595,15 +768,21 @@ function renderBotList(bots,events){
 }
 
 var _bots=[];
+var _agencies=[];
+var _lastEvents={};
 async function loadFull(){
   try{
     var res=await fetch('/api/bots/landing');
-    var data=res.ok?await res.json():{bots:[],events:{},health:{}};
+    var data=res.ok?await res.json():{bots:[],agencies:[],events:{},health:{}};
     _bots=data.bots||[];
+    _agencies=data.agencies||[];
+    _lastEvents=data.events||{};
+    indexAgencies(_agencies);
     if(!_bots.length){
       document.getElementById('content').innerHTML='<div class="empty-msg">no hay bots configurados</div>';
       document.getElementById('summary').innerHTML='';
       document.getElementById('fleet-health').innerHTML='';
+      renderAgencies(_agencies,_bots,_lastEvents);
       return;
     }
     var active=_bots.filter(function(b){return b.status==='active';}).length;
@@ -612,8 +791,9 @@ async function loadFull(){
       '<div class="stat"><div class="stat-val">'+_bots.length+'</div><div class="stat-lbl">bots</div></div>'+
       '<div class="stat"><div class="stat-val">'+active+'</div><div class="stat-lbl">activos</div></div>'+
       '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>';
-    renderFleetHealth(_bots,data.health||{},data.events||{},data.health1h||{},data.uptime||null);
-    renderBotList(_bots,data.events||{});
+    renderAgencies(_agencies,_bots,_lastEvents);
+    renderFleetHealth(_bots,data.health||{},_lastEvents,data.health1h||{},data.uptime||null);
+    renderBotList(_bots,_lastEvents);
   }catch(e){
     console.error('fetch error',e);
     document.getElementById('content').innerHTML='<div class="empty-msg">error cargando bots</div>';
@@ -625,7 +805,9 @@ async function loadHealth(){
     var res=await fetch('/api/bots/health-stats');
     if(!res.ok)return;
     var data=await res.json();
-    renderFleetHealth(_bots,data.health||{},data.events||{},data.health1h||{},data.uptime||null);
+    _lastEvents=data.events||_lastEvents;
+    renderAgencies(_agencies,_bots,_lastEvents);
+    renderFleetHealth(_bots,data.health||{},_lastEvents,data.health1h||{},data.uptime||null);
   }catch(e){console.error('health fetch error',e);}
 }
 
