@@ -1,17 +1,18 @@
 import { task, logger, metadata, runs } from '@trigger.dev/sdk/v3';
 import { visaPollingQueue, visaPollingPerBotQueue } from './queues.js';
-import { db } from '../db/client.js';
+import { db, withDbRetry } from '../db/client.js';
 import { bots, sessions, excludedDates, excludedTimes, pollLogs, rescheduleLogs, bookableEvents, dateSightings, banEpisodes, type BanPollDetail } from '../db/schema.js';
 import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
-import { filterDates, isAtLeastNDaysEarlier, computeDaysImprovement } from '../utils/date-helpers.js';
+import { filterDates, isAtLeastNDaysEarlier, computeDaysImprovement, addDays } from '../utils/date-helpers.js';
+import { MIN_DAYS_FROM_TODAY } from '../utils/constants.js';
 import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
 import { performLogin, InvalidCredentialsError, AccountLockedError, type LoginCredentials } from '../services/login.js';
-import { classifyProxyError, classifyTcpSubcategory, extractBytesRead, deriveBlockClassification, type ProxyProvider, type ProxyFetchMeta, type BlockClassification } from '../services/proxy-fetch.js';
+import { classifyProxyError, classifyTcpSubcategory, extractBytesRead, deriveBlockClassification, probeScheduleBlock, type ProxyProvider, type ProxyFetchMeta, type BlockClassification } from '../services/proxy-fetch.js';
 import { logAuth } from '../utils/auth-logger.js';
 import type { CasCacheData, DateFailureEntry } from '../db/schema.js';
 import { isBlocked, pruneDisappeared, CROSS_POLL_WINDOW_MS } from '../services/date-failure-tracker.js';
@@ -97,7 +98,7 @@ export const pollVisaTask = task({
     // Load bot (first — early exit if paused/missing)
     // SELECT specific columns — omit casCacheJson (~50-150 KB) to reduce Neon egress
     const loadStart = Date.now();
-    const [bot] = await db.select({
+    const [bot] = await withDbRetry(() => db.select({
       id: bots.id, status: bots.status,
       scheduleId: bots.scheduleId, applicantIds: bots.applicantIds,
       consularFacilityId: bots.consularFacilityId, ascFacilityId: bots.ascFacilityId,
@@ -109,13 +110,13 @@ export const pollVisaTask = task({
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore,
-      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback,
+      maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, minDaysFromToday: bots.minDaysFromToday,
       pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
       proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
       testMode: bots.testMode,
-    }).from(bots).where(eq(bots.id, botId));
+    }).from(bots).where(eq(bots.id, botId)));
     if (!bot || bot.status === 'paused') {
       logger.info('Bot not active, stopping poll chain', { botId, status: bot?.status });
       return;
@@ -224,7 +225,7 @@ export const pollVisaTask = task({
 
     metadata.set("phase", "Cargando sesion...");
     // Load session + exclusions + last poll (for date diff) in parallel
-    const [[session], exDates, exTimes, lastPollResult] = await Promise.all([
+    const [[session], exDates, exTimes, lastPollResult] = await withDbRetry(() => Promise.all([
       db.select({
         yatriCookie: sessions.yatriCookie,
         csrfToken: sessions.csrfToken,
@@ -238,7 +239,7 @@ export const pollVisaTask = task({
         .where(and(eq(pollLogs.botId, botId), isNotNull(pollLogs.topDates)))
         .orderBy(desc(pollLogs.id)).limit(1)
         .catch(() => [] as { rawDatesCount: number | null; topDates: string[] | null; allDates: Array<{date: string}> | null }[]),
-    ]);
+    ]));
     // Seed previousDates from last poll's allDates (full set) for accurate dateChanges detection
     // Falls back to topDates (3 entries) if allDates is missing (old polls)
     let previousDates: Set<string> | null = null;
@@ -414,6 +415,7 @@ export const pollVisaTask = task({
     );
 
     const dateExclusions = exDates.map((d) => ({ startDate: d.startDate, endDate: d.endDate }));
+    const minDate = addDays(new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' }), bot.minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
 
     let capturedConnInfo: LogPollExtra['connectionInfo'] = null;
     try {
@@ -573,7 +575,7 @@ export const pollVisaTask = task({
 
         allDays = firstDaysResult;
         runRawDatesCount = allDays.length;
-        days = filterDates(allDays, dateExclusions, bot.targetDateBefore);
+        days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
         metadata.set("phase", days.length > 0 ? `Analizando ${days.length} fechas...` : "Sin fechas disponibles");
 
         // Detect soft ban: dramatic date count drop.
@@ -634,7 +636,7 @@ export const pollVisaTask = task({
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
 
-          if (firstEarliest && bot.currentConsularDate && isAtLeastNDaysEarlier(firstEarliest, bot.currentConsularDate, 1)) {
+          if (firstEarliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(firstEarliest, bot.currentConsularDate, 1))) {
             foundImprovement = true;
           }
 
@@ -665,7 +667,7 @@ export const pollVisaTask = task({
             const fetchStart = Date.now();
             try {
               allDays = await client.getConsularDays();
-              days = filterDates(allDays, dateExclusions, bot.targetDateBefore);
+              days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
               consecutiveErrors = 0;
               consecutive5xx = 0;
             } catch (fetchErr) {
@@ -769,7 +771,7 @@ export const pollVisaTask = task({
 
             if (allDays.length > 0) runRawDatesCount = allDays.length;
 
-            if (fetchEarliest && bot.currentConsularDate && isAtLeastNDaysEarlier(fetchEarliest, bot.currentConsularDate, 1)) {
+            if (fetchEarliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(fetchEarliest, bot.currentConsularDate, 1))) {
               foundImprovement = true;
             }
           }
@@ -813,7 +815,8 @@ export const pollVisaTask = task({
               }).catch(e => logger.error('bookable_event insert failed', { error: String(e) }))
             );
           }
-        } else if (earliest && bot.currentConsularDate && isAtLeastNDaysEarlier(earliest, bot.currentConsularDate, 1)) {
+        } else if (earliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(earliest, bot.currentConsularDate, 1))) {
+          const isInitialBooking = bot.currentConsularDate === null;
           const RESCHEDULE_DEDUP_MS = 3 * 60 * 1000;
           const [recentReschedule] = await db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
             .from(rescheduleLogs)
@@ -826,11 +829,14 @@ export const pollVisaTask = task({
             // Update in-memory bot to reflect the new date from the other chain's reschedule
             bot.currentConsularDate = recentReschedule.newConsularDate;
           } else {
-          logger.info('EARLIER DATE FOUND — rescheduling inline', {
+          logger.info(isInitialBooking ? 'INITIAL BOOKING — booking inline' : 'EARLIER DATE FOUND — rescheduling inline', {
             botId,
             earliest,
             current: bot.currentConsularDate,
-            daysEarlier: Math.floor((new Date(bot.currentConsularDate).getTime() - new Date(earliest).getTime()) / 86400000),
+            initialBooking: isInitialBooking,
+            daysEarlier: bot.currentConsularDate
+              ? Math.floor((new Date(bot.currentConsularDate).getTime() - new Date(earliest).getTime()) / 86400000)
+              : null,
           });
 
           const timeExclusions = exTimes.map((t) => ({
@@ -934,8 +940,9 @@ export const pollVisaTask = task({
           }
 
           // If all candidates were blocked, no point calling executeReschedule — skip silently.
+          // For initial booking (currentConsularDate=null), any unblocked date is a valid candidate.
           const effectiveEarliest = daysForReschedule.find(
-            d => isAtLeastNDaysEarlier(d.date, bot.currentConsularDate!, 1),
+            d => bot.currentConsularDate === null || isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1),
           )?.date;
           if (!effectiveEarliest) {
             logger.info('All earlier dates blocked — skipping reschedule', {
@@ -958,6 +965,8 @@ export const pollVisaTask = task({
             pending,
             loginCredentials: loginCreds,
             maxReschedules: bot.maxReschedules,
+            runId: ctx.run.id,
+            sessionAgeMs,
           });
           timings.reschedule = Date.now() - rescheduleStart;
           rescheduleResultObj = result;
@@ -972,32 +981,32 @@ export const pollVisaTask = task({
             const rfDates = result.repeatedlyFailingDates ?? [];
             // no_cas_days: no short-term block — cross-poll tracker handles blocking after 5 failures in 1h
             if (fpDates.length > 0) {
-              const blockUntil2h = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
-              for (const d of fpDates) updatedBlocked[d] = blockUntil2h;
-              logger.info('CAS blocker: blocked dates after false_positive_verification', { botId, dates: fpDates, until: blockUntil2h });
+              const blockUntil6h = new Date(nowMs + 6 * 60 * 60 * 1000).toISOString();
+              for (const d of fpDates) updatedBlocked[d] = blockUntil6h;
+              logger.info('CAS blocker: blocked dates after false_positive_verification', { botId, dates: fpDates, until: blockUntil6h });
             }
             if (rfDates.length > 0) {
-              const blockUntil1h = new Date(nowMs + 60 * 60 * 1000).toISOString();
+              const blockUntil3h = new Date(nowMs + 3 * 60 * 60 * 1000).toISOString();
               for (const d of rfDates) {
-                if (!updatedBlocked[d] || new Date(updatedBlocked[d]!).getTime() < new Date(blockUntil1h).getTime()) {
-                  updatedBlocked[d] = blockUntil1h;
+                if (!updatedBlocked[d] || new Date(updatedBlocked[d]!).getTime() < new Date(blockUntil3h).getTime()) {
+                  updatedBlocked[d] = blockUntil3h;
                 }
               }
-              logger.info('CAS blocker: blocked dates after repeated failures', { botId, dates: rfDates, until: blockUntil1h });
+              logger.info('CAS blocker: blocked dates after repeated failures', { botId, dates: rfDates, until: blockUntil3h });
             }
           }
 
           // Merge newlyBlockedDates from cross-poll tracker (OUTSIDE !result.success guard)
           const newlyBlocked = result.newlyBlockedDates ?? [];
           if (newlyBlocked.length > 0) {
-            const blockUntil2hIso = new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
+            const blockUntil6hIso = new Date(nowMs + 6 * 60 * 60 * 1000).toISOString();
             for (const d of newlyBlocked) {
               const existing = updatedBlocked[d];
-              if (!existing || new Date(existing).getTime() < new Date(blockUntil2hIso).getTime()) {
-                updatedBlocked[d] = blockUntil2hIso;
+              if (!existing || new Date(existing).getTime() < new Date(blockUntil6hIso).getTime()) {
+                updatedBlocked[d] = blockUntil6hIso;
               }
             }
-            logger.info('tracker: blocked dates from cross-poll tracker', { botId, dates: newlyBlocked, until: new Date(nowMs + 2 * 60 * 60 * 1000).toISOString() });
+            logger.info('tracker: blocked dates from cross-poll tracker', { botId, dates: newlyBlocked, until: new Date(nowMs + 6 * 60 * 60 * 1000).toISOString() });
           }
 
           // Persist blockedConsularDates + dateFailureTracking in a single nested jsonb_set
@@ -1225,7 +1234,7 @@ export const pollVisaTask = task({
           allDays = await client.getConsularDays();
           { const proxyMeta = client.getLastProxyMeta(); if (proxyMeta.proxyAttemptIp) publicIp = proxyMeta.proxyAttemptIp; capturedConnInfo = captureConnInfo(proxyMeta, connInfoExtra); }
           runRawDatesCount = allDays.length;
-          days = filterDates(allDays, dateExclusions, bot.targetDateBefore);
+          days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
         } catch (fetchErr) {
           if (fetchErr instanceof SessionExpiredError) throw fetchErr;
           const errMsg = extractErrorMessage(fetchErr);
@@ -1428,6 +1437,21 @@ export const pollVisaTask = task({
           }
         }
       }
+      // ── Schedule-level block probe ──
+      // When account_ban is detected for the first time, probe the login page directly.
+      // If the domain responds, the ban is on the schedule URL path (nginx 444), not the account.
+      if (tcpBlock && (capturedConnInfo?.blockClassification === 'account_ban') && sustainedAccountBanCount === 0) {
+        const refined = await probeScheduleBlock(bot.locale ?? 'es-co');
+        if (refined === 'schedule_blocked' && capturedConnInfo) {
+          capturedConnInfo.blockClassification = 'schedule_blocked';
+          logger.warn('Schedule-level URL block detected — nginx 444 on schedule path, not account ban', {
+            botId,
+            scheduleId: bot.scheduleId,
+            locale: bot.locale,
+          });
+        }
+      }
+
       // ── Ban episode tracking ──
       if (tcpBlock) {
         const blockCls = capturedConnInfo?.blockClassification ?? 'transient';
@@ -1478,16 +1502,27 @@ export const pollVisaTask = task({
 
       if (tcpBlock && !tcpBlockNotified) {
         tcpBlockNotified = true;
+        const blockClsNow = capturedConnInfo?.blockClassification ?? 'transient';
         const errorSource = classifyProxyError(error, responseTimeMs);
-        logger.error('TCP BLOCK detected', { botId, error: errMsg, sustainedTcpBlockCount, errorSource });
-        if (sustainedTcpBlockCount === 0) {
-          // First block in this episode — notify once
+        logger.error('TCP BLOCK detected', { botId, error: errMsg, sustainedTcpBlockCount, errorSource, blockCls: blockClsNow });
+        if (sustainedTcpBlockCount === 0 && blockClsNow !== 'schedule_blocked') {
+          // First block in this episode — notify once (skip if schedule_blocked: internal infra issue, not user-facing)
           pending.push(
             notifyUserTask.trigger({
               botId,
               event: 'tcp_blocked',
               data: { error: errMsg, errorSource },
             }, { tags: [`bot:${botId}`] }).catch((e) => logger.error('tcp_blocked notify failed', { error: String(e) })),
+          );
+        }
+
+        // Auto-pause if schedule_blocked confirmed on 2+ consecutive polls — the block is permanent,
+        // no point keeping the bot in an infinite retry loop.
+        if (blockClsNow === 'schedule_blocked' && sustainedAccountBanCount >= 1) {
+          logger.warn('Auto-pausing bot: schedule path permanently blocked by server', { botId, scheduleId: bot.scheduleId, sustainedAccountBanCount });
+          pending.push(
+            db.update(bots).set({ status: 'paused' }).where(eq(bots.id, botId))
+              .catch((e) => logger.error('schedule_blocked auto-pause failed', { error: String(e) })),
           );
         }
       }
@@ -1559,7 +1594,12 @@ export const pollVisaTask = task({
       // 5xx throttle → 3min (server-side, not IP-specific)
       let delay: string;
       const blockCls = capturedConnInfo?.blockClassification;
-      if (tcpBlockNotified && bot.proxyProvider === 'webshare') {
+      if (tcpBlockNotified && blockCls === 'schedule_blocked') {
+        // Schedule URL is permanently nginx-444'd. Retrying frequently is pointless —
+        // use a long delay so the bot doesn't burn resources. Auto-pause handles the
+        // sustained case (see above); this covers the first occurrence.
+        delay = '240m';
+      } else if (tcpBlockNotified && bot.proxyProvider === 'webshare') {
         if (blockCls === 'account_ban') {
           // Account ban lasts 6h+. Probe first occurrence (could be transient pool exhaustion),
           // then escalate as the ban is confirmed to be sustained.
@@ -1575,7 +1615,7 @@ export const pollVisaTask = task({
           // Direct IP ban — escalate aggressively (ban lasts 6h+, no pool to rotate)
           delay = sustainedAccountBanCount <= 1 ? '10m'
             : sustainedAccountBanCount <= 3 ? '30m'
-            : '120m';
+            : '240m';
         } else {
           // Transient / connection_reset — existing behavior
           delay = sustainedTcpBlockCount <= 2 ? normalDelay

@@ -21,8 +21,8 @@
 import type { DateFailureEntry, FailureDimension } from '../db/schema.js';
 
 export const CROSS_POLL_THRESHOLD = 5;
-export const CROSS_POLL_BLOCK_MS = 2 * 60 * 60 * 1000; // 2h
-export const CROSS_POLL_WINDOW_MS = 60 * 60 * 1000;    // 1h
+export const CROSS_POLL_BLOCK_MS = 6 * 60 * 60 * 1000; // 6h (was 2h)
+export const CROSS_POLL_WINDOW_MS = 3 * 60 * 60 * 1000; // 3h (was 1h)
 
 /**
  * Increment a tracker entry. Pure: returns a new entry, never mutates input.

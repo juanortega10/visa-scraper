@@ -15,9 +15,10 @@ export type TcpSubcategory =
   | 'connection_refused';     // ECONNREFUSED
 
 export type BlockClassification =
-  | 'transient'    // pocas IPs fallaron, no exhausted
-  | 'ip_ban'       // pool exhausted, bytesRead > 0
-  | 'account_ban'; // bytesRead === 0 (servidor rechaza activamente)
+  | 'transient'        // pocas IPs fallaron, no exhausted
+  | 'ip_ban'           // pool exhausted, bytesRead > 0
+  | 'account_ban'      // bytesRead === 0 (servidor rechaza activamente)
+  | 'schedule_blocked'; // bytesRead === 0 pero el dominio responde — solo el URL del schedule está bloqueado (nginx 444)
 
 export function classifyProxyError(err: unknown, _latencyMs: number): ProxyErrorSource {
   const msg = err instanceof Error ? err.message : String(err);
@@ -182,6 +183,33 @@ export function deriveBlockClassification(meta: Pick<ProxyFetchMeta, 'socketByte
   if (meta.socketBytesRead === 0) return 'account_ban';
   if (meta.poolExhausted) return 'ip_ban';
   return 'transient';
+}
+
+/**
+ * Refines an `account_ban` (socket_immediate_close) classification:
+ * probes the login page directly to test if the domain itself is reachable.
+ *
+ * - Domain reachable → nginx 444 is on a specific URL path → `'schedule_blocked'`
+ * - Domain also drops → the account/IP is fully banned → `'account_ban'`
+ *
+ * Uses direct fetch (no proxy) so the result is IP-independent of the bot's provider.
+ * Times out quickly (5s) to not delay the poll chain.
+ */
+export async function probeScheduleBlock(locale: string = 'es-co'): Promise<'schedule_blocked' | 'account_ban'> {
+  const probeUrl = `https://ais.usvisa-info.com/${locale}/niv/users/sign_in`;
+  try {
+    const r = await fetch(probeUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(5_000),
+      redirect: 'manual',
+    });
+    // Any HTTP response (200, 302, 403, 404) means the domain is reachable → schedule path blocked
+    void r.body?.cancel();
+    return 'schedule_blocked';
+  } catch {
+    // Domain itself is unreachable → true account/IP ban
+    return 'account_ban';
+  }
 }
 
 // ── Proxy Pool Manager ───────────────────────────────────────────────────────

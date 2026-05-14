@@ -28,12 +28,21 @@ export function filterDates(
   dates: Array<{ date: string }>,
   excludedDates: DateRange[],
   targetDateBefore?: string | null,
+  minDate?: string | null,
 ): Array<{ date: string }> {
   return dates.filter((d) => {
     if (isDateExcluded(d.date, excludedDates)) return false;
     if (targetDateBefore && d.date >= targetDateBefore) return false;
+    if (minDate && d.date < minDate) return false;
     return true;
   });
+}
+
+/** Adds n calendar days to a YYYY-MM-DD string. Uses UTC arithmetic to avoid DST issues. */
+export function addDays(dateStr: string, n: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const date = new Date(Date.UTC(y!, m! - 1, d! + n));
+  return date.toISOString().split('T')[0]!;
 }
 
 export function filterTimes(

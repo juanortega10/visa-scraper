@@ -1,4 +1,4 @@
-import { task, logger } from '@trigger.dev/sdk/v3';
+import { task, logger, runs } from '@trigger.dev/sdk/v3';
 import { visaReschedulePerBotQueue } from './queues.js';
 import { db } from '../db/client.js';
 import { bots, sessions, excludedDates, excludedTimes } from '../db/schema.js';
@@ -21,7 +21,7 @@ export const rescheduleVisaTask = task({
   maxDuration: 120,
   retry: { maxAttempts: 2 },
 
-  run: async (payload: ReschedulePayload) => {
+  run: async (payload: ReschedulePayload, { ctx }) => {
     const { botId, dryRun = false } = payload;
     logger.info('reschedule-visa START', { botId, targetDate: payload.targetDate, dryRun });
 
@@ -79,6 +79,9 @@ export const rescheduleVisaTask = task({
       timeEnd: t.timeEnd,
     }));
 
+    const [sessionRow] = await db.select({ createdAt: sessions.createdAt }).from(sessions).where(eq(sessions.botId, botId));
+    const sessionAgeMs = sessionRow?.createdAt ? Date.now() - sessionRow.createdAt.getTime() : undefined;
+
     const pending: Promise<unknown>[] = [];
     const result = await executeReschedule({
       client,
@@ -88,6 +91,8 @@ export const rescheduleVisaTask = task({
       timeExclusions,
       dryRun,
       pending,
+      runId: ctx.run.id,
+      sessionAgeMs,
     });
     await Promise.allSettled(pending);
     return result;

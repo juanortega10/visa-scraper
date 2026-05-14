@@ -4,7 +4,8 @@ import { bots, sessions, rescheduleLogs } from '../db/schema.js';
 import { eq, sql, or, lt, isNull, and } from 'drizzle-orm';
 import { encrypt } from './encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js';
-import { filterDates, filterTimes, isAtLeastNDaysEarlier } from '../utils/date-helpers.js';
+import { filterDates, filterTimes, isAtLeastNDaysEarlier, isDateExcluded, addDays } from '../utils/date-helpers.js';
+import { MIN_DAYS_FROM_TODAY } from '../utils/constants.js';
 import { notifyUserTask } from '../trigger/notify-user.js';
 import type { DateRange, TimeRange } from '../utils/date-helpers.js';
 import type { CasCacheData, CasCacheEntry, DateFailureEntry, FailureDimension } from '../db/schema.js';
@@ -21,6 +22,7 @@ export interface RescheduleBot {
   maxCasGapDays?: number | null;
   skipCas?: boolean;
   speculativeTimeFallback?: boolean;
+  minDaysFromToday?: number | null;
 }
 
 // Historical times seen at Lima facility 115 (es-pe). Used as fallback when
@@ -37,6 +39,7 @@ export interface RescheduleAttempt {
   error?: string;
   cause?: string;
   durationMs: number;
+  timesFound?: string[];
 }
 
 export interface RescheduleParams {
@@ -52,6 +55,8 @@ export interface RescheduleParams {
   pending: Promise<unknown>[];
   loginCredentials?: { email: string; password: string; scheduleId: string; applicantIds: string[]; locale: string };
   maxReschedules?: number | null;
+  runId?: string;
+  sessionAgeMs?: number;
 }
 
 export interface RescheduleResult {
@@ -88,10 +93,31 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     pending,
     loginCredentials,
     maxReschedules,
+    runId,
+    sessionAgeMs,
   } = params;
   const totalStart = Date.now();
   const failedAttempts: RescheduleAttempt[] = [];
+  const provider = client.getConfig().proxyProvider;
+
+  /** Common diagnostic columns for every reschedule_logs insert. */
+  const diag = (attempt?: Pick<RescheduleAttempt, 'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound'>) => ({
+    runId: runId ?? null,
+    provider,
+    sessionAgeMs: sessionAgeMs ?? null,
+    ...(attempt ? {
+      failStep: attempt.failStep ?? null,
+      failReason: attempt.failReason,
+      durationMs: attempt.durationMs,
+      detail: {
+        ...(attempt.timesFound !== undefined ? { timesFound: attempt.timesFound } : {}),
+        ...(attempt.cause ? { cause: attempt.cause } : {}),
+        ...(attempt.error ? { error: attempt.error } : {}),
+      } satisfies Record<string, unknown>,
+    } : {}),
+  });
   let successfulPosts = 0; // Track POSTs in this invocation for maxReschedules guard
+  const minDate = addDays(new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' }), bot.minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
 
 
   if (dryRun) {
@@ -313,9 +339,20 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     }
   };
 
+  // Track whether the most recent claim actually incremented the counter.
+  // Initial bookings (currentConsularDate === null) skip the increment because the portal
+  // does NOT count the first appointment booking as a reschedule. Critical for Peru (max=2).
+  let lastClaimWasReal = false;
+
   // Atomic slot claim: UPDATE +1 WHERE rescheduleCount < maxReschedules (or unlimited).
   // Returns false if limit already reached — prevents TOCTOU race between workers.
   const claimSlot = async (): Promise<boolean> => {
+    // Initial booking: no slot to claim — portal doesn't count the first booking.
+    if (effectiveCurrentDate === null) {
+      lastClaimWasReal = false;
+      logger.info('claimSlot: skipped (initial booking)', { botId });
+      return true;
+    }
     const rows = await db.update(bots)
       .set({ rescheduleCount: sql`${bots.rescheduleCount} + 1` })
       .where(and(
@@ -327,14 +364,21 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       logger.warn('claimSlot: limit reached (atomic)', { botId, maxReschedules });
       return false;
     }
+    lastClaimWasReal = true;
     return true;
   };
 
   // Release a previously claimed slot on POST failure. Uses GREATEST to prevent underflow.
+  // Skip when the corresponding claim was a no-op (initial booking).
   const releaseSlot = async (reason: string): Promise<void> => {
+    if (!lastClaimWasReal) {
+      logger.info('releaseSlot: skipped (initial booking)', { botId, reason });
+      return;
+    }
     await db.update(bots)
       .set({ rescheduleCount: sql`GREATEST(${bots.rescheduleCount} - 1, 0)` })
       .where(eq(bots.id, botId));
+    lastClaimWasReal = false;
     logger.info('releaseSlot', { botId, reason });
   };
 
@@ -347,10 +391,23 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       logger.info(`Using pre-fetched days (attempt ${attempt}/${maxAttempts})`, { botId, count: consularDays.length });
     } else {
       logger.info(`Fetching consular days (attempt ${attempt}/${maxAttempts})`, { botId });
-      consularDays = await client.getConsularDays();
+      try {
+        consularDays = await client.getConsularDays();
+      } catch (fetchErr) {
+        // If we already secured a slot, don't lose it — break out of the improve loop
+        // so the caller still gets the success (and the post-success path runs:
+        // bookable_events insert, success notification, final verification).
+        if (securedResult) {
+          logger.warn('Improvement loop fetch failed but securedResult exists — returning secured', {
+            botId, attempt, error: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+          });
+          break;
+        }
+        throw fetchErr;
+      }
     }
 
-    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore);
+    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore, minDate);
     const candidates = filteredDays
       .filter((d) => effectiveCurrentDate ? isAtLeastNDaysEarlier(d.date, effectiveCurrentDate, 1) : true)
       .filter((d) => !exhaustedDates.has(d.date))
@@ -421,7 +478,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       }
       if (consularTimes.length === 0) {
         logger.warn('No consular times, re-fetching days', { botId });
-        failedAttempts.push({ date: candidate.date, failReason: 'no_times', durationMs: Date.now() - attemptStart });
+        failedAttempts.push({ date: candidate.date, failReason: 'no_times', failStep: 'get_consular_times', timesFound: consularTimesData.available_times?.filter((t): t is string => !!t) ?? [], durationMs: Date.now() - attemptStart });
         dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
         bumpTracker(candidate.date, 'consularNoTimes');
         exhaustedDates.add(candidate.date);
@@ -449,11 +506,29 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             speculative: isSpeculative,
           });
 
-          const postSuccess = await client.reschedule(candidate.date, consularTime);
+          let postSuccess = await client.reschedule(candidate.date, consularTime);
           postAttempted = true;
+
+          // Initial-booking safety net: the success redirect for a FIRST booking can differ
+          // from /instructions (used for reschedules). If redirect chain says false but the
+          // appointment actually exists, treat as success to avoid retrying a completed booking.
+          if (!postSuccess && effectiveCurrentDate === null) {
+            try {
+              const verifyAppt = await client.getCurrentAppointment();
+              if (verifyAppt && verifyAppt.consularDate === candidate.date) {
+                logger.info('Initial booking: redirect chain returned false but appointment created — overriding to success', {
+                  botId, candidate: candidate.date, verifyAppt,
+                });
+                postSuccess = true;
+              }
+            } catch (e) {
+              logger.warn('Initial booking safety net: getCurrentAppointment failed', { botId, error: e instanceof Error ? e.message : String(e) });
+            }
+          }
 
           if (!postSuccess) {
             logger.warn('Reschedule POST returned false', { botId, date: candidate.date, consularTime });
+            const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
             pending.push(
               db.insert(rescheduleLogs).values({
                 botId,
@@ -461,9 +536,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                 newConsularDate: candidate.date, newConsularTime: consularTime,
                 success: false, error: isSpeculative ? 'post_returned_false (speculative)' : 'post_returned_false',
+                ...diag(fa),
               }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
             );
-            failedAttempts.push({ date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+            failedAttempts.push(fa);
             continue; // slot still claimed, try next consular time
           }
 
@@ -478,6 +554,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 consularTime, prevDate: prevConsularDate,
               });
               verified = false;
+              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
               pending.push(
                 db.insert(rescheduleLogs).values({
                   botId,
@@ -485,26 +562,51 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                   oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                   newConsularDate: candidate.date, newConsularTime: consularTime,
                   success: false, error: isSpeculative ? 'false_positive_verification (speculative)' : 'false_positive_verification',
+                  ...diag(fa),
                 }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
               );
-              failedAttempts.push({ date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+              failedAttempts.push(fa);
               dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
               exhaustedDates.add(candidate.date);
               falsePositiveDates.add(candidate.date);
             }
           } catch (verifyErr) {
-            // Verification failed (network error) — proceed assuming success (better than losing a real reschedule)
-            logger.warn('Post-reschedule verification failed (no CAS), assuming success', {
-              botId, date: candidate.date, consularTime,
-              error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
-            });
+            const verifyErrMsg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+            if (isSpeculative) {
+              // Speculative time: cannot verify AND we guessed the slot — high false-positive risk.
+              // Release the slot rather than wasting a limited reschedule count.
+              logger.error('Post-reschedule verification failed (no CAS, speculative) — releasing slot', {
+                botId, date: candidate.date, consularTime, error: verifyErrMsg,
+              });
+              verified = false;
+              await releaseSlot('verification_network_error_speculative');
+              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+              pending.push(
+                db.insert(rescheduleLogs).values({
+                  botId,
+                  oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                  oldCasDate: prevCasDate, oldCasTime: prevCasTime,
+                  newConsularDate: candidate.date, newConsularTime: consularTime,
+                  success: false, error: 'verification_network_error (speculative)',
+                  ...diag(fa),
+                }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
+              );
+              failedAttempts.push(fa);
+              exhaustedDates.add(candidate.date);
+            } else {
+              // Real time slot: assuming success is safer than losing a confirmed reschedule
+              logger.warn('Post-reschedule verification failed (no CAS), assuming success', {
+                botId, date: candidate.date, consularTime, error: verifyErrMsg,
+              });
+            }
           }
 
           if (!verified) {
             continue; // Try next time/date (slot still claimed for this date)
           }
 
-          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isSpeculative ? ' (speculative)' : ''}`;
+          const isInitialBooking = prevConsularDate === null;
+          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isSpeculative ? ' (speculative)' : ''}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}`;
           pending.push(
             db.insert(rescheduleLogs).values({
               botId,
@@ -512,6 +614,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               oldCasDate: prevCasDate, oldCasTime: prevCasTime,
               newConsularDate: candidate.date, newConsularTime: consularTime,
               success: true, error: strategyNote,
+              ...diag(),
             }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
           );
 
@@ -581,6 +684,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         .filter(e => {
           if (e.slots <= 0) return false;
           if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
+          if (isDateExcluded(e.date, dateExclusions)) return false;
+          if (e.date < minDate) return false;
           const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
           return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
         })
@@ -617,6 +722,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             .filter(e => {
               if (e.slots <= 0) return false;
               if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
+              if (isDateExcluded(e.date, dateExclusions)) return false;
+              if (e.date < minDate) return false;
               const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
               return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
             })
@@ -648,7 +755,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       // Process results sequentially (best time first)
       let postAttempted = false;
       for (const { time: consularTime, casDays } of casResults) {
-        const filteredCasDays = filterDates(casDays, dateExclusions);
+        const filteredCasDays = filterDates(casDays, dateExclusions, undefined, minDate);
         logger.info('CAS days', { botId, consularTime, total: casDays.length, afterFilter: filteredCasDays.length, first: filteredCasDays[0]?.date });
         if (filteredCasDays.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, failReason: 'no_cas_days', durationMs: Date.now() - attemptStart });
@@ -690,11 +797,27 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           cas: `${casDate} ${casTime}`,
         });
 
-        const postSuccess = await client.reschedule(candidate.date, consularTime, casDate, casTime);
+        let postSuccess = await client.reschedule(candidate.date, consularTime, casDate, casTime);
         postAttempted = true;
+
+        // Initial-booking safety net (CAS path): see no-CAS path for rationale.
+        if (!postSuccess && effectiveCurrentDate === null) {
+          try {
+            const verifyAppt = await client.getCurrentAppointment();
+            if (verifyAppt && verifyAppt.consularDate === candidate.date) {
+              logger.info('Initial booking (CAS): redirect chain returned false but appointment created — overriding to success', {
+                botId, candidate: candidate.date, verifyAppt,
+              });
+              postSuccess = true;
+            }
+          } catch (e) {
+            logger.warn('Initial booking safety net (CAS): getCurrentAppointment failed', { botId, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
 
         if (!postSuccess) {
           logger.warn('Reschedule POST returned false', { botId, date: candidate.date, consularTime });
+          const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
           pending.push(
             db.insert(rescheduleLogs).values({
               botId,
@@ -703,9 +826,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               newConsularDate: candidate.date, newConsularTime: consularTime,
               newCasDate: casDate, newCasTime: casTime,
               success: false, error: 'post_returned_false',
+              ...diag(fa),
             }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
           );
-          failedAttempts.push({ date: candidate.date, consularTime, casDate, casTime, failReason: 'post_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+          failedAttempts.push(fa);
           continue; // slot still claimed, try next consular time
         }
 
@@ -719,6 +843,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               consularTime, casDate, casTime, prevDate: prevConsularDate,
             });
             verified = false;
+            const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
             pending.push(
               db.insert(rescheduleLogs).values({
                 botId,
@@ -727,9 +852,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 newConsularDate: candidate.date, newConsularTime: consularTime,
                 newCasDate: casDate, newCasTime: casTime,
                 success: false, error: 'false_positive_verification',
+                ...diag(fa),
               }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
             );
-            failedAttempts.push({ date: candidate.date, consularTime, casDate, casTime, failReason: 'verification_failed', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart });
+            failedAttempts.push(fa);
             dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
             exhaustedDates.add(candidate.date);
             falsePositiveDates.add(candidate.date);
@@ -745,7 +871,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           break; // Break inner loop (slot release handled after the loop)
         }
 
-        const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}`;
+        const isInitialBooking = prevConsularDate === null;
+        const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}`;
         pending.push(
           db.insert(rescheduleLogs).values({
             botId,
@@ -755,6 +882,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             newCasDate: casDate, newCasTime: casTime,
             success: true,
             error: strategyNote,
+            ...diag(),
           }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
         );
 
@@ -884,6 +1012,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                   newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
                   newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
                   success: true, error: `[post_error_recovered] ${errorMsg}`,
+                  ...diag({ failReason: 'post_error', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart, error: errorMsg }),
                 }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
               );
               pending.push(
@@ -925,6 +1054,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                   oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                   newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
                   success: false, error: `[portal_reversion] ${errorMsg}`,
+                  ...diag({ failReason: 'post_error', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart, error: errorMsg }),
                 }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
               );
               securedResult = null;
@@ -1077,6 +1207,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
   // Log failed reschedule attempt to reschedule_logs for traceability
   const failSummary = failedAttempts.map(a => `${a.date}:${a.failReason}${a.consularTime ? `@${a.consularTime}` : ''}`).join(', ');
+  const firstAttempt = failedAttempts[0];
   pending.push(
     db.insert(rescheduleLogs).values({
       botId,
@@ -1084,10 +1215,26 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       oldConsularTime: bot.currentConsularTime,
       oldCasDate: bot.currentCasDate,
       oldCasTime: bot.currentCasTime,
-      newConsularDate: failedAttempts[0]?.date ?? null,
-      newConsularTime: null,
+      newConsularDate: firstAttempt?.date ?? null,
+      newConsularTime: firstAttempt?.consularTime ?? null,
       success: false,
       error: failSummary,
+      ...diag(firstAttempt ? {
+        failReason: firstAttempt.failReason,
+        failStep: firstAttempt.failStep,
+        durationMs: firstAttempt.durationMs,
+        timesFound: firstAttempt.timesFound,
+        error: firstAttempt.error,
+        cause: firstAttempt.cause,
+      } : undefined),
+      ...(failedAttempts.length > 1 ? {
+        detail: {
+          allAttempts: failedAttempts.map(a => ({
+            date: a.date, failReason: a.failReason, failStep: a.failStep,
+            timesFound: a.timesFound, durationMs: a.durationMs,
+          })),
+        },
+      } : {}),
     }).catch((e) => logger.error('logReschedule (failed) insert error', { error: String(e) })),
   );
 
