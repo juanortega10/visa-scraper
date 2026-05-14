@@ -131,3 +131,6 @@ export function getValidCountryCodes(): string[] {
   }
   return [...codes].sort();
 }
+
+/** Minimum days from today a candidate reschedule date must be. Global rule: never book within 3 days. */
+export const MIN_DAYS_FROM_TODAY = 3;

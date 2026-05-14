@@ -117,6 +117,7 @@ export const bots = pgTable(
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
     speculativeTimeFallback: boolean('speculative_time_fallback').notNull().default(false), // true = try historical times when getConsularTimes returns empty (no-CAS only)
+    minDaysFromToday: integer('min_days_from_today'),                          // null = global default (3); 0 = disabled
     pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
     targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
@@ -124,6 +125,10 @@ export const bots = pgTable(
     notificationEmail: text('notification_email'),   // operational alerts (all events) — typically the admin
     ownerEmail: text('owner_email'),                  // bot owner — only gets reschedule_success
     notificationPhone: text('notification_phone'),    // WhatsApp phone, digits only (e.g. "573142963759")
+    visaCategory: varchar('visa_category', { length: 20 }),  // normalized code: "B1/B2", "F1", "J1", "TN", etc.
+    visaTypeRaw: text('visa_type_raw'),                       // full label from groups page (locale-specific, human-readable)
+    visaClassId: integer('visa_class_id'),                    // canonical server-side ID from applicant edit page (1=B1, 2=B1/B2, 11=F1, 22/88=J1, 49=TN, ...)
+    applicantVisaTypes: jsonb('applicant_visa_types').$type<string[] | null>(), // per-applicant raw labels (parallel to applicantIds when complete)
     activatedAt: timestamp('activated_at'),
     agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
     testMode: boolean('test_mode').notNull().default(false),     // when true, bot is shown as active but never polls/contacts the embassy
@@ -255,6 +260,14 @@ export const rescheduleLogs = pgTable(
     success: boolean('success').notNull(),
     dispatchLogId: integer('dispatch_log_id'),
     error: text('error'),
+    // Structured diagnostic fields (added 2026-04-14)
+    runId: varchar('run_id', { length: 100 }),
+    provider: varchar('provider', { length: 20 }),
+    sessionAgeMs: integer('session_age_ms'),
+    failStep: varchar('fail_step', { length: 50 }),
+    failReason: varchar('fail_reason', { length: 50 }),
+    durationMs: integer('duration_ms'),
+    detail: jsonb('detail').$type<Record<string, unknown>>(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (table) => [index('reschedule_logs_bot_idx').on(table.botId)],
