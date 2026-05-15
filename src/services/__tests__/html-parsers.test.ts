@@ -6,7 +6,15 @@ import {
   extractApplicantIdsFromAppointment,
   extractApplicantNames,
   extractAppointments,
+  extractApplicantVisaTypes,
+  normalizeVisaCategory,
+  pickPrimaryVisaCategory,
+  extractGroups,
+  extractVisaClassFromEditPage,
   extractFacilityIds,
+  detectOverloadError,
+  AppointmentFormMissingError,
+  hasKnownFacilities,
 } from '../html-parsers.js';
 
 // ── Fixtures ──────────────────────────────────────────
@@ -390,6 +398,37 @@ describe('parseApptDate', () => {
       .toEqual({ date: '2026-03-09', time: '08:15' });
   });
 
+  it('parses French date without comma after month', () => {
+    // fr-ca portal omits the comma between month and year: "9 mars 2026, 08:15"
+    expect(parseApptDate('9 mars 2026, 08:15 Heure locale de Vancouver'))
+      .toEqual({ date: '2026-03-09', time: '08:15' });
+  });
+
+  it('handles all 12 French months', () => {
+    const months = [
+      ['janvier', '01'], ['février', '02'], ['mars', '03'], ['avril', '04'],
+      ['mai', '05'], ['juin', '06'], ['juillet', '07'], ['août', '08'],
+      ['septembre', '09'], ['octobre', '10'], ['novembre', '11'], ['décembre', '12'],
+    ];
+    for (const [name, num] of months) {
+      expect(parseApptDate(`1 ${name} 2026, 09:00`))
+        .toEqual({ date: `2026-${num}-01`, time: '09:00' });
+    }
+  });
+
+  it('handles Portuguese months (Brazil)', () => {
+    expect(parseApptDate('15 março, 2026, 10:00')).toEqual({ date: '2026-03-15', time: '10:00' });
+    expect(parseApptDate('15 março 2026, 10:00')).toEqual({ date: '2026-03-15', time: '10:00' });
+    expect(parseApptDate('1 julho, 2026, 09:00')).toEqual({ date: '2026-07-01', time: '09:00' });
+    expect(parseApptDate('20 dezembro, 2026, 14:30')).toEqual({ date: '2026-12-20', time: '14:30' });
+  });
+
+  it('handles Italian months', () => {
+    expect(parseApptDate('9 marzo, 2026, 08:15')).toEqual({ date: '2026-03-09', time: '08:15' });
+    expect(parseApptDate('1 gennaio 2026, 09:00')).toEqual({ date: '2026-01-01', time: '09:00' });
+    expect(parseApptDate('20 maggio, 2026, 11:00')).toEqual({ date: '2026-05-20', time: '11:00' });
+  });
+
   it('returns null for unrecognized format', () => {
     expect(parseApptDate('No appointment')).toBeNull();
     expect(parseApptDate('')).toBeNull();
@@ -397,6 +436,93 @@ describe('parseApptDate', () => {
 
   it('returns null for unknown month name', () => {
     expect(parseApptDate('9 foobar, 2026, 08:15')).toBeNull();
+  });
+});
+
+describe('detectOverloadError', () => {
+  it('detects French overload message', () => {
+    expect(detectOverloadError('Le système est surchargé. Veuillez réessayer plus tard.')).toBe(true);
+  });
+
+  it('detects English overload message', () => {
+    expect(detectOverloadError('The system is overloaded. Please try again later.')).toBe(true);
+  });
+
+  it('detects Spanish overload message', () => {
+    expect(detectOverloadError('El sistema está sobrecargado.')).toBe(true);
+  });
+
+  it('detects Portuguese overload message', () => {
+    expect(detectOverloadError('O sistema sobrecarregado, tente mais tarde.')).toBe(true);
+  });
+
+  it('is case-insensitive', () => {
+    expect(detectOverloadError('SYSTEM IS OVERLOADED')).toBe(true);
+  });
+
+  it('returns false on normal page', () => {
+    expect(detectOverloadError('<html><body><select>...</select></body></html>')).toBe(false);
+  });
+});
+
+describe('hasKnownFacilities', () => {
+  it('returns true for es-co (Colombia)', () => {
+    expect(hasKnownFacilities('es-co')).toBe(true);
+  });
+
+  it('returns true for es-pe (Peru)', () => {
+    expect(hasKnownFacilities('es-pe')).toBe(true);
+  });
+
+  it('returns false for fr-ca (Canada — needs live extraction)', () => {
+    expect(hasKnownFacilities('fr-ca')).toBe(false);
+  });
+
+  it('returns false for pt-br (Brazil)', () => {
+    expect(hasKnownFacilities('pt-br')).toBe(false);
+  });
+});
+
+describe('extractFacilityIds — guardrail for unknown locales', () => {
+  it('throws AppointmentFormMissingError when live page has no consular select (fr-ca)', () => {
+    // Warning page returned 200 OK but has no <select> — should NOT silently
+    // return empty facility IDs because the locale has no KNOWN_FACILITIES fallback.
+    const warningPage = `<html><head><title>Avertissement Limite de Rendez-vous</title></head>
+      <body><p>Il vous reste 3 tentative(s) restante(s) avant d'atteindre la limite.</p>
+      <input type="checkbox" name="je_comprends"/></body></html>`;
+    expect(() => extractFacilityIds(warningPage, true, 'fr-ca'))
+      .toThrowError(AppointmentFormMissingError);
+  });
+
+  it('marks overload when error message present in missing-form HTML', () => {
+    const overloadPage = `<html><body>Le système est surchargé. Veuillez réessayer plus tard.</body></html>`;
+    try {
+      extractFacilityIds(overloadPage, true, 'fr-ca');
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(AppointmentFormMissingError);
+      expect((e as AppointmentFormMissingError).hasOverloadMarker).toBe(true);
+    }
+  });
+
+  it('does NOT throw for known locales (falls back to KNOWN_FACILITIES)', () => {
+    // Same warning page, but es-co has KNOWN_FACILITIES so we tolerate.
+    const warningPage = `<html><body>Atención</body></html>`;
+    expect(() => extractFacilityIds(warningPage, true, 'es-co')).not.toThrow();
+    expect(extractFacilityIds(warningPage, true, 'es-co').consularFacilityId).toBe('25');
+  });
+
+  it('successfully extracts consular facility from real fr-ca form (Vancouver=89)', () => {
+    const frCaForm = `<html><body>
+      <select name="appointments[consulate_appointment][facility_id]" id="appointments_consulate_appointment_facility_id">
+        <option value="" label=" "></option>
+        <option data-collects-biometrics="false" selected="selected" value="89">Vancouver</option>
+      </select>
+      <p>Le système est surchargé. Veuillez réessayer plus tard.</p>
+    </body></html>`;
+    const result = extractFacilityIds(frCaForm, true, 'fr-ca');
+    expect(result.consularFacilityId).toBe('89');
+    expect(result.ascFacilityId).toBe(''); // Canada has no ASC — legitimate absence
   });
 });
 
@@ -721,6 +847,214 @@ describe('real-world: extractFacilityIds with data-collects-biometrics', () => {
 describe('real-world: extractApplicantIdsFromAppointment (no checkboxes)', () => {
   it('returns empty — real Colombia pages have no applicant checkboxes', () => {
     expect(extractApplicantIdsFromAppointment(APPT_CO_REAL)).toEqual([]);
+  });
+});
+
+describe('extractApplicantVisaTypes', () => {
+  it('extracts visa-type label per applicant from real-world Colombia table', () => {
+    const labels = extractApplicantVisaTypes(GROUPS_E);
+    expect(labels).toHaveLength(4);
+    expect(labels[0]).toBe('B1/B2 Negocios y turismo (visitante temporal)');
+    expect(labels[3]).toBe('B1/B2 Negocios y turismo (visitante temporal)');
+  });
+
+  it('returns empty array when applicant table has no visa-type column', () => {
+    const html = `
+      <table>
+        <tr><td>Pedro</td><td>AT123</td></tr>
+        <tr><td>Maria</td><td>AT456</td></tr>
+      </table>
+    `;
+    expect(extractApplicantVisaTypes(html)).toEqual([]);
+  });
+
+  it('handles mixed visa types in same group', () => {
+    const html = `
+      <thead><tr><th>Nombre</th><th>Pasaporte</th><th class='show-for-medium'>DS-160</th><th class='show-for-medium'>Tipo de Visa</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>1</td><td class='show-for-medium'>AA1</td><td class='show-for-medium'>B1/B2 Negocios y turismo</td></tr>
+        <tr><td>B</td><td>2</td><td class='show-for-medium'>AA2</td><td class='show-for-medium'>F1 Estudiante</td></tr>
+        <tr><td>C</td><td>3</td><td class='show-for-medium'>AA3</td><td class='show-for-medium'>F2 Cónyuge o hijo de F1</td></tr>
+      </tbody>`;
+    expect(extractApplicantVisaTypes(html)).toEqual([
+      'B1/B2 Negocios y turismo',
+      'F1 Estudiante',
+      'F2 Cónyuge o hijo de F1',
+    ]);
+  });
+
+  it('skips thead rows', () => {
+    const html = `
+      <thead><tr><th>X</th><th class='show-for-medium'>DS-160</th><th class='show-for-medium'>Tipo de Visa</th></tr></thead>
+      <tbody><tr><td>A</td><td class='show-for-medium'>X</td><td class='show-for-medium'>J1 Visitante de intercambio</td></tr></tbody>
+    `;
+    expect(extractApplicantVisaTypes(html)).toEqual(['J1 Visitante de intercambio']);
+  });
+
+  it('handles double-quoted class attribute', () => {
+    const html = `
+      <tr><td>A</td><td class="show-for-medium">AA1</td><td class="show-for-medium">B2 Turismo</td></tr>
+    `;
+    expect(extractApplicantVisaTypes(html)).toEqual(['B2 Turismo']);
+  });
+});
+
+describe('normalizeVisaCategory', () => {
+  it('extracts B1/B2 from full Spanish label', () => {
+    expect(normalizeVisaCategory('B1/B2 Negocios y turismo (visitante temporal)')).toBe('B1/B2');
+  });
+
+  it('extracts F1', () => {
+    expect(normalizeVisaCategory('F1 Estudiante')).toBe('F1');
+  });
+
+  it('extracts J1 with parenthetical detail', () => {
+    expect(normalizeVisaCategory('J1 Visitante profesional de intercambio (ej. Médico,académico)'))
+      .toBe('J1');
+  });
+
+  it('strips hyphens (B-1 → B1, F-1 → F1)', () => {
+    expect(normalizeVisaCategory('B-1 Business visitor')).toBe('B1');
+    expect(normalizeVisaCategory('F-1 Student')).toBe('F1');
+  });
+
+  it('handles C1/D combined code', () => {
+    expect(normalizeVisaCategory('C1/D Tripulante en tránsito')).toBe('C1/D');
+  });
+
+  it('handles letter-only codes (TN, TD, I)', () => {
+    expect(normalizeVisaCategory('TN Profesional del NAFTA')).toBe('TN');
+    expect(normalizeVisaCategory('TD Cónyuge o hijo de TN')).toBe('TD');
+    expect(normalizeVisaCategory('I Representante de medios extranjeros')).toBe('I');
+  });
+
+  it('handles longer codes (T1, T5/T6, U1)', () => {
+    expect(normalizeVisaCategory('T1 Víctima de la trata')).toBe('T1');
+    expect(normalizeVisaCategory('T5/T6 Hermana de un T1 / Beneficiario derivado')).toBe('T5/T6');
+    expect(normalizeVisaCategory('U1 Víctima de un delito')).toBe('U1');
+  });
+
+  it('returns null for unparseable label', () => {
+    expect(normalizeVisaCategory('')).toBeNull();
+    expect(normalizeVisaCategory(null)).toBeNull();
+    expect(normalizeVisaCategory(undefined)).toBeNull();
+    expect(normalizeVisaCategory('123 not a visa')).toBeNull();
+  });
+
+  it('trims surrounding whitespace', () => {
+    expect(normalizeVisaCategory('  B1/B2 Negocios  ')).toBe('B1/B2');
+  });
+});
+
+describe('pickPrimaryVisaCategory', () => {
+  it('returns the only category when all applicants share', () => {
+    expect(pickPrimaryVisaCategory([
+      'B1/B2 Negocios y turismo',
+      'B1/B2 Negocios y turismo',
+      'B1/B2 Negocios y turismo',
+    ])).toBe('B1/B2');
+  });
+
+  it('returns the most common in mixed groups', () => {
+    expect(pickPrimaryVisaCategory([
+      'B1/B2 Negocios y turismo',
+      'F1 Estudiante',
+      'F1 Estudiante',
+    ])).toBe('F1');
+  });
+
+  it('breaks ties by first occurrence', () => {
+    expect(pickPrimaryVisaCategory([
+      'F1 Estudiante',
+      'B1/B2 Negocios',
+    ])).toBe('F1');
+  });
+
+  it('returns null for empty input', () => {
+    expect(pickPrimaryVisaCategory([])).toBeNull();
+  });
+
+  it('returns null when no labels are parseable', () => {
+    expect(pickPrimaryVisaCategory(['(empty)', '???'])).toBeNull();
+  });
+});
+
+describe('extractGroups: visa-type integration', () => {
+  it('populates applicantVisaTypes and primaryVisaCategory from real-world Colombia HTML', () => {
+    const groups = extractGroups(GROUPS_E);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.applicantVisaTypes).toHaveLength(4);
+    expect(groups[0]!.primaryVisaCategory).toBe('B1/B2');
+  });
+
+  it('returns empty visa-type fields when column missing', () => {
+    const html = `
+      <table>
+        <tr><td><a href="/es-co/niv/schedule/12345/applicants/100">Editar</a></td><td>Pedro X</td><td>AT1</td></tr>
+      </table>
+    `;
+    const groups = extractGroups(html);
+    expect(groups[0]?.applicantVisaTypes).toEqual([]);
+    expect(groups[0]?.primaryVisaCategory).toBeNull();
+  });
+});
+
+describe('extractVisaClassFromEditPage', () => {
+  // Realistic snippet from /schedule/{id}/applicants/{id}/edit (truncated for the test).
+  const EDIT_B1B2 = `
+    <form>
+      <select disabled="disabled" data-petitioner-help-values="[]" class="select required hasHelp" tabindex="8" required="required" aria-required="true" name="applicant[visa_class_id]" id="applicant_visa_class_id">
+        <option value="" label=" "></option>
+        <option value="1">B1 Negocios / Conferencia / Empleada domestica</option>
+        <option selected="selected" value="2">B1/B2 Negocios y turismo (visitante temporal)</option>
+        <option value="3">B2 Turismo / Tratamiento Médico </option>
+        <option value="11">F1 Estudiante</option>
+        <option value="22">J1 Visitante de intercambio de trabajo (ej. Profesor, interno, trabajador de verano)</option>
+        <option value="49">Profesional del NAFTA con visa TN</option>
+      </select>
+      <select name="applicant[previous_visa_class_id]"><option selected="selected" value="0">N/A</option></select>
+    </form>`;
+
+  const EDIT_F1 = `
+    <select name="applicant[visa_class_id]" id="applicant_visa_class_id">
+      <option value="" label=" "></option>
+      <option value="2">B1/B2 Negocios y turismo (visitante temporal)</option>
+      <option value="11" selected="selected">F1 Estudiante</option>
+    </select>`;
+
+  it('extracts canonical visa_class_id and label', () => {
+    expect(extractVisaClassFromEditPage(EDIT_B1B2)).toEqual({
+      classId: 2,
+      label: 'B1/B2 Negocios y turismo (visitante temporal)',
+    });
+  });
+
+  it('handles reverse attribute order (value before selected)', () => {
+    expect(extractVisaClassFromEditPage(EDIT_F1)).toEqual({
+      classId: 11,
+      label: 'F1 Estudiante',
+    });
+  });
+
+  it('ignores previous_visa_class_id select', () => {
+    const html = `
+      <select name="applicant[previous_visa_class_id]"><option selected="selected" value="99">Old</option></select>
+      <select name="applicant[visa_class_id]"><option selected="selected" value="3">B2 Turismo</option></select>
+    `;
+    expect(extractVisaClassFromEditPage(html)).toEqual({ classId: 3, label: 'B2 Turismo' });
+  });
+
+  it('returns null when no option is selected', () => {
+    const html = `
+      <select name="applicant[visa_class_id]">
+        <option value="1">B1</option>
+        <option value="2">B1/B2</option>
+      </select>`;
+    expect(extractVisaClassFromEditPage(html)).toBeNull();
+  });
+
+  it('returns null when select is missing', () => {
+    expect(extractVisaClassFromEditPage('<html></html>')).toBeNull();
   });
 });
 

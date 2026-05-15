@@ -29,6 +29,7 @@ function getClientIp(c: { req: { header: (name: string) => string | undefined } 
 // ── Country-specific defaults for new bots ───────────────
 const COUNTRY_DEFAULTS: Record<string, { maxReschedules?: number; targetDateBefore?: string }> = {
   pe: { maxReschedules: 1, targetDateBefore: '2026-04-01' },
+  ca: { maxReschedules: 3 }, // Canada portal caps at 3 reschedules per fr-ca/en-ca warning page
 };
 
 // Discovery token cache moved to ../services/discovery-tokens.ts (shared with agencies router).
@@ -325,8 +326,10 @@ botsRouter.get('/landing', async (c) => {
     const tracking = cache?.dateFailureTracking ?? {};
     const entries = Object.values(tracking);
     const { casCacheJson: _omit, visaEmail: encEmail, ...rest } = b;
+    // Decrypt the visa email so the dashboard can show which account belongs to the agency.
+    // Falls back to "" on decryption failure (legacy rows or rotated keys) — dashboard handles empty.
     let visaEmailPlain = '';
-    try { visaEmailPlain = decrypt(encEmail); } catch { /* legacy rows or rotated key */ }
+    try { visaEmailPlain = decrypt(encEmail); } catch { /* leave empty */ }
     return {
       ...rest,
       visaEmail: visaEmailPlain,
