@@ -26,6 +26,7 @@ export const notifyUserTask = task({
       id: bots.id,
       notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
+      notificationPhone: bots.notificationPhone,
       webhookUrl: bots.webhookUrl,
     }).from(bots).where(eq(bots.id, botId));
     if (!bot) {

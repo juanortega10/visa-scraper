@@ -186,9 +186,93 @@ function daysImproved(oldDate: string | undefined, newDate: string | undefined):
   return Math.round((new Date(oldDate).getTime() - new Date(newDate).getTime()) / 86400000);
 }
 
+function fmtDs(s: string | null | undefined): string {
+  if (!s) return '--';
+  const [y, m, d] = s.split('-');
+  const curY = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' })).getFullYear();
+  return `${parseInt(d!)}/${parseInt(m!)}${parseInt(y!) !== curY ? `/${y!.slice(2)}` : ''}`;
+}
+
+function ownerNameFromEmail(email: string | null | undefined): string {
+  if (!email) return '';
+  const p = email.split('@')[0]!;
+  return p.charAt(0).toUpperCase() + p.slice(1);
+}
+
+function fmtPhone(phone: string): string {
+  // "573206532325" → "+57 320 6532325"
+  if (phone.length < 8) return `+${phone}`;
+  const cc = phone.slice(0, phone.length - 10);
+  const area = phone.slice(phone.length - 10, phone.length - 7);
+  const rest = phone.slice(phone.length - 7);
+  return `+${cc} ${area} ${rest}`.trim();
+}
+
+function whatsappSection(
+  phone: string,
+  data: Record<string, unknown>,
+  opts: { ownerEmail: string | null | undefined; botId: number },
+): string {
+  const oldDs = fmtDs(data.oldConsularDate as string);
+  const newDs = fmtDs(data.newConsularDate as string);
+  const days = daysImproved(data.oldConsularDate as string, data.newConsularDate as string);
+  const ownerName = ownerNameFromEmail(opts.ownerEmail);
+  const lines = [
+    `Hola${ownerName ? ' ' + ownerName : ''} \u{1F44B}`,
+    '',
+    'Tu cita de visa se adelantó:',
+    '',
+    `\u{1F4C5} ${oldDs} → ${newDs}`,
+  ];
+  if (days) lines.push(`\u{1F4C6} ${days} días adelantados`);
+  lines.push('', 'Seguimos buscando mejores fechas.');
+  const text = lines.join('\n');
+  const waUrl = `https://api.whatsapp.com/send?phone=${phone}&text=${encodeURIComponent(text)}`.replace(/&/g, '&amp;');
+  const dashboardBase = process.env.DASHBOARD_BASE_URL ?? 'https://visa.homiapp.xyz';
+  const dashboardUrl = `${dashboardBase}/dashboard/${opts.botId}`;
+  const phonePretty = fmtPhone(phone);
+  const ownerLine = opts.ownerEmail
+    ? `<a href="mailto:${esc(opts.ownerEmail)}" style="color:${C_DARK};text-decoration:none">${esc(opts.ownerEmail)}</a>`
+    : `<span style="color:${C_MID}">(sin email del dueño)</span>`;
+
+  return `<table width="100%" cellpadding="0" cellspacing="0" style="margin:20px 0;background:#f0fdf4;border:1px solid #86efac;border-radius:12px">
+  <tr><td style="padding:18px 20px">
+    <p style="${F_SYNE};font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#15803d;margin:0 0 10px">Solo admin</p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px">
+      <tr>
+        <td style="${F_BODY};font-size:13px;color:${C_MID};padding:3px 0;width:90px">Bot</td>
+        <td style="${F_BODY};font-size:14px;color:${C_DARK};padding:3px 0">
+          <a href="${dashboardUrl}" target="_blank" style="${F_SYNE};font-weight:700;color:#15803d;text-decoration:none">#${opts.botId}</a>
+          ${ownerName ? `<span style="color:${C_MID}">&middot; ${esc(ownerName)}</span>` : ''}
+        </td>
+      </tr>
+      <tr>
+        <td style="${F_BODY};font-size:13px;color:${C_MID};padding:3px 0">Email</td>
+        <td style="${F_BODY};font-size:14px;color:${C_DARK};padding:3px 0">${ownerLine}</td>
+      </tr>
+      <tr>
+        <td style="${F_BODY};font-size:13px;color:${C_MID};padding:3px 0">WhatsApp</td>
+        <td style="${F_BODY};font-size:14px;color:${C_DARK};padding:3px 0;font-variant-numeric:tabular-nums">${esc(phonePretty)}</td>
+      </tr>
+    </table>
+    <table cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="background:#25D366;border-radius:8px">
+          <a href="${waUrl}" target="_blank" style="display:inline-block;padding:12px 20px;${F_SYNE};font-size:14px;font-weight:700;color:#ffffff;text-decoration:none">Enviar notificaci&oacute;n por WhatsApp</a>
+        </td>
+        <td style="width:10px"></td>
+        <td style="border:1px solid #86efac;border-radius:8px;background:#ffffff">
+          <a href="${dashboardUrl}" target="_blank" style="display:inline-block;padding:11px 18px;${F_SYNE};font-size:14px;font-weight:700;color:#15803d;text-decoration:none">Ver bot en dashboard &rarr;</a>
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+</table>`;
+}
+
 // ── Email templates ────────────────────────────────────
 
-function buildEmail(event: string, data: Record<string, unknown>): { subject: string; html: string } {
+function buildEmail(event: string, data: Record<string, unknown>, opts?: { whatsappPhone?: string; ownerEmail?: string | null; botId?: number }): { subject: string; html: string } {
   if (event === 'reschedule_success') {
     const isDry = !!data.dryRun;
     const days = daysImproved(data.oldConsularDate as string, data.newConsularDate as string);
@@ -240,6 +324,7 @@ ${isDry ? `<p style="margin-bottom:16px">${badge('DRY RUN', '#dbeafe', '#1e40af'
 <h2 style="${F_SYNE};font-size:26px;font-weight:800;color:${C_DARK};margin:0 0 4px">Movimos tu cita${days ? ` <span style="color:#0d9488">${days} días</span> antes` : ''}</h2>
 ${daysHtml}
 ${card(oldRowContent + newRowContent, { teal: true })}
+${opts?.whatsappPhone && opts?.botId != null ? whatsappSection(opts.whatsappPhone, data, { ownerEmail: opts.ownerEmail, botId: opts.botId }) : ''}
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin-top:20px">Seguimos buscando. Si aparece algo mejor, lo movemos.</p>`);
     return { subject, html };
   }
@@ -547,7 +632,7 @@ const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'bot_paused']);
 const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
 
 export async function notifyUser(
-  bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; webhookUrl: string | null },
+  bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; notificationPhone?: string | null; webhookUrl: string | null },
   event: string,
   data: Record<string, unknown>,
 ): Promise<void> {
@@ -555,14 +640,21 @@ export async function notifyUser(
 
   const promises: Promise<void>[] = [];
 
+  // Admin variant gets bot info (id, owner email, phone) plus action buttons
+  // (open dashboard, send pre-filled WhatsApp). Only attached when recipient is the admin.
+  const adminOpts = (recipient: string | null | undefined) =>
+    recipient && recipient === ADMIN_RESCHEDULE_EMAIL && event === 'reschedule_success' && bot.notificationPhone
+      ? { whatsappPhone: bot.notificationPhone, ownerEmail: bot.ownerEmail ?? null, botId: bot.id }
+      : undefined;
+
   if (bot.notificationEmail && NOTIFICATION_EMAIL_EVENTS.has(event)) {
-    const { subject, html } = buildEmail(event, data);
+    const { subject, html } = buildEmail(event, data, adminOpts(bot.notificationEmail));
     promises.push(sendEmail(bot.id, event, bot.notificationEmail, subject, html));
   }
 
   // Owner only gets reschedule_success — no operational spam
   if (bot.ownerEmail && event === 'reschedule_success') {
-    const { subject, html } = buildEmail(event, data);
+    const { subject, html } = buildEmail(event, data, adminOpts(bot.ownerEmail));
     promises.push(sendEmail(bot.id, event, bot.ownerEmail, subject, html));
   }
 
@@ -570,7 +662,7 @@ export async function notifyUser(
   if (ADMIN_RESCHEDULE_EMAIL && event === 'reschedule_success') {
     const alreadySent = [bot.notificationEmail, bot.ownerEmail].includes(ADMIN_RESCHEDULE_EMAIL);
     if (!alreadySent) {
-      const { subject, html } = buildEmail(event, data);
+      const { subject, html } = buildEmail(event, data, adminOpts(ADMIN_RESCHEDULE_EMAIL));
       promises.push(sendEmail(bot.id, event, ADMIN_RESCHEDULE_EMAIL, subject, html));
     }
   }
