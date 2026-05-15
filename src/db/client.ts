@@ -1,21 +1,41 @@
-import { neon } from '@neondatabase/serverless';
-import { drizzle } from 'drizzle-orm/neon-http';
-import type { NeonHttpDatabase } from 'drizzle-orm/neon-http';
+import ws from 'ws';
+import { Pool, neonConfig } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-serverless';
+import type { NeonDatabase } from 'drizzle-orm/neon-serverless';
 import * as schema from './schema.js';
 
-// Lazy initialization — neon() throws if DATABASE_URL is missing.
-// Deferring avoids crashes during Trigger.dev's build indexer step
-// (which imports task files to discover exports but doesn't have env vars).
-let _db: NeonHttpDatabase<typeof schema> | null = null;
+// Node.js 20 no tiene WebSocket nativo — proveemos el polyfill.
+// El WebSocket pool mantiene conexiones TCP persistentes (a diferencia del driver
+// HTTP que abría una conexión nueva por cada query), eliminando los ETIMEDOUT
+// del ISP residencial del RPi bajo carga concurrente.
+neonConfig.webSocketConstructor = ws;
 
-export const db = new Proxy({} as NeonHttpDatabase<typeof schema>, {
-  get(_target, prop, receiver) {
-    if (!_db) {
-      const sql = neon(process.env.DATABASE_URL!);
-      _db = drizzle(sql, { schema });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL!, max: 5 });
+
+export const db = drizzle({ client: pool, schema });
+export type Database = NeonDatabase<typeof schema>;
+
+// Retry wrapper para errores transitorios de red (ETIMEDOUT, connection reset).
+// Aplicar en queries síncronas críticas al inicio de cada run.
+// Las queries de background (allSettled) no lo necesitan — el siguiente poll reintenta.
+export async function withDbRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const isTransient =
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('fetch failed') ||
+        msg.includes('connection timeout') ||
+        msg.includes('Connection terminated') ||
+        msg.includes('write CONNECTION_ENDED') ||
+        msg.includes('read CONNECTION_END');
+      if (!isTransient || attempt === maxAttempts) throw e;
+      lastError = e;
+      await new Promise(r => setTimeout(r, attempt * 500));
     }
-    return Reflect.get(_db, prop, receiver);
-  },
-});
-
-export type Database = NeonHttpDatabase<typeof schema>;
+  }
+  throw lastError;
+}

@@ -6,6 +6,7 @@ import {
   filterTimes,
   isEarlierDate,
   isAtLeastNDaysEarlier,
+  addDays,
 } from '../../utils/date-helpers.js';
 
 describe('isDateExcluded', () => {
@@ -80,6 +81,50 @@ describe('filterDates', () => {
     const dates = [{ date: '2026-03-01' }];
     const exclusions = [{ startDate: '2026-01-01', endDate: '2026-12-31' }];
     expect(filterDates(dates, exclusions)).toEqual([]);
+  });
+
+  it('filters dates before minDate', () => {
+    const dates = [
+      { date: '2026-04-16' },
+      { date: '2026-04-18' },
+      { date: '2026-04-20' },
+    ];
+    expect(filterDates(dates, [], undefined, '2026-04-18')).toEqual([
+      { date: '2026-04-18' },
+      { date: '2026-04-20' },
+    ]);
+  });
+
+  it('keeps all dates when minDate is undefined', () => {
+    const dates = [{ date: '2026-04-16' }, { date: '2026-04-18' }];
+    expect(filterDates(dates, [])).toEqual(dates);
+  });
+
+  it('filters all dates when all are before minDate', () => {
+    const dates = [{ date: '2026-04-15' }, { date: '2026-04-17' }];
+    expect(filterDates(dates, [], undefined, '2026-04-18')).toEqual([]);
+  });
+});
+
+describe('addDays', () => {
+  it('adds days within a month', () => {
+    expect(addDays('2026-04-15', 3)).toBe('2026-04-18');
+  });
+
+  it('crosses month boundary', () => {
+    expect(addDays('2026-04-29', 3)).toBe('2026-05-02');
+  });
+
+  it('crosses year boundary', () => {
+    expect(addDays('2026-12-30', 3)).toBe('2027-01-02');
+  });
+
+  it('adds 0 days returns same date', () => {
+    expect(addDays('2026-04-15', 0)).toBe('2026-04-15');
+  });
+
+  it('handles leap year February', () => {
+    expect(addDays('2028-02-27', 3)).toBe('2028-03-01');
   });
 });
 

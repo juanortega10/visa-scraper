@@ -7,7 +7,8 @@ import { bots, sessions, excludedDates, excludedTimes } from '../src/db/schema.j
 import { eq } from 'drizzle-orm';
 import { decrypt } from '../src/services/encryption.js';
 import { VisaClient, type DaySlot } from '../src/services/visa-client.js';
-import { filterDates, filterTimes, isAtLeastNDaysEarlier } from '../src/utils/date-helpers.js';
+import { filterDates, filterTimes, isAtLeastNDaysEarlier, addDays } from '../src/utils/date-helpers.js';
+import { MIN_DAYS_FROM_TODAY } from '../src/utils/constants.js';
 import type { ProxyProvider } from '../src/services/proxy-fetch.js';
 
 const args = process.argv.slice(2);
@@ -44,10 +45,12 @@ const dateExclusions = exDates.map(d => ({ startDate: d.startDate, endDate: d.en
 const exTimes = await db.select().from(excludedTimes).where(eq(excludedTimes.botId, botId));
 const timeExclusions = exTimes.map(t => ({ date: t.date, timeStart: t.timeStart, timeEnd: t.timeEnd }));
 
+const minDate = addDays(new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' }), bot.minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
+
 // 1. Fetch consular days
 console.log('Fetching consular days...');
 const allDays = await client.getConsularDays();
-const filteredDays = filterDates(allDays, dateExclusions);
+const filteredDays = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
 console.log(`Total: ${allDays.length}, After filter: ${filteredDays.length}`);
 
 const candidates = filteredDays.filter(d =>
@@ -81,7 +84,7 @@ for (const time of consularTimes) {
   console.log(`\n--- Trying consular time: ${time} ---`);
 
   const casDays = await client.getCasDays(targetDate, time);
-  const filteredCasDays = filterDates(casDays, dateExclusions);
+  const filteredCasDays = filterDates(casDays, dateExclusions, undefined, minDate);
   console.log(`CAS days: ${casDays.length} total, ${filteredCasDays.length} after filter`);
 
   if (filteredCasDays.length === 0) {

@@ -28,10 +28,13 @@
     "@hono/node-server": "^1.19.9",
     "@neondatabase/serverless": "^0.10.4",
     "@trigger.dev/sdk": "^4.4.1",
+    "@types/ws": "^8.18.1",
     "drizzle-orm": "^0.38.0",
     "hono": "^4.6.0",
+    "postgres": "^3.4.9",
     "resend": "^4.0.0",
-    "undici": "^7.0.0"
+    "undici": "^7.0.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@trigger.dev/build": "^4.4.1",

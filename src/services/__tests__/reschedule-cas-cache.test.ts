@@ -67,6 +67,7 @@ function makeClient(overrides: Record<string, any> = {}) {
     reschedule: vi.fn().mockResolvedValue(true),
     getCurrentAppointment: vi.fn().mockResolvedValue(null),
     getSession: vi.fn().mockReturnValue({ cookie: 'c', csrfToken: 't', authenticityToken: 'a' }),
+    getConfig: vi.fn().mockReturnValue({ proxyProvider: 'direct' }),
     updateSession: vi.fn(),
     refreshTokens: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -1068,7 +1069,7 @@ describe('dateFailureTracking (cross-poll)', () => {
   it('accumulates across calls: 4 seeded + 1 new no_times = blocked', async () => {
     const { executeReschedule } = await import('../reschedule-logic.js');
 
-    const candidateDate = '2026-06-01'; // earlier than current 2026-11-19
+    const candidateDate = '2026-07-01'; // earlier than current 2026-11-19, after minDate (NOW_UTC+3d)
     const windowStartedAt = new Date(NOW_UTC - 10 * 60 * 1000).toISOString(); // 10min ago
 
     const cache: CasCacheData = {
@@ -1088,8 +1089,6 @@ describe('dateFailureTracking (cross-poll)', () => {
     };
 
     const client = makeClient({
-      // CAS path: need to return empty times to get no_cas_times, but let's use no_times (simpler)
-      // Force no_times by returning empty consularTimes
       getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
     });
 
@@ -1109,7 +1108,7 @@ describe('dateFailureTracking (cross-poll)', () => {
     });
 
     expect(result.success).toBe(false);
-    // 5th failure in the 1h window crosses CROSS_POLL_THRESHOLD (5) → blocked
+    // 5th failure in the 3h window crosses CROSS_POLL_THRESHOLD (5) → blocked
     expect(result.newlyBlockedDates).toContain(candidateDate);
     expect(result.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(5);
     expect(result.dateFailureTrackingDelta?.[candidateDate]?.blockedUntil).toBeDefined();
@@ -1217,7 +1216,7 @@ describe('dateFailureTracking (cross-poll)', () => {
   it('clears tracker entry on successful reschedule for that date', async () => {
     const { executeReschedule } = await import('../reschedule-logic.js');
 
-    const candidateDate = '2026-06-01';
+    const candidateDate = '2026-07-01'; // after minDate (NOW_UTC+3d)
     const windowStartedAt = new Date(NOW_UTC - 10 * 60 * 1000).toISOString();
 
     const cache: CasCacheData = {
@@ -1225,7 +1224,7 @@ describe('dateFailureTracking (cross-poll)', () => {
       windowDays: 21,
       totalDates: 1,
       fullDates: 0,
-      entries: [{ date: '2026-05-28', slots: 3, times: ['07:00', '07:15', '07:30'] }],
+      entries: [{ date: '2026-06-25', slots: 3, times: ['07:00', '07:15', '07:30'] }], // within CAS window for 2026-07-01 (1-12 days before)
       dateFailureTracking: {
         [candidateDate]: {
           windowStartedAt,
@@ -1310,12 +1309,12 @@ describe('dateFailureTracking (cross-poll)', () => {
   });
 
   // TEST-06: Bogota TZ window arithmetic
-  it('window arithmetic is correct under Bogota TZ: in-window at T+59min, rolls at T+61min', async () => {
+  it('window arithmetic is correct under Bogota TZ: in-window at T+179min, rolls at T+181min', async () => {
     const { executeReschedule } = await import('../reschedule-logic.js');
 
-    const candidateDate = '2026-06-01';
-    // Window started 59 min ago — still in the 1h window
-    const windowStartedAt59 = new Date(NOW_UTC - 59 * 60 * 1000).toISOString();
+    const candidateDate = '2026-07-01'; // after minDate (NOW_UTC+3d)
+    // Window started 179 min ago — still in the 3h window
+    const windowStartedAt59 = new Date(NOW_UTC - 179 * 60 * 1000).toISOString();
 
     const cache59: CasCacheData = {
       refreshedAt: new Date(NOW_UTC - 5 * 60 * 1000).toISOString(),
@@ -1361,15 +1360,15 @@ describe('dateFailureTracking (cross-poll)', () => {
     expect(result59.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(5);
     expect(result59.newlyBlockedDates).toContain(candidateDate);
 
-    // Now advance time by 2 extra minutes (window opened 61 min ago) → window expires → fresh entry
+    // Now advance time by 2 extra minutes (window opened 181 min ago) → window expires → fresh entry
     vi.setSystemTime(NOW_UTC + 2 * 60 * 1000);
 
-    const windowStartedAt61 = new Date(NOW_UTC - 61 * 60 * 1000).toISOString();
+    const windowStartedAt61 = new Date(NOW_UTC - 181 * 60 * 1000).toISOString();
     const cache61: CasCacheData = {
       ...cache59,
       dateFailureTracking: {
         [candidateDate]: {
-          windowStartedAt: windowStartedAt61, // 61min ago = expired
+          windowStartedAt: windowStartedAt61, // 181min ago = expired (>3h window)
           totalCount: 4,
           byDimension: { consularNoTimes: 4 },
           lastFailureAt: new Date(NOW_UTC - 60 * 1000).toISOString(),
@@ -1395,7 +1394,7 @@ describe('dateFailureTracking (cross-poll)', () => {
       pending: [],
     });
 
-    // At T+61min: window expired → recordFailure should start a fresh window with totalCount=1
+    // At T+181min: window expired → recordFailure should start a fresh window with totalCount=1
     expect(result61.dateFailureTrackingDelta?.[candidateDate]?.totalCount).toBe(1);
     expect(result61.newlyBlockedDates ?? []).not.toContain(candidateDate); // 1 < 5 threshold
   });
@@ -1406,9 +1405,9 @@ describe('dateFailureTracking (cross-poll)', () => {
 
     // Run 3 separate single-attempt calls to isolate each tracked dimension.
     // (Multi-attempt on same executeReschedule would re-fetch getConsularDays which returns [].)
-    const dateA = '2026-06-01'; // will get no_times (consularNoTimes)
-    const dateB = '2026-06-05'; // will get no_cas_days (casNoDays)
-    const dateC = '2026-06-10'; // will get no_cas_times (casNoTimes)
+    const dateA = '2026-07-01'; // will get no_times (consularNoTimes) — after minDate (NOW_UTC+3d)
+    const dateB = '2026-07-05'; // will get no_cas_days (casNoDays)
+    const dateC = '2026-07-10'; // will get no_cas_times (casNoTimes)
 
     const setupMock = () => {
       mockDbSelect.mockReturnValue(chain([{ currentConsularDate: '2026-11-19' }]));
@@ -1444,7 +1443,7 @@ describe('dateFailureTracking (cross-poll)', () => {
     const resultC = await executeReschedule({
       client: makeClient({
         getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
-        getCasDays: vi.fn().mockResolvedValue([{ date: '2026-06-03', business_day: true }]),
+        getCasDays: vi.fn().mockResolvedValue([{ date: '2026-07-03', business_day: true }]), // within CAS window for 2026-07-10 (1-12 days before)
         getCasTimes: vi.fn().mockResolvedValue({ available_times: [] }),
       }),
       botId: 12, bot: DEFAULT_BOT, dateExclusions: [], timeExclusions: [],

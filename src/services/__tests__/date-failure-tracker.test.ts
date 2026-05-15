@@ -60,18 +60,18 @@ describe('recordFailure', () => {
     expect(e.blockedUntil).toBe(blockedAfter5);
   });
 
-  it('5. window expiry (>1h) produces fresh entry with totalCount=1, no blockedUntil', () => {
+  it('5. window expiry (>3h) produces fresh entry with totalCount=1, no blockedUntil', () => {
     const seed: DateFailureEntry = {
       windowStartedAt: new Date(T0).toISOString(),
       totalCount: 3,
       byDimension: { consularNoTimes: 3 },
       lastFailureAt: new Date(T0 + 30 * 60_000).toISOString(),
     };
-    const fresh = recordFailure(seed, 'casNoTimes', T0 + 61 * 60_000);
+    const fresh = recordFailure(seed, 'casNoTimes', T0 + 181 * 60_000); // >3h
     expect(fresh.totalCount).toBe(1);
     expect(fresh.byDimension.casNoTimes).toBe(1);
     expect(fresh.byDimension.consularNoTimes).toBeUndefined();
-    expect(fresh.windowStartedAt).toBe(new Date(T0 + 61 * 60_000).toISOString());
+    expect(fresh.windowStartedAt).toBe(new Date(T0 + 181 * 60_000).toISOString());
     expect(fresh.blockedUntil).toBeUndefined();
   });
 
@@ -165,20 +165,20 @@ describe('clearOnCasAvailable', () => {
 });
 
 describe('Bogota TZ window arithmetic (Pitfall 6)', () => {
-  it('11. window math is timezone-independent; in-window at +59min, expires at +61min', () => {
+  it('11. window math is timezone-independent; in-window at +179min, expires at +181min', () => {
     expect(process.env.TZ).toBe('America/Bogota');
     const e1 = recordFailure(undefined, 'consularNoTimes', T0);
-    const e2 = recordFailure(e1, 'consularNoTimes', T0 + 59 * 60 * 1000);
+    const e2 = recordFailure(e1, 'consularNoTimes', T0 + 179 * 60 * 1000);
     expect(e2.totalCount).toBe(2);
     expect(e2.windowStartedAt).toBe(new Date(T0).toISOString());
 
-    const e3 = recordFailure(e2, 'consularNoTimes', T0 + 61 * 60 * 1000);
+    const e3 = recordFailure(e2, 'consularNoTimes', T0 + 181 * 60 * 1000);
     expect(e3.totalCount).toBe(1);
-    expect(e3.windowStartedAt).toBe(new Date(T0 + 61 * 60 * 1000).toISOString());
+    expect(e3.windowStartedAt).toBe(new Date(T0 + 181 * 60 * 1000).toISOString());
 
     // Sanity: also assert the constants used
-    expect(CROSS_POLL_WINDOW_MS).toBe(60 * 60 * 1000);
+    expect(CROSS_POLL_WINDOW_MS).toBe(3 * 60 * 60 * 1000);
     expect(CROSS_POLL_THRESHOLD).toBe(5);
-    expect(CROSS_POLL_BLOCK_MS).toBe(2 * 60 * 60 * 1000);
+    expect(CROSS_POLL_BLOCK_MS).toBe(6 * 60 * 60 * 1000);
   });
 });

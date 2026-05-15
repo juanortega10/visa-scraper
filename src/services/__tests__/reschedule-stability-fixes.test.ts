@@ -69,6 +69,7 @@ function makeClient(overrides: Record<string, any> = {}) {
     reschedule: vi.fn().mockResolvedValue(true),
     getCurrentAppointment: vi.fn().mockResolvedValue(null),
     getSession: vi.fn().mockReturnValue({ cookie: 'c', csrfToken: 't', authenticityToken: 'a' }),
+    getConfig: vi.fn().mockReturnValue({ proxyProvider: 'direct' }),
     updateSession: vi.fn(),
     refreshTokens: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -76,12 +77,15 @@ function makeClient(overrides: Record<string, any> = {}) {
 }
 
 // Bot with May 4 consular appointment, target = Apr 9 (better)
+// minDaysFromToday=0 so the new minDate filter doesn't reject test fixtures
+// (NOW=2026-04-03, CAS=2026-04-05 — only 2 days out, would fail with default 3).
 const BASE_BOT: RescheduleBot = {
   currentConsularDate: '2026-05-04',
   currentConsularTime: '11:15',
   currentCasDate: '2026-04-22',
   currentCasTime: '08:00',
   ascFacilityId: '26',
+  minDaysFromToday: 0,
 };
 
 // Bot configured for no-CAS path (Peru-style: skipCas=true)
