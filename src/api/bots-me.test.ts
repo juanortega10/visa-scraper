@@ -35,7 +35,9 @@ vi.mock('../db/client.js', () => {
       insert: vi.fn(() => chain([])),
       update: vi.fn(() => chain([])),
       delete: vi.fn(() => chain([])),
+      execute: vi.fn(() => Promise.resolve({ rows: [], command: '', rowCount: 0, oid: 0, fields: [] })),
     },
+    withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
   };
 });
 
@@ -534,7 +536,7 @@ describe('tracker endpoints', () => {
     };
 
     mockDbRows([bot1, bot2]); // allBots
-    mockDbRows([]);            // originalDates (rescheduleLogs min)
+    // originalDates now uses db.execute() — covered by default execute mock
     mockDbRows([]);            // fetchPollStats (merged pollLogs query)
     mockDbRows([]);            // fetchRecentEvents (rescheduleLogs last 24h)
 
@@ -567,7 +569,7 @@ describe('tracker endpoints', () => {
       pollEnvironments: ['dev'],
       casCacheJson: null,
     }]);
-    mockDbRows([]); // originalDates
+    // originalDates now uses db.execute() — covered by default execute mock
     mockDbRows([]); // fetchPollStats
     mockDbRows([]); // fetchRecentEvents
 

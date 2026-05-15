@@ -8,6 +8,8 @@ import { devRouter } from './api/dev.js';
 import { dashboardRouter } from './api/dashboard.js';
 import { blockIntelRouter } from './api/block-intelligence.js';
 import { apiAuth } from './middleware/api-auth.js';
+import { db } from './db/client.js';
+import { sql } from 'drizzle-orm';
 
 const app = new Hono();
 
@@ -37,6 +39,8 @@ app.route('/api/blocks', blockIntelRouter);
 const port = parseInt(process.env.PORT || '3000', 10);
 serve({ fetch: app.fetch, port }, () => {
   console.log(`Visa Bot API running on http://localhost:${port}`);
+  // Warm up the DB connection pool so first real request doesn't cold-start
+  db.execute(sql`SELECT 1`).catch(() => {});
 });
 
 export default app;

@@ -23,7 +23,7 @@ blockIntelRouter.get('/cross-bot', async (c) => {
   const cached = getCached(cacheKey);
   if (cached) return c.json(cached);
 
-  const { rows } = await db.execute(sql`
+  const rows = await db.execute(sql`
     SELECT
       public_ip,
       bot_id,
@@ -91,7 +91,7 @@ blockIntelRouter.get('/episodes', async (c) => {
   if (cached) return c.json(cached);
 
   // Get tcp_blocked polls + their neighbors for episode boundary detection
-  const { rows } = await db.execute(sql.raw(`
+  const rows = await db.execute(sql.raw(`
     WITH blocked_windows AS (
       SELECT bot_id,
         min(created_at) AS window_start,
@@ -279,15 +279,15 @@ blockIntelRouter.get('/risk-factors', async (c) => {
   ]);
 
   const result = {
-    byProvider: byProvider.rows,
-    byHour: byHour.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byDayOfWeek: byDow.rows.map(r => ({
+    byProvider: [...byProvider],
+    byHour: [...byHour].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byDayOfWeek: [...byDow].map(r => ({
       ...r,
       day_name: typeof r.day_name === 'string' ? r.day_name.trim() : r.day_name,
       block_rate: Number(r.block_rate),
     })),
-    byLocale: byLocale.rows,
-    classificationBreakdown: byClassification.rows,
+    byLocale: [...byLocale],
+    classificationBreakdown: [...byClassification],
     windowHours: hours,
   };
   setCached(cacheKey, result, 2 * 60_000);
@@ -346,9 +346,9 @@ blockIntelRouter.get('/trends', async (c) => {
   ]);
 
   const result = {
-    timeseries: mainResult.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byProvider: providerResult.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byClassification: clsResult.rows,
+    timeseries: [...mainResult].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byProvider: [...providerResult].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byClassification: [...clsResult],
     windowHours: hours,
     granularity,
   };

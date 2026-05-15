@@ -282,13 +282,14 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .fh-status-badge{font-size:7px;font-weight:700;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0}
 .fh-status-paused{background:rgba(156,163,175,.12);color:#9ca3af;border:1px solid #9ca3af}
 
-/* ── Agencias (encima del fleet) ── */
+/* ── Agencies section (above fleet) ── */
 .agy-section{margin:4px 0 14px}
 .agy-section-hdr{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:700;
   text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px}
 .agy-section-hdr::after{content:'';flex:1;height:1px;background:var(--border)}
 .agy-section-hdr .pill{font-size:8px;font-weight:800;padding:1px 6px;border-radius:3px;
-  background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border);letter-spacing:.3px}
+  background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border);
+  letter-spacing:.3px}
 .agy-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
   padding:10px 12px;margin-bottom:8px;border-left:2px solid var(--cyan)}
 .agy-card.agy-free{border-left-color:var(--cyan)}
@@ -328,11 +329,48 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .agy-summary .neutral{color:var(--bright)}
 .agy-empty{font-size:10px;color:var(--dim);padding:6px 8px;text-align:center}
 
+/* AGY tag inline en filas de fleet health para identificar bots de agencia */
 .fh-agy-tag{font-size:7px;font-weight:800;padding:1px 4px;border-radius:3px;letter-spacing:.4px;
   background:rgba(103,232,249,.1);color:var(--cyan);border:1px solid rgba(103,232,249,.25);
   margin-left:4px;text-transform:uppercase;white-space:nowrap}
 .fh-agy-tag-paid{background:rgba(74,222,128,.1);color:var(--green);border-color:rgba(74,222,128,.25)}
 .fh-agy-tag-test{background:rgba(252,211,77,.1);color:var(--amber);border-color:rgba(252,211,77,.25)}
+
+/* ── Landing tabs ── */
+.lnd-tabs{display:flex;gap:3px;margin-bottom:12px}
+.lnd-tab{flex:1;padding:8px 6px;font-family:inherit;font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.5px;cursor:pointer;
+  background:var(--surface);border:1px solid var(--border);border-radius:6px;
+  color:var(--muted);transition:all .15s;white-space:nowrap}
+.lnd-tab.on{color:var(--accent);border-color:var(--accent-border);background:var(--accent-dim)}
+.lnd-badge{display:inline-block;font-size:8px;font-weight:800;padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle}
+.lnd-badge-ok{background:rgba(74,222,128,.15);color:var(--green)}
+.lnd-badge-fail{background:rgba(248,113,113,.15);color:var(--red)}
+
+/* ── Reschedule cards ── */
+.rsc-hdr{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:700;
+  text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:10px;margin-top:2px}
+.rsc-hdr::after{content:'';flex:1;height:1px;background:var(--border)}
+.rsc-card{padding:10px 12px;margin-bottom:6px;background:var(--surface);
+  border:1px solid var(--border);border-radius:8px}
+.rsc-card-ok{border-left:2px solid rgba(74,222,128,.4)}
+.rsc-card-fail{border-left:2px solid rgba(248,113,113,.25)}
+.rsc-top{display:flex;align-items:baseline;gap:6px;margin-bottom:5px}
+.rsc-result-ok{font-size:11px;font-weight:800;color:var(--green)}
+.rsc-result-fail{font-size:11px;font-weight:800;color:var(--red)}
+.rsc-bot{font-size:12px;font-weight:800;color:var(--accent);text-decoration:none}
+.rsc-bot:hover{text-decoration:underline}
+.rsc-owner{font-size:9px;color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rsc-ts{font-size:9px;color:var(--muted);white-space:nowrap;flex-shrink:0}
+.rsc-dates{font-size:12px;font-weight:700;color:var(--bright);margin-bottom:4px}
+.rsc-dates .old{color:var(--muted);font-weight:400}
+.rsc-dates .arr{color:var(--dim);margin:0 5px}
+.rsc-dates .new-ok{color:var(--green)}
+.rsc-dates .new-fail{color:var(--red)}
+.rsc-gain{font-size:9px;font-weight:700;color:var(--green);margin-left:8px}
+.rsc-meta{font-size:9px;color:var(--dim);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.rsc-tag{font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,.05);color:var(--muted)}
+.rsc-reason{font-size:9px;color:var(--muted);word-break:break-word}
 
 </style>
 </head>
@@ -351,10 +389,20 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 
 <div id="agencies-section" class="agy-section" style="display:none"></div>
 
-<div id="fleet-health"></div>
+<div class="lnd-tabs">
+  <button class="lnd-tab on" id="tab-fleet-btn" onclick="switchLndTab('fleet')">fleet</button>
+  <button class="lnd-tab" id="tab-rs-btn" onclick="switchLndTab('rs')">reagendados<span id="rs-badge"></span></button>
+</div>
 
-<div id="content">
-  <div class="sk">&nbsp;</div><div class="sk">&nbsp;</div><div class="sk">&nbsp;</div>
+<div id="tab-fleet">
+  <div id="fleet-health"></div>
+  <div id="content">
+    <div class="sk">&nbsp;</div><div class="sk">&nbsp;</div><div class="sk">&nbsp;</div>
+  </div>
+</div>
+
+<div id="tab-rs" style="display:none">
+  <div id="rs-fleet"></div>
 </div>
 
 <div class="foot">visa bot &middot; multi-country dashboard</div>
@@ -408,11 +456,12 @@ function timeAgo(iso){
   return Math.floor(h/24)+'d';
 }
 
-function renderAgencies(agencies,bots,events){
+function renderAgencies(agencies,bots,events,health1h){
   var el=document.getElementById('agencies-section');
   if(!el)return;
   if(!agencies||!agencies.length){el.style.display='none';el.innerHTML='';return;}
 
+  /* index bots por agencyId */
   var byAgency={};
   for(var i=0;i<bots.length;i++){
     var b=bots[i];
@@ -423,6 +472,7 @@ function renderAgencies(agencies,bots,events){
 
   var html='<div class="agy-section-hdr">agencias <span class="pill">'+agencies.length+'</span></div>';
 
+  /* ordenar: agencias con más bots primero, luego más recientes */
   var sortedAgencies=agencies.slice().sort(function(a,b){
     var ca=(byAgency[a.id]||[]).length;
     var cb=(byAgency[b.id]||[]).length;
@@ -445,6 +495,7 @@ function renderAgencies(agencies,bots,events){
     if(a.contactEmail)contactBits.push('<span class="em">'+a.contactEmail.split('@')[0]+'</span>');
     var contactHtml=contactBits.length?'<span class="agy-contact">'+contactBits.join(' <span style="color:var(--dim)">·</span> ')+'</span>':'';
 
+    /* summary counters */
     var active=0,paused=0,errors=0,reschedSum=0;
     agencyBots.forEach(function(b){
       if(b.status==='active')active++;
@@ -457,6 +508,7 @@ function renderAgencies(agencies,bots,events){
     if(!agencyBots.length){
       rowsHtml='<div class="agy-empty">sin bots</div>';
     }else{
+      /* ordenar bots por cita más próxima */
       agencyBots.sort(function(x,y){
         var dx=x.currentConsularDate?new Date(x.currentConsularDate+'T00:00:00').getTime():Number.MAX_SAFE_INTEGER;
         var dy=y.currentConsularDate?new Date(y.currentConsularDate+'T00:00:00').getTime():Number.MAX_SAFE_INTEGER;
@@ -513,6 +565,7 @@ function renderAgencies(agencies,bots,events){
   el.style.display='block';
 }
 
+/* Build una lookup map id→agency una sola vez por render para el AGY tag de fleet */
 var _agencyById={};
 function indexAgencies(agencies){
   _agencyById={};
@@ -584,10 +637,25 @@ function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
     var h1b=(health1h&&health1h[b.id])||{total:0,ok:0};
     var pctA=h1a.total>0?h1a.ok/h1a.total:1;
     var pctB=h1b.total>0?h1b.ok/h1b.total:1;
-    var cautionA=(h1a.total>0&&pctA<0.5)||h1a.total===0?1:0;
-    var cautionB=(h1b.total>0&&pctB<0.5)||h1b.total===0?1:0;
+    var evA=events&&events[a.id];
+    var evB=events&&events[b.id];
+    // Tier 1: recent successful reschedule — sorted by most recent success
+    var rsA=evA&&evA.successes&&evA.successes.length>0?1:0;
+    var rsB=evB&&evB.successes&&evB.successes.length>0?1:0;
+    if(rsA!==rsB)return rsB-rsA;
+    if(rsA&&rsB){
+      var atA=evA.successes[0].at?new Date(evA.successes[0].at).getTime():0;
+      var atB=evB.successes[0].at?new Date(evB.successes[0].at).getTime():0;
+      if(atA!==atB)return atB-atA;
+    }
+    // Tier 2: caution (error/low health/no polls)
+    var cautionA=(h1a.total>0&&pctA<0.5)||h1a.total===0||(evA&&evA.failedCount>0)?1:0;
+    var cautionB=(h1b.total>0&&pctB<0.5)||h1b.total===0||(evB&&evB.failedCount>0)?1:0;
     if(cautionA!==cautionB)return cautionB-cautionA;
-    if(pctA!==pctB)return pctA-pctB;
+    // Tier 3: most recently activated first
+    var actA=a.activatedAt?new Date(a.activatedAt).getTime():0;
+    var actB=b.activatedAt?new Date(b.activatedAt).getTime():0;
+    if(actA!==actB)return actB-actA;
     return a.id-b.id;
   });
 
@@ -658,7 +726,7 @@ function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
     if(b.agencyId&&_agencyById[b.agencyId]){
       var agy=_agencyById[b.agencyId];
       var tagCls=agy.testMode?'fh-agy-tag fh-agy-tag-test':(agy.billingMode==='paid'?'fh-agy-tag fh-agy-tag-paid':'fh-agy-tag');
-      var nameShort=(agy.name||'').length>10?(agy.name||'').substring(0,10)+'\u2026':(agy.name||'');
+      var nameShort=(agy.name||'').length>10?(agy.name||'').substring(0,10)+'…':(agy.name||'');
       agyTag=' <span class="'+tagCls+'" title="'+agy.name+'">'+nameShort+'</span>';
     }
 
@@ -767,6 +835,101 @@ function renderBotList(bots,events){
   document.getElementById('content').innerHTML=html;
 }
 
+function renderRsFleet(rows){
+  var el=document.getElementById('rs-fleet');
+  if(!el)return;
+  if(!rows||rows.length===0){el.innerHTML='<div style="padding:24px;text-align:center;color:var(--muted);font-size:11px">sin intentos recientes</div>';return;}
+
+  var okCount=rows.filter(function(r){return r.success;}).length;
+  var failCount=rows.length-okCount;
+
+  /* Update tab badge */
+  var badge=document.getElementById('rs-badge');
+  if(badge){
+    if(okCount>0){badge.innerHTML='<span class="lnd-badge lnd-badge-ok">'+okCount+' ✓</span>'+(failCount>0?'<span class="lnd-badge lnd-badge-fail">'+failCount+' ✗</span>':'');}
+    else if(failCount>0){badge.innerHTML='<span class="lnd-badge lnd-badge-fail">'+failCount+' ✗</span>';}
+    else{badge.innerHTML='';}
+  }
+
+  var html='<div class="rsc-hdr">'+rows.length+' intentos · últimos 7 días</div>';
+
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    var ok=r.success;
+
+    /* Timestamp */
+    var ts='--';
+    if(r.createdAt){
+      var dt=new Date(r.createdAt);
+      var bog=new Date(dt.getTime()-5*3600000);
+      var nowMs=Date.now();
+      var diffMs=nowMs-dt.getTime();
+      var diffMin=Math.floor(diffMs/60000);
+      if(diffMin<60){ts=diffMin+'m';}
+      else if(diffMin<1440){ts=Math.floor(diffMin/60)+'h';}
+      else{ts=Math.floor(diffMin/1440)+'d';}
+      var mo=String(bog.getUTCMonth()+1).padStart(2,'0');
+      var dd=String(bog.getUTCDate()).padStart(2,'0');
+      var hh=String(bog.getUTCHours()).padStart(2,'0');
+      var mm=String(bog.getUTCMinutes()).padStart(2,'0');
+      ts=mo+'/'+dd+' '+hh+':'+mm+' <span style="color:var(--dim)">('+ts+')</span>';
+    }
+
+    /* Dates & improvement */
+    var oldD=r.oldConsularDate||'--';
+    var newD=r.newConsularDate||(ok?'--':'—');
+    var gainHtml='';
+    if(r.oldConsularDate&&r.newConsularDate){
+      var dOld=new Date(r.oldConsularDate).getTime();
+      var dNew=new Date(r.newConsularDate).getTime();
+      var days=Math.round((dOld-dNew)/86400000);
+      if(days>0)gainHtml='<span class="rsc-gain">+'+days+' días</span>';
+    }
+    var newTime=r.newConsularTime?' <span style="color:var(--muted);font-size:10px">'+r.newConsularTime+'</span>':'';
+
+    /* Reason */
+    var reason='';
+    if(!ok){
+      if(r.failReason){reason=r.failReason;}
+      else if(r.failStep){reason=r.failStep;}
+      else if(r.error){reason=r.error.substring(0,60);}
+    } else {
+      if(r.error){reason=r.error.substring(0,60);} /* strategy string on success */
+    }
+
+    /* Tags */
+    var tags='';
+    if(r.provider){tags+='<span class="rsc-tag">'+r.provider+'</span>';}
+    if(r.sessionAgeMs){tags+='<span class="rsc-tag">ses '+Math.round(r.sessionAgeMs/60000)+'m</span>';}
+    if(r.durationMs){tags+='<span class="rsc-tag">'+r.durationMs+'ms</span>';}
+
+    html+='<div class="rsc-card '+(ok?'rsc-card-ok':'rsc-card-fail')+'">';
+    /* Top row */
+    html+='<div class="rsc-top">';
+    html+='<span class="'+(ok?'rsc-result-ok':'rsc-result-fail')+'">'+(ok?'✓ ok':'✗ fail')+'</span>';
+    html+='<a class="rsc-bot" href="/dashboard/'+r.botId+'">#'+r.botId+'</a>';
+    html+='<span class="rsc-owner"></span>';
+    html+='<span class="rsc-ts">'+ts+'</span>';
+    html+='</div>';
+    /* Dates row */
+    html+='<div class="rsc-dates">';
+    html+='<span class="old">'+oldD+'</span>';
+    html+='<span class="arr">→</span>';
+    html+='<span class="'+(ok?'new-ok':'new-fail')+'">'+newD+'</span>'+newTime+gainHtml;
+    html+='</div>';
+    /* Meta row */
+    if(reason||tags){
+      html+='<div class="rsc-meta">';
+      if(reason)html+='<span class="rsc-reason">'+reason+'</span>';
+      if(tags)html+=tags;
+      html+='</div>';
+    }
+    html+='</div>';
+  }
+
+  el.innerHTML=html;
+}
+
 var _bots=[];
 var _agencies=[];
 var _lastEvents={};
@@ -782,7 +945,7 @@ async function loadFull(){
       document.getElementById('content').innerHTML='<div class="empty-msg">no hay bots configurados</div>';
       document.getElementById('summary').innerHTML='';
       document.getElementById('fleet-health').innerHTML='';
-      renderAgencies(_agencies,_bots,_lastEvents);
+      renderAgencies(_agencies,_bots,_lastEvents,data.health1h||{});
       return;
     }
     var active=_bots.filter(function(b){return b.status==='active';}).length;
@@ -791,9 +954,10 @@ async function loadFull(){
       '<div class="stat"><div class="stat-val">'+_bots.length+'</div><div class="stat-lbl">bots</div></div>'+
       '<div class="stat"><div class="stat-val">'+active+'</div><div class="stat-lbl">activos</div></div>'+
       '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>';
-    renderAgencies(_agencies,_bots,_lastEvents);
+    renderAgencies(_agencies,_bots,_lastEvents,data.health1h||{});
     renderFleetHealth(_bots,data.health||{},_lastEvents,data.health1h||{},data.uptime||null);
     renderBotList(_bots,_lastEvents);
+    fetch('/api/bots/recent-reschedules?days=7&limit=100').then(function(r){return r.ok?r.json():[];}).then(renderRsFleet).catch(function(){});
   }catch(e){
     console.error('fetch error',e);
     document.getElementById('content').innerHTML='<div class="empty-msg">error cargando bots</div>';
@@ -806,9 +970,16 @@ async function loadHealth(){
     if(!res.ok)return;
     var data=await res.json();
     _lastEvents=data.events||_lastEvents;
-    renderAgencies(_agencies,_bots,_lastEvents);
+    renderAgencies(_agencies,_bots,_lastEvents,data.health1h||{});
     renderFleetHealth(_bots,data.health||{},_lastEvents,data.health1h||{},data.uptime||null);
   }catch(e){console.error('health fetch error',e);}
+}
+
+function switchLndTab(t){
+  document.getElementById('tab-fleet').style.display=t==='fleet'?'':'none';
+  document.getElementById('tab-rs').style.display=t==='rs'?'':'none';
+  document.getElementById('tab-fleet-btn').className='lnd-tab'+(t==='fleet'?' on':'');
+  document.getElementById('tab-rs-btn').className='lnd-tab'+(t==='rs'?' on':'');
 }
 
 tickClock();loadFull();
@@ -959,6 +1130,21 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 .rs-arrow{color:var(--dim);margin:0 4px}
 .rs-meta{font-size:10px;color:var(--muted);margin-top:2px}
 .rs-err{color:var(--red);font-size:10px}
+.rsf-wrap{padding:0 11px 14px}
+.rsf-hdr{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px;margin-top:14px}
+.rsf-hdr::after{content:'';flex:1;height:1px;background:var(--border)}
+.rsf-table{width:100%;border-collapse:collapse;font-size:10px}
+.rsf-table th{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);text-align:left;padding:3px 6px;border-bottom:1px solid var(--border)}
+.rsf-table td{padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:top;max-width:0}
+.rsf-table tr:last-child td{border-bottom:none}
+.rsf-table tr:hover td{background:rgba(255,255,255,.02)}
+.rsf-ok{color:var(--green);font-weight:700}
+.rsf-fail{color:var(--red)}
+.rsf-dim{color:var(--dim)}
+.rsf-reason{font-size:9px;color:var(--muted);display:block;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+.rsf-detail{font-size:8px;color:var(--dim);font-family:monospace;white-space:pre-wrap;word-break:break-all;max-width:200px}
+.rsf-bid{font-weight:700;color:var(--accent);cursor:pointer;text-decoration:none}
+.rsf-bid:hover{text-decoration:underline}
 
 /* ── Actions ── */
 .actions{display:flex;gap:6px;margin-top:8px}
@@ -1674,7 +1860,7 @@ var cd=60,timer,lastBot=null,lastPolls=null,lastSummary=null,chartMode=0;
 var calIdx=0,calMonthOffset=0,lastExclusions=null,calPollList=null,calMode=0;
 var tlData=null,tlSelDate=null,tlDots=[],tlClickBound=false;
 var calPolls=null,dateHistory=null;
-var slowCd=0,lastRss=null,lastCasLogs=null,lastBeRows=null; /* slow refresh: reschedules/cas/summary/cancellations/be every 5×60s=5min */
+var slowCd=0,lastRss=null,lastCobrosRss=null,lastCasLogs=null,lastBeRows=null; /* slow refresh: reschedules/cas/summary/cancellations/be every 5×60s=5min */
 var beData=[],beFilter='all';
 var BE_OUTCOME_CLASS={
   success:'success',
@@ -1945,9 +2131,11 @@ async function refresh(){
         fetchJ(API+'/bots/'+BID+'/logs/date-sightings?hours=24'),
         fetchJ(API+'/bots/'+BID+'/logs/bookable-events?hours=168'),
         fetchJ(API+'/bots/'+BID+'/logs/date-history'),
+        fetchJ(API+'/bots/'+BID+'/logs/reschedules?successOnly=true'),
       ]);
       rss=slowRes[0];casLogs=slowRes[1];summary=slowRes[2];cancelServer=slowRes[3];beRows=slowRes[4];
       var dhRes=slowRes[5];
+      lastCobrosRss=slowRes[6];
       lastRss=rss;lastCasLogs=casLogs;lastSummary=summary;tlData=cancelServer;lastBeRows=beRows;
       if(dhRes&&dhRes.days)dateHistory=dhRes.days;
     }
@@ -2030,7 +2218,7 @@ async function refresh(){
       var infoActRow=document.getElementById('infoActivatedRow');
       if(bot.activatedAt){infoActRow.style.display='flex';var ad=new Date(bot.activatedAt);document.getElementById('infoActivated').textContent=fmtDs(ad.toISOString().slice(0,10))+' '+ad.toLocaleTimeString('es-CO',{timeZone:'America/Bogota',hour:'2-digit',minute:'2-digit',hour12:false});}else{infoActRow.style.display='none';}
       var infoOrigRow=document.getElementById('infoOrigDateRow');
-      var origDate=rss.length>0?rss[rss.length-1].oldConsularDate:null;
+      var origDate=bot.originalConsularDate||null;
       if(origDate){infoOrigRow.style.display='flex';document.getElementById('infoOrigDate').textContent=fmtDs(origDate);}else{infoOrigRow.style.display='none';}
     }else{infoCard.style.display='none';}
 
@@ -2094,24 +2282,31 @@ async function refresh(){
       }
     }else{rsLimitRow.style.display='none';}
 
-    /* Active exclusions (P1) */
+    /* Active exclusions + global min-date restriction (P1) */
     var exclRow=document.getElementById('exclRow');
+    var today3=new Date().toLocaleDateString('sv-SE',TZ);
+    // Compute minDate: today + N days (per-bot minDaysFromToday, default 3)
+    var _minDays=(bot.minDaysFromToday!=null)?bot.minDaysFromToday:3;
+    var _md=new Date(today3+'T12:00:00');_md.setDate(_md.getDate()+_minDays);
+    var minDateStr=_md.toISOString().split('T')[0];
+    var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">restricciones: </span>';
+    if(_minDays>0)eh+='<span style="background:rgba(96,165,250,.1);color:var(--accent);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">&#9654; no antes: '+fmtDs(minDateStr)+'</span>';
     var excls=bot.excludedDateRanges||[];
-    if(excls.length>0){
-      var today3=new Date().toLocaleDateString('sv-SE',TZ);
-      var actEx=excls.filter(function(e){return e.endDate>=today3;});
-      if(actEx.length>0){
-        exclRow.style.display='';
-        var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">excluidos: </span>';
-        for(var ei=0;ei<Math.min(actEx.length,4);ei++){
-          var ex=actEx[ei];
-          var isNow=ex.startDate<=today3&&ex.endDate>=today3;
-          eh+='<span style="background:rgba(248,113,113,'+(isNow?'.12':'.06')+');color:'+(isNow?'var(--red)':'var(--muted)')+';padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">'+(isNow?'&#9632; ':'')+fmtDs(ex.startDate)+'→'+fmtDs(ex.endDate)+'</span>';
-        }
-        if(actEx.length>4)eh+='<span style="color:var(--dim)">+'+( actEx.length-4)+' más</span>';
-        exclRow.innerHTML=eh;
-      }else{exclRow.style.display='none';}
-    }else{exclRow.style.display='none';}
+    var actEx=excls.filter(function(e){return e.endDate>=today3;});
+    for(var ei=0;ei<Math.min(actEx.length,3);ei++){
+      var ex=actEx[ei];
+      var isNow=ex.startDate<=today3&&ex.endDate>=today3;
+      eh+='<span style="background:rgba(248,113,113,'+(isNow?'.12':'.06')+');color:'+(isNow?'var(--red)':'var(--muted)')+';padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">'+(isNow?'&#9632; ':'')+fmtDs(ex.startDate)+'→'+fmtDs(ex.endDate)+'</span>';
+    }
+    if(actEx.length>3)eh+='<span style="color:var(--dim)">+'+( actEx.length-3)+' más</span>';
+    var exclTimes=bot.excludedTimeRanges||[];
+    for(var ti=0;ti<exclTimes.length;ti++){
+      var et=exclTimes[ti];
+      var tlabel=et.date?fmtDs(et.date)+' ':'';
+      eh+='<span style="background:rgba(251,191,36,.08);color:var(--amber);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">&#9201; '+tlabel+et.timeStart+'–'+et.timeEnd+'</span>';
+    }
+    exclRow.style.display='';
+    exclRow.innerHTML=eh;
 
     /* Latest poll */
     if(polls.length>0){
@@ -2233,20 +2428,48 @@ async function refresh(){
       tb.innerHTML=rows;
     }
 
-    /* Reschedules */
+    /* Reschedules — detailed table */
     var rl=document.getElementById('rsList');
     var re=document.getElementById('rsEmpty');
-    if(rss.length===0){rl.innerHTML='';re.style.display=''}
+    if(rss.length===0){rl.innerHTML='';re.style.display='';}
     else{
       re.style.display='none';
-      var rh='';
+      var rh='<table class="rsf-table" style="margin-top:4px">';
+      rh+='<thead><tr><th>Hora</th><th>Desde → Hasta</th><th>Estado</th><th>Razón / Estrategia</th><th>Provider</th><th>Sesión</th><th>Dur</th></tr></thead><tbody>';
       for(var i=0;i<rss.length;i++){
         var r=rss[i];var ok=r.success;
-        rh+='<div class="rs-item"><div class="rs-dates">'+fmtDs(r.oldConsularDate)+' '+(r.oldConsularTime||'')+
-          '<span class="rs-arrow">&rarr;</span><span style="color:'+(ok?'var(--green)':'var(--red)')+';font-weight:700">'
-          +fmtDs(r.newConsularDate)+' '+r.newConsularTime+'</span> '+badge(ok?'OK':'FAIL',ok?'success':'fail')+
-          '</div><div class="rs-meta">'+fmt(r.createdAt)+(ok&&r.error?' &mdash; <span style="color:var(--accent)">'+r.error.substring(0,60)+'</span>':!ok&&r.error?' &mdash; <span class="rs-err">'+r.error.substring(0,60)+'</span>':'')+'</div></div>';
+        var ts=fmt(r.createdAt);
+        var oldD=fmtDs(r.oldConsularDate)+(r.oldConsularTime?' '+(r.oldConsularTime||''):'');
+        var newD='<span style="color:'+(ok?'var(--green)':'var(--red)')+';font-weight:700">'+fmtDs(r.newConsularDate)+(r.newConsularTime?' '+r.newConsularTime:'')+'</span>';
+        var reasonParts=[];
+        if(r.failReason)reasonParts.push(r.failReason);
+        if(r.failStep)reasonParts.push('<span class="rsf-dim">@'+r.failStep+'</span>');
+        if(!r.failReason&&r.error)reasonParts.push('<span title="'+r.error+'">'+r.error.substring(0,55)+(r.error.length>55?'…':'')+'</span>');
+        var detailStr='';
+        if(r.detail){
+          try{
+            var d=typeof r.detail==='string'?JSON.parse(r.detail):r.detail;
+            var dp=[];
+            if(d.timesFound!==undefined)dp.push('times:'+JSON.stringify(d.timesFound));
+            if(d.allAttempts)dp.push(d.allAttempts.length+' intentos');
+            if(d.cause)dp.push(d.cause);
+            if(dp.length)detailStr='<span class="rsf-detail">'+dp.join(' | ')+'</span>';
+          }catch(e){}
+        }
+        var provStr=r.provider||'<span class="rsf-dim">—</span>';
+        var sesAgeStr=r.sessionAgeMs?(Math.round(r.sessionAgeMs/60000)+'m'):'<span class="rsf-dim">—</span>';
+        var durStr=r.durationMs?(r.durationMs+'ms'):'<span class="rsf-dim">—</span>';
+        rh+='<tr>';
+        rh+='<td style="color:var(--muted);white-space:nowrap;font-size:9px">'+ts+'</td>';
+        rh+='<td style="white-space:nowrap">'+oldD+' <span class="rs-arrow">→</span> '+newD+'</td>';
+        rh+='<td>'+(ok?'<span class="rsf-ok">✓</span>':'<span class="rsf-fail">✗</span>')+'</td>';
+        rh+='<td><span class="rsf-reason">'+reasonParts.join(' ')+'</span>'+detailStr+'</td>';
+        rh+='<td style="white-space:nowrap;color:var(--muted);font-size:9px">'+provStr+'</td>';
+        rh+='<td style="white-space:nowrap;color:var(--muted);font-size:9px">'+sesAgeStr+'</td>';
+        rh+='<td style="white-space:nowrap;color:var(--dim);font-size:9px">'+durStr+'</td>';
+        rh+='</tr>';
       }
+      rh+='</tbody></table>';
       rl.innerHTML=rh;
     }
 
@@ -2897,29 +3120,29 @@ function cfgSaveTarget(){
   var errEl=document.getElementById('cfgTargetErr');
   if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
   if(errEl)errEl.style.display='none';
-  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
-    var filtered=cfgFilterDates(data.dates,newVal||null,lastBot.currentConsularDate,cfgPendingRanges);
-    if(filtered.length===0){
-      if(errEl){errEl.textContent='Sin esta configuracion el bot no podria reagendar a ninguna fecha disponible. Ajusta los rangos o la fecha limite.';errEl.style.display='block';}
-      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
-      return;
-    }
-    if(errEl)errEl.style.display='none';
+  var doSaveTarget=function(warn){
     return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDateBefore:newVal||null})})
     .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
     .then(function(){
       showToast('Fecha limite guardada',true);
       lastBot.targetDateBefore=newVal||null;
       cfgSavedTarget=newVal||null;
+      if(errEl&&warn){errEl.textContent='Advertencia: no hay fechas disponibles ahora con esta config, pero se guardó.';errEl.style.display='block';}
+      else if(errEl){errEl.style.display='none';}
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
       renderCfgTargetSection();
     })
     .catch(function(){
       showToast('Error al guardar. Reintenta.',false);
       if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
     });
+  };
+  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
+    var filtered=cfgFilterDates(data.dates,newVal||null,lastBot.currentConsularDate,cfgPendingRanges);
+    if(errEl)errEl.style.display='none';
+    return doSaveTarget(filtered.length===0);
   }).catch(function(){
-    if(errEl){errEl.textContent='Error al verificar disponibilidad. Reintenta.';errEl.style.display='block';}
-    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+    return doSaveTarget(false);
   });
 }
 
@@ -3080,31 +3303,31 @@ function cfgSaveRanges(){
   var errEl=document.getElementById('cfgRangesErr');
   if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
   if(errEl)errEl.style.display='none';
-  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
-    var inp=document.getElementById('cfgDateInput');
-    var proposedTarget=(inp&&inp.value)?inp.value:cfgSavedTarget;
-    var filtered=cfgFilterDates(data.dates,proposedTarget||null,lastBot.currentConsularDate,cfgPendingRanges);
-    if(filtered.length===0){
-      if(errEl){errEl.textContent='Sin esta configuracion el bot no podria reagendar a ninguna fecha disponible. Ajusta los rangos o la fecha limite.';errEl.style.display='block';}
-      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
-      return;
-    }
-    if(errEl)errEl.style.display='none';
+  var doSaveRanges=function(warn){
     return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({excludedDateRanges:cfgPendingRanges})})
     .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
     .then(function(){
       showToast('Rangos guardados',true);
       lastBot.excludedDateRanges=JSON.parse(JSON.stringify(cfgPendingRanges));
       cfgSavedRanges=JSON.parse(JSON.stringify(cfgPendingRanges));
+      if(errEl&&warn){errEl.textContent='Advertencia: no hay fechas disponibles ahora con esta config, pero se guardó.';errEl.style.display='block';}
+      else if(errEl){errEl.style.display='none';}
+      if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
       renderCfgRangesSection();
     })
     .catch(function(){
       showToast('Error al guardar. Reintenta.',false);
       if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
     });
+  };
+  fetchJ(API+'/bots/'+BID+'/available-dates').then(function(data){
+    var inp=document.getElementById('cfgDateInput');
+    var proposedTarget=(inp&&inp.value)?inp.value:cfgSavedTarget;
+    var filtered=cfgFilterDates(data.dates,proposedTarget||null,lastBot.currentConsularDate,cfgPendingRanges);
+    if(errEl)errEl.style.display='none';
+    return doSaveRanges(filtered.length===0);
   }).catch(function(){
-    if(errEl){errEl.textContent='Error al verificar disponibilidad. Reintenta.';errEl.style.display='block';}
-    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar rangos';}
+    return doSaveRanges(false);
   });
 }
 
@@ -4107,9 +4330,9 @@ function fmtMoney(n){return n.toLocaleString('es-CO')}
 
 function renderCobros(){
   var el=document.getElementById('cobrosContent');
-  if(!lastRss||!lastBot){el.innerHTML='<div class="cobro-empty">cargando...</div>';return;}
+  if(!lastCobrosRss||!lastBot){el.innerHTML='<div class="cobro-empty">cargando...</div>';return;}
 
-  var okRss=lastRss.filter(function(r){return r.success&&r.oldConsularDate&&r.newConsularDate});
+  var okRss=lastCobrosRss.filter(function(r){return r.oldConsularDate&&r.newConsularDate});
   if(!okRss.length){el.innerHTML='<div class="cobro-empty">sin reagendamientos exitosos</div>';return;}
 
   okRss.sort(function(a,b){return new Date(a.createdAt)-new Date(b.createdAt)});
@@ -4228,7 +4451,7 @@ function openCobroWa(){
   if(!lastBot||!lastBot.notificationPhone)return;
   var msg=document.getElementById('cobroPreview').value;
   if(!msg)return;
-  window.open('https://wa.me/'+lastBot.notificationPhone+'?text='+encodeURIComponent(msg),'_blank');
+  window.open('https://api.whatsapp.com/send?phone='+lastBot.notificationPhone+'&text='+encodeURIComponent(msg),'_blank');
 }
 
 function copyCobroMsg(){
