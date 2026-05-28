@@ -1,0 +1,30 @@
+[Unit]
+Description=Visa Bot 173 — Jun 17–Jul 16 sniper (forward-move, no CAS)
+Documentation=file:///home/agetrox/visa-scraper/scripts/_bot173-jun-jul-sniper.ts
+After=network-online.target visa-trigger.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=agetrox
+WorkingDirectory=/home/agetrox/visa-scraper
+EnvironmentFile=/home/agetrox/visa-scraper/.env
+ExecStart=/usr/bin/npx tsx --env-file=.env scripts/_bot173-jun-jul-sniper.ts --commit
+
+# Auto-restart on crash/OOM/exit, but back off so we don't hammer if it's broken
+Restart=always
+RestartSec=15
+
+# Resource limits — keep the sniper polite on the shared RPi
+MemoryMax=512M
+CPUWeight=50
+
+# Log to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot173-sniper
+
+[Install]
+WantedBy=multi-user.target

@@ -141,8 +141,48 @@ function card(content: string, opts?: { teal?: boolean }): string {
   return `<table width="100%" cellpadding="0" cellspacing="0" style="${border};border-radius:12px;margin:16px 0"><tr><td style="padding:20px;background:#ffffff;border-radius:12px">${content}</td></tr></table>`;
 }
 
-function wrap(body: string): string {
+/**
+ * Agency co-branding map — keep in sync with visa_frontend/src/lib/agency-brands.ts.
+ * When notify-user passes an agencyName matching a key here, the email header
+ * renders co-branded: partner logo | divider | visagente, plus "Alianza
+ * estratégica" subtitle (same pattern as /agencias/{slug} landing).
+ */
+interface EmailAgencyBrand { name: string; logoUrl: string; }
+const EMAIL_AGENCY_BRANDS: Record<string, EmailAgencyBrand> = {
+  visasok: { name: 'VisasOK', logoUrl: 'https://www.visagente.com/agencies/visasok-logo-white.png' },
+};
+export function resolveEmailAgencyBrand(agencyName: string | null | undefined): EmailAgencyBrand | undefined {
+  if (!agencyName) return undefined;
+  const slug = agencyName.toLowerCase().replace(/\s+/g, '');
+  return EMAIL_AGENCY_BRANDS[slug];
+}
+
+function wrap(body: string, opts?: { agencyBrand?: EmailAgencyBrand }): string {
   const footer = `<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:32px;border-top:1px solid ${C_BORDER}"><tr><td style="${F_BODY};font-size:12px;color:${C_MID};padding-top:16px">Agente R &mdash; <a href="https://visagente.com" style="color:#0d9488;text-decoration:none">visagente.com</a> &mdash; ${new Date().toISOString()}</td></tr></table>`;
+
+  const brand = opts?.agencyBrand;
+  const headerInner = brand
+    ? `<table cellpadding="0" cellspacing="0" align="center"><tr>
+          <td style="vertical-align:middle;padding-right:18px">
+            <img src="${brand.logoUrl}" alt="${esc(brand.name)}" style="display:block;border:0;height:30px;width:auto">
+          </td>
+          <td style="vertical-align:middle;padding-right:18px"><div style="width:1px;height:32px;background:rgba(255,255,255,0.18)"></div></td>
+          <td style="vertical-align:middle;padding-right:10px">
+            <img src="https://www.visagente.com/glasses.png" alt="" style="display:block;border:0;height:1.6em;width:auto">
+          </td>
+          <td style="vertical-align:middle">
+            <span style="${F_SYNE};font-size:22px;font-weight:800;letter-spacing:-0.02em;color:#ffffff;line-height:1">vis<span style="color:${C_TEAL}">agente</span></span>
+          </td>
+        </tr></table>
+        <div style="${F_BODY};font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.18em;color:rgba(255,255,255,0.55);text-align:center;margin-top:10px">Alianza estratégica</div>`
+    : `<table cellpadding="0" cellspacing="0"><tr>
+          <td style="vertical-align:middle;padding-right:14px">
+            <img src="https://www.visagente.com/glasses.png" alt="" style="display:block;border:0;height:1.6em;width:auto">
+          </td>
+          <td style="vertical-align:middle">
+            <span style="${F_SYNE};font-size:22px;font-weight:800;letter-spacing:-0.02em;color:#ffffff;line-height:1">vis<span style="color:${C_TEAL}">agente</span></span>
+          </td>
+        </tr></table>`;
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -156,15 +196,8 @@ function wrap(body: string): string {
   <tr><td align="center" style="padding:32px 16px">
     <!-- Dark header bar — matches visagente landing (grid overlay) -->
     <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;border-radius:16px 16px 0 0;overflow:hidden">
-      <tr><td style="padding:28px 32px;background-color:${C_NAVY};background-image:linear-gradient(rgba(255,255,255,0.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.045) 1px,transparent 1px);background-size:28px 28px;border-radius:16px 16px 0 0">
-        <table cellpadding="0" cellspacing="0"><tr>
-          <td style="vertical-align:middle;padding-right:14px">
-            <img src="https://www.visagente.com/glasses.png" alt="" style="display:block;border:0;height:1.6em;width:auto">
-          </td>
-          <td style="vertical-align:middle">
-            <span style="${F_SYNE};font-size:22px;font-weight:800;letter-spacing:-0.02em;color:#ffffff;line-height:1">vis<span style="color:${C_TEAL}">agente</span></span>
-          </td>
-        </tr></table>
+      <tr><td align="center" style="padding:28px 32px;background-color:${C_NAVY};background-image:linear-gradient(rgba(255,255,255,0.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.045) 1px,transparent 1px);background-size:28px 28px;border-radius:16px 16px 0 0">
+        ${headerInner}
       </td></tr>
     </table>
     <!-- White body card -->
@@ -272,13 +305,15 @@ function whatsappSection(
 
 // ── Email templates ────────────────────────────────────
 
-function buildEmail(event: string, data: Record<string, unknown>, opts?: { whatsappPhone?: string; ownerEmail?: string | null; botId?: number }): { subject: string; html: string } {
+function buildEmail(event: string, data: Record<string, unknown>, opts?: { whatsappPhone?: string; ownerEmail?: string | null; botId?: number; visaEmail?: string | null; agencyBrand?: EmailAgencyBrand }): { subject: string; html: string } {
+  const _wrap = (body: string): string => wrap(body, { agencyBrand: opts?.agencyBrand });
   if (event === 'reschedule_success') {
     const isDry = !!data.dryRun;
     const days = daysImproved(data.oldConsularDate as string, data.newConsularDate as string);
+    const acctTag = opts?.visaEmail ? ` — ${opts.visaEmail}` : opts?.botId != null ? ` — bot #${opts.botId}` : '';
     const subject = isDry
-      ? '[DRY RUN] Reschedule simulado'
-      : `Cita adelantada${days ? ` ${days} dias` : ''}!`;
+      ? `[DRY RUN] Reschedule simulado${acctTag}`
+      : `Cita adelantada${days ? ` ${days} dias` : ''}!${acctTag}`;
 
     const oldConsularFmt = fmtDateTime(data.oldConsularDate as string, data.oldConsularTime as string);
     const newConsularFmt = fmtDateTime(data.newConsularDate as string, data.newConsularTime as string);
@@ -318,10 +353,16 @@ function buildEmail(event: string, data: Record<string, unknown>, opts?: { whats
   ${newCasFmt ? `<tr><td style="${F_BODY};font-size:13px;color:${C_MID};padding-top:6px"><span style="${casTagStyle}">ASC</span><span style="${F_BODY};font-weight:600;color:#0d9488">${newCasFmt}</span></td></tr>` : ''}
 </table>`;
 
-    const html = wrap(`
+    const acctRows: Array<[string, string]> = [];
+    if (opts?.visaEmail) acctRows.push(['Cuenta', esc(opts.visaEmail)]);
+    if (opts?.botId != null) acctRows.push(['Bot', `#${opts.botId}`]);
+    const acctCard = acctRows.length > 0 ? card(kvTable(acctRows)) : '';
+
+    const html = _wrap(`
 ${isDry ? `<p style="margin-bottom:16px">${badge('DRY RUN', '#dbeafe', '#1e40af')} &nbsp;<span style="${F_BODY};font-size:15px;color:${C_MID}">Simulacion &mdash; no se hizo cambio real.</span></p>` : ''}
 <p style="${F_SYNE};font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#0d9488;margin:0 0 8px">MISIÓN COMPLETADA</p>
 <h2 style="${F_SYNE};font-size:26px;font-weight:800;color:${C_DARK};margin:0 0 4px">Movimos tu cita${days ? ` <span style="color:#0d9488">${days} días</span> antes` : ''}</h2>
+${acctCard}
 ${daysHtml}
 ${card(oldRowContent + newRowContent, { teal: true })}
 ${opts?.whatsappPhone && opts?.botId != null ? whatsappSection(opts.whatsappPhone, data, { ownerEmail: opts.ownerEmail, botId: opts.botId }) : ''}
@@ -345,7 +386,7 @@ ${opts?.whatsappPhone && opts?.botId != null ? whatsappSection(opts.whatsappPhon
   <td style="${tdDimStyle}">${a.durationMs}ms</td>
 </tr>`;
     }).join('');
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">Fecha encontrada</span> pero no agendada</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">Se encontraron fechas mejores que <strong style="color:${C_DARK}">${fmtDate(data.currentDate as string)}</strong> pero no se pudieron agendar.</p>
 ${card(kvTable([
@@ -366,7 +407,7 @@ ${dataTable(['Fecha', 'Hora', 'Error', 'Dur.'], rows.split('\n').filter(Boolean)
     if (data.window) kvRows.push(['Ventana', esc(String(data.window))]);
     if (data.fetchNumber) kvRows.push(['Fetch #', String(data.fetchNumber)]);
     kvRows.push(['Próximo reintento', `<span style="color:#0d9488;font-weight:600">${delayMin} min</span>`]);
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_RED}">TCP Block</span> — conexión rechazada</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('SITIO CAIDO', '#fee2e2', C_RED)} &nbsp;El servidor rechaza conexiones TCP. Sitio caído o rate-limit severo.</p>
 ${card(kvTable(kvRows))}
@@ -383,7 +424,7 @@ ${card(kvTable(kvRows))}
     kvRows.push(['5xx consecutivos', `<span style="color:${C_ORANGE};font-weight:600">${data.consecutive5xx ?? '?'}</span>`]);
     if (data.window) kvRows.push(['Ventana', esc(String(data.window))]);
     kvRows.push(['Próximo reintento', `<span style="color:#0d9488;font-weight:600">${delayMin} min</span>`]);
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">Servidor saturado</span> — 502 repetido</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('SERVIDOR SATURADO', '#ffedd5', C_ORANGE)} &nbsp;Errores HTTP 5xx repetidos. Precursor de soft ban.</p>
 ${card(kvTable(kvRows))}
@@ -396,7 +437,7 @@ ${card(kvTable(kvRows))}
     const kvRows: Array<[string, string]> = [];
     if (data.window) kvRows.push(['Ventana', esc(String(data.window))]);
     kvRows.push(['Duración típica', '5–20 horas']);
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">Soft ban</span> — fechas a cero</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('ADVERTENCIA', '#ffedd5', C_ORANGE)} &nbsp;La API pasó de devolver <strong style="color:${C_DARK}">${data.previousCount ?? '?'}</strong> fechas a <strong style="color:${C_RED}">${data.currentCount ?? '?'}</strong>.</p>
 ${card(kvTable(kvRows))}
@@ -409,7 +450,7 @@ ${card(kvTable(kvRows))}
     const kvRows: Array<[string, string]> = [];
     if (data.scheduleId) kvRows.push(['Schedule', esc(String(data.scheduleId))]);
     kvRows.push(['Mensaje', esc(String(data.message ?? ''))]);
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">Sesión expirada</span></h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('ACCIÓN', '#ffedd5', C_ORANGE)} &nbsp;La sesión expiró y el re-login automático falló.</p>
 ${card(kvTable(kvRows))}
@@ -419,7 +460,7 @@ ${card(kvTable(kvRows))}
 
   if (event === 'bot_error') {
     const subject = 'Bot en error — reintentará en 30min';
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_RED}">Bot en error</span></h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('ERROR', '#fee2e2', C_RED)} &nbsp;El bot alcanzó 5 errores consecutivos de sesión/lógica.</p>
 ${card(kvTable([
@@ -501,7 +542,7 @@ ${card(kvTable([
     ).join('');
     const table = `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14px;margin:12px 0"><tr>${ths}</tr>${rows}</table>`;
 
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px">CAS slots cambiaron</h2>
 ${reliabilityWarning}
 ${card(kvTable([
@@ -553,7 +594,7 @@ ${table}
 ${dataTable(['Fecha', 'Dia', 'Slots', 'Rango'], [dangerRows])}`
       : '';
 
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px">CAS Cache${isFirst ? ' activado' : ''}</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${statusBadge}${isFirst ? ` &nbsp;${badge('PRIMERA VEZ', '#dbeafe', '#1e40af')}` : ''}${filling ? ` &nbsp;<span style="${F_BODY};font-size:14px;color:${C_MID}">Fechas con slots ahora FULL.</span>` : ''}</p>
 ${card(kvTable([
@@ -571,7 +612,7 @@ ${dangerTable}
     const ageMin = data.cacheAgeMin as number;
     const reason = data.reason as string;
     const subject = `CAS Cache stale (${ageMin}min)`;
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">CAS Cache stale</span> — ${ageMin} min</h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('CACHE STALE', '#ffedd5', C_ORANGE)} &nbsp;El cron no ha podido actualizar el cache en ${ageMin} minutos.</p>
 ${card(kvTable([
@@ -591,7 +632,7 @@ ${card(kvTable([
     ];
     if (data.scheduleId) kvRows.push(['Schedule', esc(String(data.scheduleId))]);
     if (data.locale) kvRows.push(['País', esc(String(data.locale))]);
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_ORANGE}">Bot pausado</span></h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('PAUSADO', '#ffedd5', C_ORANGE)} &nbsp;El bot dejó de monitorear.</p>
 ${card(kvTable(kvRows))}
@@ -601,7 +642,7 @@ ${card(kvTable(kvRows))}
 
   if (event === 'account_locked') {
     const subject = 'Cuenta bloqueada — reintentos pausados ~1h';
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_RED}">Cuenta bloqueada</span></h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('AUTO-RETRY', '#fef3c7', '#92400e')} &nbsp;${esc(String(data.message ?? ''))}</p>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin-top:20px">El lockout dura ~1h. El cron reintentará automáticamente.</p>`);
@@ -610,7 +651,7 @@ ${card(kvTable(kvRows))}
 
   if (event === 'invalid_credentials') {
     const subject = 'Credenciales inválidas — bot detenido';
-    const html = wrap(`
+    const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${C_RED}">Credenciales inválidas</span></h2>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge('ACCIÓN', '#fee2e2', C_RED)} &nbsp;${esc(String(data.message ?? ''))}</p>
 <p style="${F_BODY};font-size:15px;color:${C_MID};margin-top:20px">Actualiza las credenciales y reactiva con <code style="${F_BODY};font-size:13px">POST /api/bots/:id/activate</code>.</p>`);
@@ -619,7 +660,7 @@ ${card(kvTable(kvRows))}
 
   // Generic fallback
   const subject = `Visa bot: ${event}`;
-  const html = wrap(`
+  const html = _wrap(`
 <h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px">${esc(subject)}</h2>
 ${card(`<pre style="${F_BODY};font-size:13px;color:${C_MID};white-space:pre-wrap;word-break:break-all;margin:0">${esc(JSON.stringify(data, null, 2))}</pre>`)}`);
   return { subject, html };
@@ -632,7 +673,7 @@ const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'bot_paused']);
 const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
 
 export async function notifyUser(
-  bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; notificationPhone?: string | null; webhookUrl: string | null },
+  bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; notificationPhone?: string | null; webhookUrl: string | null; visaEmail?: string | null; agencyName?: string | null },
   event: string,
   data: Record<string, unknown>,
 ): Promise<void> {
@@ -640,21 +681,35 @@ export async function notifyUser(
 
   const promises: Promise<void>[] = [];
 
-  // Admin variant gets bot info (id, owner email, phone) plus action buttons
-  // (open dashboard, send pre-filled WhatsApp). Only attached when recipient is the admin.
-  const adminOpts = (recipient: string | null | undefined) =>
-    recipient && recipient === ADMIN_RESCHEDULE_EMAIL && event === 'reschedule_success' && bot.notificationPhone
-      ? { whatsappPhone: bot.notificationPhone, ownerEmail: bot.ownerEmail ?? null, botId: bot.id }
-      : undefined;
+  // Resolve agency brand once per call (used by every recipient's header).
+  const agencyBrand = resolveEmailAgencyBrand(bot.agencyName);
+
+  // All reschedule_success emails get account context (botId + visaEmail) so
+  // agency leaders managing multiple bots can identify which client the move
+  // belongs to. Admin variant also gets WhatsApp action button.
+  const buildOpts = (recipient: string | null | undefined) => {
+    const base: { whatsappPhone?: string; ownerEmail?: string | null; botId?: number; visaEmail?: string | null; agencyBrand?: EmailAgencyBrand } = {
+      agencyBrand,
+    };
+    if (event === 'reschedule_success') {
+      base.botId = bot.id;
+      base.visaEmail = bot.visaEmail ?? null;
+      base.ownerEmail = bot.ownerEmail ?? null;
+      if (recipient && recipient === ADMIN_RESCHEDULE_EMAIL && bot.notificationPhone) {
+        base.whatsappPhone = bot.notificationPhone;
+      }
+    }
+    return base;
+  };
 
   if (bot.notificationEmail && NOTIFICATION_EMAIL_EVENTS.has(event)) {
-    const { subject, html } = buildEmail(event, data, adminOpts(bot.notificationEmail));
+    const { subject, html } = buildEmail(event, data, buildOpts(bot.notificationEmail));
     promises.push(sendEmail(bot.id, event, bot.notificationEmail, subject, html));
   }
 
   // Owner only gets reschedule_success — no operational spam
   if (bot.ownerEmail && event === 'reschedule_success') {
-    const { subject, html } = buildEmail(event, data, adminOpts(bot.ownerEmail));
+    const { subject, html } = buildEmail(event, data, buildOpts(bot.ownerEmail));
     promises.push(sendEmail(bot.id, event, bot.ownerEmail, subject, html));
   }
 
@@ -662,7 +717,7 @@ export async function notifyUser(
   if (ADMIN_RESCHEDULE_EMAIL && event === 'reschedule_success') {
     const alreadySent = [bot.notificationEmail, bot.ownerEmail].includes(ADMIN_RESCHEDULE_EMAIL);
     if (!alreadySent) {
-      const { subject, html } = buildEmail(event, data, adminOpts(ADMIN_RESCHEDULE_EMAIL));
+      const { subject, html } = buildEmail(event, data, buildOpts(ADMIN_RESCHEDULE_EMAIL));
       promises.push(sendEmail(bot.id, event, ADMIN_RESCHEDULE_EMAIL, subject, html));
     }
   }

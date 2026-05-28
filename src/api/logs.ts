@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, bookableEvents, dateSightings, banEpisodes } from '../db/schema.js';
-import { eq, desc, and, gte, lte, sql, isNotNull } from 'drizzle-orm';
+import { eq, desc, and, gte, lte, sql, isNotNull, or } from 'drizzle-orm';
 
 export const logsRouter = new Hono();
 
@@ -405,7 +405,12 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
     .from(pollLogs)
     .where(and(
       eq(pollLogs.botId, botId),
-      hasDate ? isNotNull(pollLogs.earliestDate) : undefined,
+      hasDate
+        ? or(
+            isNotNull(pollLogs.earliestDate),
+            sql`jsonb_array_length(${pollLogs.topDates}) > 0`,
+          )
+        : undefined,
     ))
     .orderBy(desc(pollLogs.createdAt))
     .limit(limit)

@@ -80,25 +80,38 @@ async function ensureChainForBot(
 }
 
 /**
- * Tuesday Chain Guardian — every minute from 8:50 to 8:59 AM Bogota, PRODUCTION only.
+ * Chain Guardian — runs every 10 min in BOTH dev (RPi) and prod (cloud).
  *
- * Ensures all active/error bots have a poll chain that will EXECUTE before 9:00 AM.
+ * Each runtime env (DEVELOPMENT / PRODUCTION) only manages chains for ITS env:
+ * - dev worker → bot.activeRunId      (concurrencyKey `poll-${id}`)
+ * - cloud worker → bot.activeCloudRunId (concurrencyKey `poll-cloud-${id}`)
+ *
+ * Triggering across envs is unsafe (the spawned run would execute in the wrong
+ * env and bypass the pollEnvironments guard).
+ *
+ * Behavior per chain:
  * - EXECUTING → no-op (already running)
- * - DELAYED → cancel + re-trigger now (pulls forward a run that might be 10min away)
+ * - DELAYED / QUEUED → cancel + re-trigger now (releases stuck queue slot)
  * - Dead/null → resurrect (unless cron bot with recent poll_logs)
  *
- * Runs every minute so even if a chain dies at 8:56, it's caught by 8:57 at worst.
+ * Bursty Tuesday-drop window (8:50–8:59 Bogota) is still covered — the 10 min
+ * cadence + per-minute self-chain make sure no bot stays idle for more than
+ * ~10 min during normal operation.
  */
 export const ensureChainSchedule = schedules.task({
   id: 'ensure-chain',
   cron: {
-    pattern: '50-59 13 * * 2',
-    environments: ['PRODUCTION'],
+    // Every 10 minutes — catches orphans within 10 min anywhere in the system.
+    pattern: '*/10 * * * *',
+    environments: ['DEVELOPMENT', 'PRODUCTION'],
   },
   machine: { preset: 'micro' },
-  maxDuration: 30,
+  maxDuration: 60,
 
-  run: async () => {
+  run: async (_payload, { ctx }) => {
+    const isCloud = ctx.environment.type === 'PRODUCTION';
+    const envLabel = isCloud ? 'cloud' : 'dev';
+
     // SELECT only columns needed for chain management
     const targetBots = await db.select({
       id: bots.id, status: bots.status,
@@ -109,59 +122,56 @@ export const ensureChainSchedule = schedules.task({
       .where(inArray(bots.status, ['active', 'error']));
 
     if (targetBots.length === 0) {
-      logger.info('ensure-chain: no bots');
+      logger.info('ensure-chain: no bots', { env: envLabel });
       return;
     }
 
-    const results: Record<number, { dev: RunAction; cloud?: RunAction }> = {};
+    const results: Record<number, RunAction> = {};
 
     for (const bot of targetBots) {
       const envs = (bot.pollEnvironments as string[] | null) ?? ['dev'];
-      const usesCloud = envs.includes('prod');
-      const usesCron = envs.length > 1; // dual-source (e.g. ['dev','prod']) = cron-driven
+      const botUsesCloud = envs.includes('prod');
+      const botUsesDev = envs.includes('dev');
+      const usesCron = envs.length > 1; // dual-source = cron-driven
 
-      // ensure-chain runs in PRODUCTION (cloud). It can only manage cloud chains —
-      // dev chains are managed by the RPi dev worker/cron. Triggering a dev chain
-      // from cloud creates runs that execute in cloud but bypass the pollEnvironments
-      // filter (chainId='dev' → isCloud=false → no guard).
-      if (!usesCloud) {
-        logger.info('ensure-chain: skipping dev-only bot', { botId: bot.id, pollEnvironments: envs });
-        continue;
+      // Only manage chains for the env we're running in.
+      const manageThisBot = isCloud ? botUsesCloud : botUsesDev;
+      if (!manageThisBot) continue;
+
+      const runId = isCloud ? bot.activeCloudRunId : bot.activeRunId;
+      const concurrencyKey = isCloud ? `poll-cloud-${bot.id}` : `poll-${bot.id}`;
+      const tags = [`bot:${bot.id}`, ...(isCloud ? ['cloud'] : []), 'guardian'];
+
+      const result = await ensureChainForBot(
+        bot.id,
+        runId,
+        concurrencyKey,
+        bot.activatedAt,
+        tags,
+        usesCron,
+        isCloud ? 'cloud' : 'dev',
+      );
+
+      if (result.newRunId) {
+        const updateField = isCloud
+          ? { activeCloudRunId: result.newRunId }
+          : { activeRunId: result.newRunId };
+        await db.update(bots)
+          .set({ ...updateField, updatedAt: new Date() })
+          .where(eq(bots.id, bot.id));
       }
+      results[bot.id] = result.action;
 
-      if (usesCloud) {
-        const cloud = await ensureChainForBot(
-          bot.id,
-          bot.activeCloudRunId,
-          `poll-cloud-${bot.id}`,
-          bot.activatedAt,
-          [`bot:${bot.id}`, 'cloud', 'guardian'],
-          usesCron,
-          'cloud',
-        );
-        if (cloud.newRunId) {
-          await db.update(bots)
-            .set({ activeCloudRunId: cloud.newRunId, updatedAt: new Date() })
-            .where(eq(bots.id, bot.id));
-        }
-        if (results[bot.id]) {
-          results[bot.id]!.cloud = cloud.action;
-        } else {
-          results[bot.id] = { dev: 'cron_ok', cloud: cloud.action };
-        }
-      }
-
-      const r = results[bot.id];
-      // Notify only on resurrections (not pull-forwards or cron_ok — those are normal)
-      if (r && (r.dev === 'resurrected' || r.cloud === 'resurrected')) {
+      // Notify only on real resurrections (not pull-forwards or cron_ok)
+      if (result.action === 'resurrected') {
         await notifyUserTask.trigger({
           botId: bot.id,
           event: 'chain_resurrected',
-          data: { dev: r.dev, cloud: r.cloud, trigger: 'tuesday_guardian' },
+          data: { env: envLabel, action: result.action, trigger: 'guardian_10min' },
         }, { tags: [`bot:${bot.id}`] }).catch(() => {});
       }
     }
 
-    logger.info('ensure-chain done', { results });
+    logger.info('ensure-chain done', { env: envLabel, results });
   },
 });

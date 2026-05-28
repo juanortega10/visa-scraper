@@ -340,12 +340,17 @@ export function extractGroups(groupsHtml: string): GroupInfo[] {
   return boundaries.map(({ id, start }, i) => {
     const end = boundaries[i + 1]?.start ?? html.length;
 
-    // Expand the section start backwards to capture the surrounding <table>, since the first
-    // /schedule/{id}/ link sits *after* the first row's name/passport/DS-160/visa-type cells.
-    // Bound expansion by the previous group boundary to avoid cross-group contamination.
+    // Backwards expansion: capture the <table> that precedes the first schedule link,
+    // since gear links (/applicants/{id}) sit *after* the applicant name/passport cells.
+    // Exception: if there's already a <table> *within* [start, end] (e.g. a "Continuar"
+    // button appears before the applicant table), names are already after `start` — skip
+    // backwards expansion to avoid bleeding into the previous group's table.
     const prevBoundary = i > 0 ? boundaries[i - 1]!.start : 0;
+    const forwardTableIdx = html.indexOf('<table', start);
     const tableIdx = html.lastIndexOf('<table', start);
-    const sectionStart = tableIdx >= prevBoundary ? tableIdx : start;
+    const sectionStart = (forwardTableIdx !== -1 && forwardTableIdx < end)
+      ? start
+      : (tableIdx >= prevBoundary ? tableIdx : start);
     const section = html.slice(sectionStart, end);
 
     const applicantIds: string[] = [];

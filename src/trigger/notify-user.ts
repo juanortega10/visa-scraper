@@ -1,9 +1,10 @@
 import { task, logger } from '@trigger.dev/sdk/v3';
 import { visaNotifyQueue } from './queues.js';
 import { db } from '../db/client.js';
-import { bots } from '../db/schema.js';
+import { bots, agencies } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { notifyUser } from '../services/notifications.js';
+import { decrypt } from '../services/encryption.js';
 
 interface NotifyPayload {
   botId: number;
@@ -21,21 +22,27 @@ export const notifyUserTask = task({
     const { botId, event, data } = payload;
     logger.info('notify-user START', { botId, event, data });
 
-    // SELECT only fields needed for notification delivery
-    const [bot] = await db.select({
+    // SELECT only fields needed for notification delivery + visa account email
+    // (decrypted) for account identification + agency name for co-branded header.
+    const [row] = await db.select({
       id: bots.id,
       notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
       notificationPhone: bots.notificationPhone,
       webhookUrl: bots.webhookUrl,
-    }).from(bots).where(eq(bots.id, botId));
-    if (!bot) {
+      visaEmailEnc: bots.visaEmail,
+      agencyName: agencies.name,
+    }).from(bots).leftJoin(agencies, eq(bots.agencyId, agencies.id)).where(eq(bots.id, botId));
+    if (!row) {
       logger.warn('Bot not found for notification', { botId });
       return;
     }
 
-    logger.info('Sending notification', { botId, event, webhookUrl: bot.webhookUrl ?? 'none', email: bot.notificationEmail ?? 'none' });
-    await notifyUser(bot, event, data);
+    let visaEmail: string | null = null;
+    try { visaEmail = decrypt(row.visaEmailEnc); } catch { /* leave null on decrypt failure */ }
+
+    logger.info('Sending notification', { botId, event, webhookUrl: row.webhookUrl ?? 'none', email: row.notificationEmail ?? 'none', agency: row.agencyName ?? 'none' });
+    await notifyUser({ ...row, visaEmail }, event, data);
     logger.info('notify-user DONE', { botId, event });
   },
 });

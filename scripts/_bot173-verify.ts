@@ -1,0 +1,13 @@
+import { db } from '../src/db/client.js';
+import { bots, pollLogs, rescheduleLogs } from '../src/db/schema.js';
+import { eq, desc, gte, and } from 'drizzle-orm';
+const since = new Date(Date.now() - 20 * 60_000);
+const [b] = await db.select().from(bots).where(eq(bots.id, 173));
+const polls = await db.select().from(pollLogs).where(and(eq(pollLogs.botId, 173), gte(pollLogs.createdAt, since))).orderBy(desc(pollLogs.createdAt)).limit(5);
+const rs = await db.select().from(rescheduleLogs).where(and(eq(rescheduleLogs.botId, 173), gte(rescheduleLogs.createdAt, since))).orderBy(desc(rescheduleLogs.createdAt)).limit(5);
+console.log(`bot 173: status=${b.status} provider=${b.proxyProvider} skipCas=${b.skipCas} current=${b.currentConsularDate} ${b.currentConsularTime} activeRunId=${b.activeRunId}`);
+console.log(`polls (${polls.length}):`);
+for (const p of polls) console.log(`  ${p.createdAt?.toISOString()} status=${p.status} earliest=${p.earliestDate} count=${p.datesCount} reschedule=${p.rescheduleResult ?? '-'}`);
+console.log(`reschedules since activation: ${rs.length}`);
+for (const r of rs) console.log(`  ${r.createdAt?.toISOString()} ${r.success ? 'OK' : 'FAIL'} ${r.oldConsularDate}->${r.newConsularDate} ${r.error ?? ''}`);
+process.exit(0);

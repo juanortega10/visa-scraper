@@ -999,6 +999,98 @@ describe('extractGroups: visa-type integration', () => {
   });
 });
 
+// Fixture F: Two groups where the first /schedule/{id}/ occurrence is a "Continuar" button
+// that appears BEFORE the applicant <table>. This is the real AIS Colombia structure.
+// Group 1: 3 applicants, no date. Group 2: 2 applicants, Feb 3 2027.
+// Bug: without the fix, the backwards <table> search for Group 2 finds Group 1's table
+// (which starts after Group 1's first schedule link = prevBoundary), causing Group 2 to
+// incorrectly show 5 applicants and "Juan Carlos" as its first name.
+const GROUPS_F = `
+<html><body>
+<ul class='dropdown-menu align-right actions'>
+  <li><a href="/es-co/niv/schedule/74396272/continue_actions">Continuar</a></li>
+</ul>
+<div class='card'>
+  <table>
+    <tr><td>Juan Carlos Mendivil Acosta</td><td>BA100001</td><td>B1/B2 Negocios y turismo (visitante temporal)</td></tr>
+    <tr><td>Liliana Patricia Marenco Lopez</td><td>BA100002</td><td>B1/B2 Negocios y turismo (visitante temporal)</td></tr>
+    <tr><td>Julian David Mendivil Marenco</td><td>BA100003</td><td>B1/B2 Negocios y turismo (visitante temporal)</td></tr>
+    <tr>
+      <td><a href="/es-co/niv/schedule/74396272/applicants/11000001">Editar</a></td>
+      <td><a href="/es-co/niv/schedule/74396272/applicants/11000002">Editar</a></td>
+      <td><a href="/es-co/niv/schedule/74396272/applicants/11000003">Editar</a></td>
+    </tr>
+  </table>
+</div>
+<ul class='dropdown-menu align-right actions'>
+  <li><a href="/es-co/niv/schedule/71321952/continue_actions">Continuar</a></li>
+</ul>
+<div class='card'>
+  <table>
+    <tr><td>Juan Camilo Mendivil Marenco</td><td>BA225482</td><td>B1/B2 Negocios y turismo (visitante temporal)</td></tr>
+    <tr><td>Diego Alejandro Mendivil Marenco</td><td>AV441012</td><td>B1/B2 Negocios y turismo (visitante temporal)</td></tr>
+    <tr>
+      <td><a href="/es-co/niv/schedule/71321952/applicants/85307072">Editar</a></td>
+      <td><a href="/es-co/niv/schedule/71321952/applicants/85307146">Editar</a></td>
+    </tr>
+  </table>
+  <p class='consular-appt'>
+    <strong>Cita Consular:</strong>
+    3 febrero, 2027, 07:15 Bogota Hora Local at Bogota
+  </p>
+  <p class='asc-appt'>
+    <strong>Cita ASC:</strong>
+    29 enero, 2027, 14:00 BOGOTA Hora Local at Bogota ASC
+  </p>
+</div>
+</body></html>`;
+
+describe('extractGroups: Continuar-button-before-table (two-group bleed fix)', () => {
+  it('isolates groups correctly when schedule ID first appears in a Continuar button before the table', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups).toHaveLength(2);
+  });
+
+  it('group 1 (74396272) has exactly 3 applicants', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups[0]!.scheduleId).toBe('74396272');
+    expect(groups[0]!.applicantIds).toHaveLength(3);
+    expect(groups[0]!.applicantIds).toEqual(['11000001', '11000002', '11000003']);
+  });
+
+  it('group 1 names are Juan Carlos, Liliana, Julian — not contaminated by group 2', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups[0]!.applicantNames).toEqual([
+      'Juan Carlos Mendivil Acosta',
+      'Liliana Patricia Marenco Lopez',
+      'Julian David Mendivil Marenco',
+    ]);
+  });
+
+  it('group 2 (71321952) has exactly 2 applicants — not 5 from bleed', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups[1]!.scheduleId).toBe('71321952');
+    expect(groups[1]!.applicantIds).toHaveLength(2);
+    expect(groups[1]!.applicantIds).toEqual(['85307072', '85307146']);
+  });
+
+  it('group 2 first name is Juan Camilo — not Juan Carlos from group 1', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups[1]!.applicantNames[0]).toBe('Juan Camilo Mendivil Marenco');
+    expect(groups[1]!.applicantNames).toEqual([
+      'Juan Camilo Mendivil Marenco',
+      'Diego Alejandro Mendivil Marenco',
+    ]);
+  });
+
+  it('group 2 has the correct consular date and no date on group 1', () => {
+    const groups = extractGroups(GROUPS_F);
+    expect(groups[0]!.currentConsularDate).toBeNull();
+    expect(groups[1]!.currentConsularDate).toBe('2027-02-03');
+    expect(groups[1]!.currentCasDate).toBe('2027-01-29');
+  });
+});
+
 describe('extractVisaClassFromEditPage', () => {
   // Realistic snippet from /schedule/{id}/applicants/{id}/edit (truncated for the test).
   const EDIT_B1B2 = `
