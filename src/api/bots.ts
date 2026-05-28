@@ -141,6 +141,29 @@ function validateUpdateBot(body: Record<string, unknown>): string | null {
   return validateExclusions(body);
 }
 
+// Returns an existing bot that shares (scheduleId, applicantIds) — the US-embassy
+// account is the same in real life and only one bot should poll it at a time.
+// applicantIds is order-insensitive: ["A","B"] == ["B","A"].
+async function findDuplicateBot(
+  scheduleId: string,
+  applicantIds: string[],
+  excludeBotId?: number,
+): Promise<{ id: number; status: string; ownerEmail: string | null } | null> {
+  const candidates = await db
+    .select({ id: bots.id, status: bots.status, applicantIds: bots.applicantIds, ownerEmail: bots.ownerEmail })
+    .from(bots)
+    .where(eq(bots.scheduleId, scheduleId));
+  const target = [...applicantIds].sort().join(',');
+  for (const c of candidates) {
+    if (excludeBotId != null && c.id === excludeBotId) continue;
+    const ids = Array.isArray(c.applicantIds) ? c.applicantIds : [];
+    if ([...ids].sort().join(',') === target) {
+      return { id: c.id, status: c.status, ownerEmail: c.ownerEmail };
+    }
+  }
+  return null;
+}
+
 // ── Routes ─────────────────────────────────────────────────
 
 // List all bots (summary for dashboard)
@@ -409,6 +432,23 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   const validationError = validateCreateBot(body);
   if (validationError) return c.json({ error: validationError }, 400);
 
+  // Refuse if another bot already manages this (scheduleId, applicantIds) pair —
+  // they map to the same real US-embassy account, and parallel polling causes
+  // session contention + duplicate reschedules.
+  const dup = await findDuplicateBot(body.scheduleId, body.applicantIds);
+  if (dup) {
+    return c.json(
+      {
+        error: 'duplicate_bot',
+        existingBotId: dup.id,
+        existingStatus: dup.status,
+        existingOwner: dup.ownerEmail,
+        message: `Ya existe el bot #${dup.id} (${dup.status}) para esta cuenta del consulado.`,
+      },
+      409,
+    );
+  }
+
   const {
     visaEmail,
     visaPassword,
@@ -556,6 +596,7 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
       agencyId: agency?.id ?? null,
+      clientType: agency?.id ? 'b2b' : 'b2c',   // agency client vs direct user
       // Test-mode bots inherit from the agency: shown as active in the dashboard
       // but never poll the embassy. Allows agency demos and Juan-side QA without
       // burning visa-info.com sessions or triggering bans.
@@ -950,6 +991,7 @@ botsRouter.get('/:id', async (c) => {
     targetDateBefore: bots.targetDateBefore,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     maxCasGapDays: bots.maxCasGapDays,
+    minDaysFromToday: bots.minDaysFromToday,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     skipCas: bots.skipCas,
     speculativeTimeFallback: bots.speculativeTimeFallback,
@@ -1009,6 +1051,7 @@ botsRouter.get('/:id', async (c) => {
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
     maxCasGapDays: bot.maxCasGapDays ?? null,
+    minDaysFromToday: bot.minDaysFromToday ?? null,
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
     skipCas: bot.skipCas,
@@ -1074,6 +1117,7 @@ botsRouter.put('/:id', async (c) => {
   if (body.targetDateBefore !== undefined) updates.targetDateBefore = body.targetDateBefore;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
   if (body.maxCasGapDays !== undefined) updates.maxCasGapDays = body.maxCasGapDays != null ? parseInt(body.maxCasGapDays as string, 10) : null;
+  if (body.minDaysFromToday !== undefined) updates.minDaysFromToday = body.minDaysFromToday != null ? parseInt(body.minDaysFromToday as string, 10) : null;
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;
   if (body.skipCas !== undefined) updates.skipCas = !!body.skipCas;
@@ -1116,11 +1160,29 @@ botsRouter.put('/:id', async (c) => {
 // Activate bot — login + poll chain
 botsRouter.post('/:id/activate', async (c) => {
   const id = parseInt(c.req.param('id'));
-  const [bot] = await db.select({ id: bots.id, status: bots.status }).from(bots).where(eq(bots.id, id));
+  const [bot] = await db
+    .select({ id: bots.id, status: bots.status, scheduleId: bots.scheduleId, applicantIds: bots.applicantIds })
+    .from(bots)
+    .where(eq(bots.id, id));
   if (!bot) return c.json({ error: 'Not found' }, 404);
 
   if (bot.status !== 'created' && bot.status !== 'error' && bot.status !== 'login_required' && bot.status !== 'paused' && bot.status !== 'invalid_credentials') {
     return c.json({ error: `Cannot activate bot in '${bot.status}' state` }, 409);
+  }
+
+  // Refuse if another bot already manages the same US-embassy account.
+  const dup = await findDuplicateBot(bot.scheduleId, bot.applicantIds as string[], id);
+  if (dup) {
+    return c.json(
+      {
+        error: 'duplicate_bot',
+        existingBotId: dup.id,
+        existingStatus: dup.status,
+        existingOwner: dup.ownerEmail,
+        message: `Otro bot (#${dup.id}, ${dup.status}) ya maneja esta cuenta. Pausa o elimina ese primero.`,
+      },
+      409,
+    );
   }
 
   // Full login + poll chain activation

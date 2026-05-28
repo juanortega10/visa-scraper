@@ -1,15 +1,13 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { agencies, bots, botCredentialAttempts } from '../db/schema.js';
-import type { DiscoveredAttemptData } from '../db/schema.js';
-import { eq, and, desc } from 'drizzle-orm';
+import type { DiscoveredAttemptData, AttemptConfig } from '../db/schema.js';
+import { eq, and, desc, inArray } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { clerkAuth } from '../middleware/clerk-auth.js';
-import { logAuth } from '../utils/auth-logger.js';
 import { resolveLocale } from '../utils/constants.js';
-import { InvalidCredentialsError } from '../services/login.js';
-import { discoverWithFallback } from './bots.js';
-import { setDiscoveryToken } from '../services/discovery-tokens.js';
+import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
+import { discoverAgencyBatchTask } from '../trigger/discover-agency-batch.js';
 
 export const agenciesRouter = new Hono();
 
@@ -131,6 +129,8 @@ agenciesRouter.get('/me', clerkAuth({ required: true }), async (c) => {
       visaEmail: botCredentialAttempts.visaEmail,
       country: botCredentialAttempts.country,
       locale: botCredentialAttempts.locale,
+      notificationPhone: botCredentialAttempts.notificationPhone,
+      config: botCredentialAttempts.config,
       status: botCredentialAttempts.status,
       discoveredData: botCredentialAttempts.discoveredData,
       lastError: botCredentialAttempts.lastError,
@@ -162,6 +162,34 @@ interface AttemptInput {
   visaEmail: string;
   visaPassword: string;
   country: string;
+  phone?: string;          // client WhatsApp (optional)
+  config?: AttemptConfig;  // restrictions captured before validation
+}
+
+const PHONE_DIGITS_RE = /^\d{8,16}$/;
+
+/** Keep only well-formed restriction data; null when nothing usable. */
+function sanitizeConfig(config?: AttemptConfig): AttemptConfig | null {
+  if (!config || typeof config !== 'object') return null;
+  const out: AttemptConfig = {};
+  if (Array.isArray(config.excludedDateRanges)) {
+    out.excludedDateRanges = config.excludedDateRanges.filter((r) => r?.startDate && r?.endDate);
+  }
+  if (Array.isArray(config.excludedTimeRanges)) {
+    out.excludedTimeRanges = config.excludedTimeRanges.filter((r) => r?.timeStart && r?.timeEnd);
+  }
+  if (typeof config.targetDateBefore === 'string' && config.targetDateBefore) {
+    out.targetDateBefore = config.targetDateBefore;
+  }
+  if (typeof config.maxReschedules === 'number' && config.maxReschedules > 0) {
+    out.maxReschedules = Math.floor(config.maxReschedules);
+  }
+  const empty =
+    (!out.excludedDateRanges || out.excludedDateRanges.length === 0) &&
+    (!out.excludedTimeRanges || out.excludedTimeRanges.length === 0) &&
+    !out.targetDateBefore &&
+    out.maxReschedules == null;
+  return empty ? null : out;
 }
 
 agenciesRouter.post('/:id/credential-attempts', clerkAuth({ required: true }), async (c) => {
@@ -230,16 +258,29 @@ agenciesRouter.post('/:id/credential-attempts', clerkAuth({ required: true }), a
     deduped?: boolean;
   };
   const responseRows: RespRow[] = [];
-  const toInsert: Array<{ agencyId: number; visaEmail: string; visaPassword: string; country: string; status: 'pending' }> = [];
+  const toInsert: Array<{
+    agencyId: number; visaEmail: string; visaPassword: string; country: string;
+    notificationPhone: string | null; config: AttemptConfig | null; status: 'pending';
+  }> = [];
 
   for (const a of attempts) {
     const key = a.visaEmail.toLowerCase();
+    const phoneDigits = a.phone ? a.phone.replace(/\D/g, '') : '';
+    const notificationPhone = PHONE_DIGITS_RE.test(phoneDigits) ? phoneDigits : null;
+    const config = sanitizeConfig(a.config);
     const existing = existingByEmail.get(key);
     if (existing) {
       if (existing.status !== 'used') {
+        // Collect-first: refresh password/country AND restrictions/phone without validating.
         await db
           .update(botCredentialAttempts)
-          .set({ visaPassword: encrypt(a.visaPassword), country: a.country.toLowerCase(), updatedAt: new Date() })
+          .set({
+            visaPassword: encrypt(a.visaPassword),
+            country: a.country.toLowerCase(),
+            notificationPhone,
+            config,
+            updatedAt: new Date(),
+          })
           .where(eq(botCredentialAttempts.id, existing.id));
       }
       responseRows.push({
@@ -257,6 +298,8 @@ agenciesRouter.post('/:id/credential-attempts', clerkAuth({ required: true }), a
         visaEmail: encrypt(a.visaEmail),
         visaPassword: encrypt(a.visaPassword),
         country: a.country.toLowerCase(),
+        notificationPhone,
+        config,
         status: 'pending' as const,
       });
     }
@@ -315,97 +358,56 @@ agenciesRouter.patch(
     if (!attempt) return c.json({ error: 'attempt_not_found' }, 404);
     if (attempt.status === 'used') return c.json({ error: 'attempt already used' }, 409);
 
-    let visaEmail: string;
-    let visaPassword: string;
-    try {
-      visaEmail = decrypt(attempt.visaEmail);
-      visaPassword = decrypt(attempt.visaPassword);
-    } catch {
-      return c.json({ error: 'corrupt_credentials' }, 500);
+    // Delegate to the shared discovery service (same logic the bulk task uses).
+    const res = await runDiscoveryForAttempt(attempt, {
+      clerkUserId: clerkUser.clerkUserId,
+      ip: getClientIp(c),
+    });
+
+    if (res.status === 'ready') {
+      return c.json({ status: 'ready', discoveryToken: res.discoveryToken, locale: res.locale, ...res.discoveredData });
     }
+    if (res.error === 'corrupt_credentials') return c.json({ error: 'corrupt_credentials' }, 500);
+    if (res.error === 'invalid_country') return c.json({ error: 'invalid country on attempt' }, 400);
+    const isInvalid = res.error === 'invalid_credentials';
+    return c.json(
+      { status: 'failed', error: isInvalid ? 'invalid_credentials' : 'discovery_failed', message: res.message },
+      isInvalid ? 401 : 503,
+    );
+  },
+);
 
-    const locale = resolveLocale(attempt.country);
-    if (!locale) return c.json({ error: 'invalid country on attempt' }, 400);
+// ── POST /:id/credential-attempts/discover-all — Bulk discovery (background) ──
 
-    // Mark in-progress
-    await db
-      .update(botCredentialAttempts)
-      .set({ status: 'discovering', lastAttemptAt: new Date(), updatedAt: new Date() })
-      .where(eq(botCredentialAttempts.id, attemptId));
+agenciesRouter.post(
+  '/:id/credential-attempts/discover-all',
+  clerkAuth({ required: true }),
+  async (c) => {
+    const agencyId = parseInt(c.req.param('id'), 10);
+    if (isNaN(agencyId)) return c.json({ error: 'Invalid id' }, 400);
 
-    console.log(`[agencies.discover] attempt=${attemptId} agency=${agencyId} email=${visaEmail}`);
+    const clerkUser = c.get('clerkUser')!;
+    const auth = await loadOwnedAgency(agencyId, clerkUser.clerkUserId);
+    if (auth.error === 'agency_not_found') return c.json({ error: 'agency_not_found' }, 404);
+    if (auth.error === 'forbidden') return c.json({ error: 'forbidden' }, 403);
 
-    try {
-      const { result, via } = await discoverWithFallback(visaEmail, visaPassword, locale);
-
-      const discoveryToken = setDiscoveryToken(result);
-      const discoveredData: DiscoveredAttemptData = {
-        scheduleId: result.scheduleId,
-        userId: result.userId,
-        applicantIds: result.applicantIds,
-        applicantNames: result.applicantNames,
-        currentConsularDate: result.currentConsularDate,
-        currentConsularTime: result.currentConsularTime,
-        currentCasDate: result.currentCasDate,
-        currentCasTime: result.currentCasTime,
-        consularFacilityId: result.consularFacilityId,
-        ascFacilityId: result.ascFacilityId,
-        collectsBiometrics: result.collectsBiometrics,
-        primaryVisaCategory: result.primaryVisaCategory ?? null,
-        primaryVisaTypeRaw: result.primaryVisaTypeRaw ?? null,
-        applicantVisaTypes: result.applicantVisaTypes ?? null,
-      };
-
-      await db
-        .update(botCredentialAttempts)
-        .set({
-          status: 'ready',
-          locale,
-          discoveryToken,
-          discoveredData,
-          lastError: null,
-          retryCount: attempt.retryCount + 1,
-          updatedAt: new Date(),
-        })
-        .where(eq(botCredentialAttempts.id, attemptId));
-
-      logAuth({
-        email: visaEmail, action: 'discover', locale, result: 'ok', errorMessage: via,
-        password: visaPassword, clerkUserId: clerkUser.clerkUserId, ip: getClientIp(c),
-      });
-
-      return c.json({ status: 'ready', discoveryToken, locale, ...discoveredData });
-    } catch (e) {
-      const isInvalid = e instanceof InvalidCredentialsError;
-      const errorMessage = isInvalid
-        ? 'invalid_credentials'
-        : e instanceof Error
-        ? e.message
-        : String(e);
-
-      await db
-        .update(botCredentialAttempts)
-        .set({
-          status: 'failed',
-          lastError: errorMessage,
-          retryCount: attempt.retryCount + 1,
-          updatedAt: new Date(),
-        })
-        .where(eq(botCredentialAttempts.id, attemptId));
-
-      logAuth({
-        email: visaEmail, action: 'discover', locale,
-        result: isInvalid ? 'invalid' : 'error',
-        errorMessage,
-        password: visaPassword, clerkUserId: clerkUser.clerkUserId, ip: getClientIp(c),
-      });
-
-      console.warn(`[agencies.discover] attempt=${attemptId} FAILED: ${errorMessage}`);
-      return c.json(
-        { status: 'failed', error: isInvalid ? 'invalid_credentials' : 'discovery_failed', message: errorMessage },
-        isInvalid ? 401 : 503,
+    const targets = await db
+      .select({ id: botCredentialAttempts.id })
+      .from(botCredentialAttempts)
+      .where(
+        and(
+          eq(botCredentialAttempts.agencyId, agencyId),
+          inArray(botCredentialAttempts.status, ['pending', 'failed']),
+        ),
       );
-    }
+    if (targets.length === 0) return c.json({ error: 'nothing_to_discover' }, 400);
+
+    const handle = await discoverAgencyBatchTask.trigger({
+      agencyId,
+      clerkUserId: clerkUser.clerkUserId,
+    });
+
+    return c.json({ status: 'queued', runId: handle.id, count: targets.length });
   },
 );
 

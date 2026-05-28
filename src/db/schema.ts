@@ -131,6 +131,7 @@ export const bots = pgTable(
     applicantVisaTypes: jsonb('applicant_visa_types').$type<string[] | null>(), // per-applicant raw labels (parallel to applicantIds when complete)
     activatedAt: timestamp('activated_at'),
     agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
+    clientType: varchar('client_type', { length: 3 }).notNull().default('b2c'), // 'b2c' (direct user) | 'b2b' (agency client)
     testMode: boolean('test_mode').notNull().default(false),     // when true, bot is shown as active but never polls/contacts the embassy
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
@@ -531,6 +532,16 @@ export interface DiscoveredAttemptData {
   applicantVisaTypes?: string[] | null;
 }
 
+/** Per-client restrictions captured at collection time (BEFORE validation), so the
+ * whole flow can be async: agency enters creds + country + exclusions, then a
+ * background job validates and another creates the bot applying these rules. */
+export interface AttemptConfig {
+  excludedDateRanges?: Array<{ startDate: string; endDate: string }>;
+  excludedTimeRanges?: Array<{ timeStart: string; timeEnd: string }>;
+  targetDateBefore?: string | null;
+  maxReschedules?: number | null;
+}
+
 export const botCredentialAttempts = pgTable(
   'bot_credential_attempts',
   {
@@ -540,6 +551,8 @@ export const botCredentialAttempts = pgTable(
     visaPassword: text('visa_password').notNull(),                    // encrypted
     country: varchar('country', { length: 2 }).notNull(),             // 2-letter code (co, pe, br, ...)
     locale: varchar('locale', { length: 10 }),                        // resolved locale, populated after discover
+    notificationPhone: varchar('notification_phone', { length: 20 }), // client WhatsApp (optional; falls back to agency)
+    config: jsonb('config').$type<AttemptConfig | null>(),            // restrictions captured pre-validation
     status: credentialAttemptStatusEnum('status').notNull().default('pending'),
     discoveryToken: varchar('discovery_token', { length: 64 }),       // links to discoveryTokens cache when status=ready
     discoveredData: jsonb('discovered_data').$type<DiscoveredAttemptData | null>(),
