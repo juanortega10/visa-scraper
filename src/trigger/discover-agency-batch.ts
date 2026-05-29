@@ -3,7 +3,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { botCredentialAttempts } from '../db/schema.js';
 import { agencyDiscoverQueue } from './queues.js';
-import { runDiscoveryForAttempt, isTransientDiscoverError } from '../services/agency-discovery.js';
+import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
 
 interface AttemptPayload {
   attemptId: number;
@@ -13,15 +13,16 @@ interface AttemptPayload {
 
 /**
  * Discover ONE agency credential attempt. Runs on the concurrency-limited
- * agency-discover queue (anti-ban). Transient failures throw so Trigger retries
- * (maxAttempts 3 = 1 try + 2 retries, D18); permanent failures return without retry.
+ * agency-discover queue (anti-ban). No immediate retries (maxAttempts 1): transient
+ * failures are re-attempted by reconcile-agency-attempts at a 15-min cadence, max 3
+ * (D26). Idempotent per (attempt, retryCount) via the caller's idempotencyKey.
  */
 export const discoverAgencyAttemptTask = task({
   id: 'discover-agency-attempt',
   queue: agencyDiscoverQueue,
   machine: { preset: 'micro' },
   maxDuration: 90,
-  retry: { maxAttempts: 3, minTimeoutInMs: 2000, maxTimeoutInMs: 15000, factor: 2 },
+  retry: { maxAttempts: 1 },
   run: async (payload: AttemptPayload) => {
     const { attemptId, agencyId, clerkUserId } = payload;
     const [attempt] = await db
@@ -31,13 +32,12 @@ export const discoverAgencyAttemptTask = task({
 
     if (!attempt) return { attemptId, status: 'failed' as const, error: 'attempt_not_found' };
     if (attempt.status === 'used') return { attemptId, status: 'used' as const };
+    // Skip if already resolved/in-flight (idempotency safety net vs reconciler races).
+    if (attempt.status === 'ready' || attempt.status === 'discovering') {
+      return { attemptId, status: attempt.status };
+    }
 
     const res = await runDiscoveryForAttempt(attempt, { clerkUserId });
-
-    // Let Trigger retry only transient failures (portal down / network).
-    if (res.status === 'failed' && isTransientDiscoverError(res.error)) {
-      throw new Error(`discover transient failure for attempt ${attemptId}: ${res.message ?? res.error}`);
-    }
     return { attemptId, status: res.status, error: res.error };
   },
 });

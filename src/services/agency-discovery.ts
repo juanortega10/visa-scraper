@@ -41,17 +41,27 @@ export async function runDiscoveryForAttempt(
   attempt: AttemptRow,
   opts: { clerkUserId?: string | null; ip?: string | null } = {},
 ): Promise<DiscoverAttemptResult> {
+  // Mark permanent pre-flight failures as 'failed' (not left 'pending') so the
+  // reconciler doesn't retry them forever and they surface in the report.
+  const markFailed = async (err: DiscoverErrorCode): Promise<DiscoverAttemptResult> => {
+    await db
+      .update(botCredentialAttempts)
+      .set({ status: 'failed', lastError: err, lastAttemptAt: new Date(), updatedAt: new Date() })
+      .where(eq(botCredentialAttempts.id, attempt.id));
+    return { status: 'failed', error: err };
+  };
+
   let visaEmail: string;
   let visaPassword: string;
   try {
     visaEmail = decrypt(attempt.visaEmail);
     visaPassword = decrypt(attempt.visaPassword);
   } catch {
-    return { status: 'failed', error: 'corrupt_credentials' };
+    return markFailed('corrupt_credentials');
   }
 
   const locale = resolveLocale(attempt.country);
-  if (!locale) return { status: 'failed', error: 'invalid_country' };
+  if (!locale) return markFailed('invalid_country');
 
   await db
     .update(botCredentialAttempts)
