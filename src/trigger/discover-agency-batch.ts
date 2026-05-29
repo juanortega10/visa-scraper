@@ -1,142 +1,122 @@
 import { task, logger, metadata } from '@trigger.dev/sdk/v3';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, lt, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { agencies, botCredentialAttempts } from '../db/schema.js';
-import { agencyDiscoverQueue } from './queues.js';
 import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
 import { createBotFromAttempt } from '../services/agency-bot-creation.js';
 import { sendAgencyBatchSummaryEmail } from '../services/notifications.js';
 
-interface AttemptPayload {
-  attemptId: number;
-  agencyId: number;
-  clerkUserId?: string | null;
+type AttemptRow = typeof botCredentialAttempts.$inferSelect;
+type AgencyRow = typeof agencies.$inferSelect;
+
+// Anti-ban: at most this many concurrent portal logins per batch run.
+const CONCURRENCY = 3;
+// D26: retry transient failures at a 15-min cadence, up to 3 retries (4 attempts total).
+const MAX_TOTAL_ATTEMPTS = 4;
+const RETRY_AFTER_MIN = 15;
+
+type Outcome = 'created' | 'invalid_creds' | 'portal_down' | 'max_bots' | 'other';
+
+/** Discover one attempt and, if it lands ready, create its bot. Reuses the same
+ * services the per-bot endpoint uses. Processed INLINE (no child-task fan-out) so it
+ * runs reliably in the dev worker — child-task fan-out + batchTriggerAndWait proved
+ * fragile in this environment (runs stuck PENDING_VERSION). */
+async function processAttempt(attempt: AttemptRow, agency: AgencyRow | undefined): Promise<Outcome> {
+  const res = await runDiscoveryForAttempt(attempt);
+  if (res.status !== 'ready') {
+    return res.error === 'invalid_credentials' || res.error === 'corrupt_credentials' || res.error === 'invalid_country'
+      ? 'invalid_creds'
+      : 'portal_down';
+  }
+  if (!agency) return 'other';
+  const [fresh] = await db.select().from(botCredentialAttempts).where(eq(botCredentialAttempts.id, attempt.id));
+  if (!fresh) return 'other';
+  const created = await createBotFromAttempt(fresh, agency);
+  if (created.status === 'created') return 'created';
+  if (created.status === 'skipped' && created.reason === 'max_bots') return 'max_bots';
+  if (created.status === 'skipped' && (created.reason === 'duplicate' || created.reason === 'already_used')) return 'created';
+  return 'other';
 }
 
 /**
- * Discover ONE agency credential attempt. Runs on the concurrency-limited
- * agency-discover queue (anti-ban). No immediate retries (maxAttempts 1): transient
- * failures are re-attempted by reconcile-agency-attempts at a 15-min cadence, max 3
- * (D26). Idempotent per (attempt, retryCount) via the caller's idempotencyKey.
- */
-export const discoverAgencyAttemptTask = task({
-  id: 'discover-agency-attempt',
-  queue: agencyDiscoverQueue,
-  machine: { preset: 'micro' },
-  maxDuration: 90,
-  retry: { maxAttempts: 1 },
-  run: async (payload: AttemptPayload) => {
-    const { attemptId, agencyId, clerkUserId } = payload;
-    const [attempt] = await db
-      .select()
-      .from(botCredentialAttempts)
-      .where(and(eq(botCredentialAttempts.id, attemptId), eq(botCredentialAttempts.agencyId, agencyId)));
-
-    if (!attempt) return { attemptId, result: 'failed' as const, error: 'attempt_not_found' };
-    if (attempt.botId || attempt.status === 'used') return { attemptId, result: 'skipped' as const, reason: 'already_used' };
-    // Skip if already resolved/in-flight (idempotency safety net vs reconciler races).
-    if (attempt.status === 'ready' || attempt.status === 'discovering') {
-      return { attemptId, result: 'skipped' as const, reason: attempt.status };
-    }
-
-    metadata.set('phase', 'validando'); // live status for the frontend (D31)
-    const res = await runDiscoveryForAttempt(attempt, { clerkUserId });
-    if (res.status !== 'ready') {
-      metadata.set('phase', 'requiere_accion');
-      return { attemptId, result: 'failed' as const, error: res.error };
-    }
-    metadata.set('phase', 'creando');
-
-    // D24: auto-create the bot right after discovery, reusing the fresh session.
-    const [agency] = await db.select().from(agencies).where(eq(agencies.id, agencyId));
-    if (!agency) return { attemptId, result: 'failed' as const, error: 'agency_missing' };
-    const [fresh] = await db
-      .select()
-      .from(botCredentialAttempts)
-      .where(eq(botCredentialAttempts.id, attemptId));
-    if (!fresh) return { attemptId, result: 'failed' as const, error: 'attempt_gone' };
-
-    const created = await createBotFromAttempt(fresh, agency);
-    logger.info('discover→create', { attemptId, create: created.status });
-    if (created.status === 'created') {
-      metadata.set('phase', 'activado');
-      return { attemptId, result: 'created' as const, botId: created.botId, activation: created.activation };
-    }
-    metadata.set('phase', 'omitido');
-    return { attemptId, result: 'skipped' as const, reason: created.reason };
-  },
-});
-
-/**
- * Parent task: discover ALL pending/failed attempts for an agency in bulk.
- * Fans out one child run per attempt (throttled by the queue), waits for all,
- * then aggregates. Triggered by POST /api/agencies/:id/credential-attempts/discover-all.
+ * Discover + auto-create all due attempts for an agency, inline with bounded concurrency.
+ * Triggered by POST /api/agencies/:id/credential-attempts/discover-all and by the
+ * reconciler. Targets: pending attempts + transient-failed ones due for a 15-min retry.
  */
 export const discoverAgencyBatchTask = task({
   id: 'discover-agency-batch',
-  machine: { preset: 'micro' },
-  maxDuration: 60,
+  machine: { preset: 'small-1x' },
+  maxDuration: 1800,
   run: async (payload: { agencyId: number; clerkUserId?: string | null }) => {
-    const { agencyId, clerkUserId } = payload;
+    const { agencyId } = payload;
+    const cutoff = new Date(Date.now() - RETRY_AFTER_MIN * 60 * 1000);
 
     const targets = await db
-      .select({ id: botCredentialAttempts.id })
+      .select()
       .from(botCredentialAttempts)
       .where(
         and(
           eq(botCredentialAttempts.agencyId, agencyId),
-          inArray(botCredentialAttempts.status, ['pending', 'failed']),
+          or(
+            eq(botCredentialAttempts.status, 'pending'),
+            and(
+              eq(botCredentialAttempts.status, 'failed'),
+              lt(botCredentialAttempts.retryCount, MAX_TOTAL_ATTEMPTS),
+              lt(botCredentialAttempts.lastAttemptAt, cutoff),
+            ),
+          ),
         ),
       );
 
     if (targets.length === 0) {
-      logger.info('discover-agency-batch: nothing to discover', { agencyId });
-      return { agencyId, total: 0, created: 0, failed: 0, skipped: 0 };
+      logger.info('discover-agency-batch: nothing due', { agencyId });
+      return { agencyId, total: 0, activated: 0, invalidCreds: 0, portalDown: 0, maxBots: 0, other: 0 };
     }
 
+    // Skip transient-failed that aren't due yet for retry (belt-and-suspenders vs the SQL).
+    const [agency] = await db.select().from(agencies).where(eq(agencies.id, agencyId));
     logger.info('discover-agency-batch START', { agencyId, total: targets.length });
 
-    const batch = await discoverAgencyAttemptTask.batchTriggerAndWait(
-      targets.map((t) => ({
-        payload: { attemptId: t.id, agencyId, clerkUserId },
-        options: {
-          idempotencyKey: `discover-attempt-${t.id}`,
-          idempotencyKeyTTL: '20m',
-          tags: [`agency:${agencyId}`, `attempt:${t.id}`], // Realtime subscription (D31)
-        },
-      })),
-    );
+    const counts = { activated: 0, invalidCreds: 0, portalDown: 0, maxBots: 0, other: 0 };
+    const bump = (o: Outcome) => {
+      if (o === 'created') counts.activated++;
+      else if (o === 'invalid_creds') counts.invalidCreds++;
+      else if (o === 'portal_down') counts.portalDown++;
+      else if (o === 'max_bots') counts.maxBots++;
+      else counts.other++;
+    };
 
-    // Aggregate by cause for the report (D30).
-    let activated = 0, invalidCreds = 0, portalDown = 0, maxBots = 0, other = 0;
-    for (const run of batch.runs) {
-      if (!run.ok) { other++; continue; }
-      const o = run.output;
-      if (o?.result === 'created') activated++;
-      else if (o?.result === 'skipped') {
-        if (o.reason === 'duplicate' || o.reason === 'already_used') activated++;
-        else if (o.reason === 'max_bots') maxBots++;
-        else other++; // ready/discovering in-flight
-      } else if (o?.result === 'failed') {
-        if (o.error === 'invalid_credentials') invalidCreds++;
-        else if (o.error === 'discovery_failed') portalDown++;
-        else other++;
-      } else other++;
-    }
-    const created = activated, failed = invalidCreds + portalDown + other, skipped = maxBots;
-    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, activated, invalidCreds, portalDown, maxBots, other });
+    let idx = 0;
+    let done = 0;
+    metadata.set('progress', { done: 0, total: targets.length });
+    const worker = async () => {
+      while (idx < targets.length) {
+        const a = targets[idx++]!;
+        try {
+          bump(await processAttempt(a, agency));
+        } catch (e) {
+          counts.other++;
+          logger.error('processAttempt failed', { attemptId: a.id, error: String(e) });
+        }
+        done++;
+        metadata.set('progress', { done, total: targets.length });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, worker));
 
-    // Email summary to the agency (D29/D30). Fire-and-forget.
-    const [ag] = await db
-      .select({ contactEmail: agencies.contactEmail, name: agencies.name })
-      .from(agencies)
-      .where(eq(agencies.id, agencyId));
-    if (ag?.contactEmail) {
-      await sendAgencyBatchSummaryEmail(ag.contactEmail, ag.name, {
-        total: targets.length, activated, invalidCreds, portalDown, maxBots, other,
+    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, ...counts });
+
+    if (agency?.contactEmail) {
+      await sendAgencyBatchSummaryEmail(agency.contactEmail, agency.name, {
+        total: targets.length,
+        activated: counts.activated,
+        invalidCreds: counts.invalidCreds,
+        portalDown: counts.portalDown,
+        maxBots: counts.maxBots,
+        other: counts.other,
       }).catch((e) => logger.warn('batch summary email failed', { error: String(e) }));
     }
 
-    return { agencyId, total: targets.length, created, failed, skipped };
+    return { agencyId, total: targets.length, ...counts };
   },
 });
