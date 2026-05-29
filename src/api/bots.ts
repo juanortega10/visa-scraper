@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { bots, agencies, botCredentialAttempts, excludedDates, excludedTimes, sessions, authLogs, rescheduleLogs, pollLogs } from '../db/schema.js';
 import type { CasCacheData } from '../db/schema.js';
-import { eq, and, desc, asc, gte, sql, isNotNull, count } from 'drizzle-orm';
+import { eq, and, desc, asc, gte, sql, isNotNull, isNull, count } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
 import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
@@ -213,7 +213,9 @@ botsRouter.get('/me', clerkAuth({ required: true }), async (c) => {
       createdAt: bots.createdAt,
     })
     .from(bots)
-    .where(eq(bots.clerkUserId, clerkUser.clerkUserId))
+    // Individual (B2C) bots only. Agency (B2B) client bots share the agency owner's
+    // clerkUserId but belong to the agency dashboard, NOT the /activar individual flow.
+    .where(and(eq(bots.clerkUserId, clerkUser.clerkUserId), isNull(bots.agencyId)))
     .orderBy(desc(bots.createdAt));
 
   return c.json({
