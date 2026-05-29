@@ -59,6 +59,43 @@ async function sendEmail(
   }
 }
 
+/** Per-cause batch report (D30) emailed to the agency when a discover-all run settles (D29). */
+export interface AgencyBatchSummary {
+  total: number;
+  activated: number;
+  invalidCreds: number;   // requiere acción: corregir contraseña
+  portalDown: number;     // reintentando automáticamente
+  maxBots: number;        // límite de plan
+  other: number;          // revisar
+}
+
+export async function sendAgencyBatchSummaryEmail(
+  to: string,
+  agencyName: string | null,
+  s: AgencyBatchSummary,
+): Promise<void> {
+  if (!to) return;
+  const row = (label: string, n: number, note: string) =>
+    n > 0
+      ? `<tr><td style="padding:6px 12px;font-weight:600">${n}</td><td style="padding:6px 12px">${label}</td><td style="padding:6px 12px;color:#64748b">${note}</td></tr>`
+      : '';
+  const html = `
+  <div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;color:#0f172a">
+    <h2 style="color:#0f172a">Resumen de activación${agencyName ? ` — ${agencyName}` : ''}</h2>
+    <p style="color:#475569">Procesamos ${s.total} cuenta${s.total === 1 ? '' : 's'}.</p>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;border:1px solid #e2e8f0;border-radius:8px">
+      ${row('Activadas', s.activated, 'agentes corriendo')}
+      ${row('Credenciales inválidas', s.invalidCreds, 'corrige la contraseña y se reintenta solo')}
+      ${row('Portal caído', s.portalDown, 'reintentando automáticamente')}
+      ${row('Límite de plan', s.maxBots, 'amplía el cupo para activarlas')}
+      ${row('Requieren revisión', s.other, 'revísalas en el panel')}
+    </table>
+    <p style="margin-top:16px"><a href="https://visagente.com/agencias-piloto/dashboard" style="color:#0d9488">Ver el panel →</a></p>
+  </div>`;
+  const subject = `Activación: ${s.activated}/${s.total} listas${s.invalidCreds + s.other > 0 ? ` · ${s.invalidCreds + s.other} requieren acción` : ''}`;
+  await sendEmail(0, 'agency_batch_summary', to, subject, html);
+}
+
 async function sendWebhook(
   botId: number,
   event: string,

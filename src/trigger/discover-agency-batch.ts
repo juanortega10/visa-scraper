@@ -5,6 +5,7 @@ import { agencies, botCredentialAttempts } from '../db/schema.js';
 import { agencyDiscoverQueue } from './queues.js';
 import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
 import { createBotFromAttempt } from '../services/agency-bot-creation.js';
+import { sendAgencyBatchSummaryEmail } from '../services/notifications.js';
 
 interface AttemptPayload {
   attemptId: number;
@@ -106,20 +107,36 @@ export const discoverAgencyBatchTask = task({
       })),
     );
 
-    let created = 0;
-    let failed = 0;
-    let skipped = 0;
+    // Aggregate by cause for the report (D30).
+    let activated = 0, invalidCreds = 0, portalDown = 0, maxBots = 0, other = 0;
     for (const run of batch.runs) {
-      if (!run.ok) { failed++; continue; }
-      const r = run.output?.result;
-      if (r === 'created') created++;
-      else if (r === 'failed') failed++;
-      else skipped++;
+      if (!run.ok) { other++; continue; }
+      const o = run.output;
+      if (o?.result === 'created') activated++;
+      else if (o?.result === 'skipped') {
+        if (o.reason === 'duplicate' || o.reason === 'already_used') activated++;
+        else if (o.reason === 'max_bots') maxBots++;
+        else other++; // ready/discovering in-flight
+      } else if (o?.result === 'failed') {
+        if (o.error === 'invalid_credentials') invalidCreds++;
+        else if (o.error === 'discovery_failed') portalDown++;
+        else other++;
+      } else other++;
+    }
+    const created = activated, failed = invalidCreds + portalDown + other, skipped = maxBots;
+    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, activated, invalidCreds, portalDown, maxBots, other });
+
+    // Email summary to the agency (D29/D30). Fire-and-forget.
+    const [ag] = await db
+      .select({ contactEmail: agencies.contactEmail, name: agencies.name })
+      .from(agencies)
+      .where(eq(agencies.id, agencyId));
+    if (ag?.contactEmail) {
+      await sendAgencyBatchSummaryEmail(ag.contactEmail, ag.name, {
+        total: targets.length, activated, invalidCreds, portalDown, maxBots, other,
+      }).catch((e) => logger.warn('batch summary email failed', { error: String(e) }));
     }
 
-    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, created, failed, skipped });
-
-    // Email summary (D29/D30) is sent by the caller/reconciler once the agency settles.
     return { agencyId, total: targets.length, created, failed, skipped };
   },
 });
