@@ -8,6 +8,7 @@ import { clerkAuth } from '../middleware/clerk-auth.js';
 import { resolveLocale } from '../utils/constants.js';
 import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
 import { discoverAgencyBatchTask } from '../trigger/discover-agency-batch.js';
+import { auth as triggerAuth } from '@trigger.dev/sdk/v3';
 
 export const agenciesRouter = new Hono();
 
@@ -410,6 +411,26 @@ agenciesRouter.post(
     return c.json({ status: 'queued', runId: handle.id, count: targets.length });
   },
 );
+
+// ── POST /:id/realtime-token — Public Access Token for Realtime (D31) ──────
+// Frontend uses it with useRealtimeRunsWithTag(`agency:${id}`) to stream live status.
+
+agenciesRouter.post('/:id/realtime-token', clerkAuth({ required: true }), async (c) => {
+  const agencyId = parseInt(c.req.param('id'), 10);
+  if (isNaN(agencyId)) return c.json({ error: 'Invalid id' }, 400);
+
+  const clerkUser = c.get('clerkUser')!;
+  const authz = await loadOwnedAgency(agencyId, clerkUser.clerkUserId);
+  if (authz.error === 'agency_not_found') return c.json({ error: 'agency_not_found' }, 404);
+  if (authz.error === 'forbidden') return c.json({ error: 'forbidden' }, 403);
+
+  const token = await triggerAuth.createPublicToken({
+    scopes: { read: { tags: [`agency:${agencyId}`] } },
+    expirationTime: '1h',
+  });
+
+  return c.json({ token });
+});
 
 // ── DELETE /:id/credential-attempts/:attemptId — Drop an attempt ───────
 

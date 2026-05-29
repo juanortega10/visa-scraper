@@ -1,4 +1,4 @@
-import { task, logger } from '@trigger.dev/sdk/v3';
+import { task, logger, metadata } from '@trigger.dev/sdk/v3';
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { agencies, botCredentialAttempts } from '../db/schema.js';
@@ -38,8 +38,13 @@ export const discoverAgencyAttemptTask = task({
       return { attemptId, result: 'skipped' as const, reason: attempt.status };
     }
 
+    metadata.set('phase', 'validando'); // live status for the frontend (D31)
     const res = await runDiscoveryForAttempt(attempt, { clerkUserId });
-    if (res.status !== 'ready') return { attemptId, result: 'failed' as const, error: res.error };
+    if (res.status !== 'ready') {
+      metadata.set('phase', 'requiere_accion');
+      return { attemptId, result: 'failed' as const, error: res.error };
+    }
+    metadata.set('phase', 'creando');
 
     // D24: auto-create the bot right after discovery, reusing the fresh session.
     const [agency] = await db.select().from(agencies).where(eq(agencies.id, agencyId));
@@ -53,8 +58,10 @@ export const discoverAgencyAttemptTask = task({
     const created = await createBotFromAttempt(fresh, agency);
     logger.info('discover→create', { attemptId, create: created.status });
     if (created.status === 'created') {
+      metadata.set('phase', 'activado');
       return { attemptId, result: 'created' as const, botId: created.botId, activation: created.activation };
     }
+    metadata.set('phase', 'omitido');
     return { attemptId, result: 'skipped' as const, reason: created.reason };
   },
 });
@@ -91,7 +98,11 @@ export const discoverAgencyBatchTask = task({
     const batch = await discoverAgencyAttemptTask.batchTriggerAndWait(
       targets.map((t) => ({
         payload: { attemptId: t.id, agencyId, clerkUserId },
-        options: { idempotencyKey: `discover-attempt-${t.id}`, idempotencyKeyTTL: '20m' },
+        options: {
+          idempotencyKey: `discover-attempt-${t.id}`,
+          idempotencyKeyTTL: '20m',
+          tags: [`agency:${agencyId}`, `attempt:${t.id}`], // Realtime subscription (D31)
+        },
       })),
     );
 

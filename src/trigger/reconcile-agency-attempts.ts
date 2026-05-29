@@ -57,7 +57,11 @@ export const reconcileAgencyAttempts = schedules.task({
     for (const r of due) {
       await discoverAgencyAttemptTask.trigger(
         { attemptId: r.id, agencyId: r.agencyId },
-        { idempotencyKey: `discover-attempt-${r.id}-${r.retryCount}`, idempotencyKeyTTL: '20m' },
+        {
+          idempotencyKey: `discover-attempt-${r.id}-${r.retryCount}`,
+          idempotencyKeyTTL: '20m',
+          tags: [`agency:${r.agencyId}`, `attempt:${r.id}`],
+        },
       );
     }
 
