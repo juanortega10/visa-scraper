@@ -1,9 +1,10 @@
 import { task, logger } from '@trigger.dev/sdk/v3';
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { botCredentialAttempts } from '../db/schema.js';
+import { agencies, botCredentialAttempts } from '../db/schema.js';
 import { agencyDiscoverQueue } from './queues.js';
 import { runDiscoveryForAttempt } from '../services/agency-discovery.js';
+import { createBotFromAttempt } from '../services/agency-bot-creation.js';
 
 interface AttemptPayload {
   attemptId: number;
@@ -30,15 +31,31 @@ export const discoverAgencyAttemptTask = task({
       .from(botCredentialAttempts)
       .where(and(eq(botCredentialAttempts.id, attemptId), eq(botCredentialAttempts.agencyId, agencyId)));
 
-    if (!attempt) return { attemptId, status: 'failed' as const, error: 'attempt_not_found' };
-    if (attempt.status === 'used') return { attemptId, status: 'used' as const };
+    if (!attempt) return { attemptId, result: 'failed' as const, error: 'attempt_not_found' };
+    if (attempt.botId || attempt.status === 'used') return { attemptId, result: 'skipped' as const, reason: 'already_used' };
     // Skip if already resolved/in-flight (idempotency safety net vs reconciler races).
     if (attempt.status === 'ready' || attempt.status === 'discovering') {
-      return { attemptId, status: attempt.status };
+      return { attemptId, result: 'skipped' as const, reason: attempt.status };
     }
 
     const res = await runDiscoveryForAttempt(attempt, { clerkUserId });
-    return { attemptId, status: res.status, error: res.error };
+    if (res.status !== 'ready') return { attemptId, result: 'failed' as const, error: res.error };
+
+    // D24: auto-create the bot right after discovery, reusing the fresh session.
+    const [agency] = await db.select().from(agencies).where(eq(agencies.id, agencyId));
+    if (!agency) return { attemptId, result: 'failed' as const, error: 'agency_missing' };
+    const [fresh] = await db
+      .select()
+      .from(botCredentialAttempts)
+      .where(eq(botCredentialAttempts.id, attemptId));
+    if (!fresh) return { attemptId, result: 'failed' as const, error: 'attempt_gone' };
+
+    const created = await createBotFromAttempt(fresh, agency);
+    logger.info('discover→create', { attemptId, create: created.status });
+    if (created.status === 'created') {
+      return { attemptId, result: 'created' as const, botId: created.botId, activation: created.activation };
+    }
+    return { attemptId, result: 'skipped' as const, reason: created.reason };
   },
 });
 
@@ -66,26 +83,32 @@ export const discoverAgencyBatchTask = task({
 
     if (targets.length === 0) {
       logger.info('discover-agency-batch: nothing to discover', { agencyId });
-      return { agencyId, total: 0, ready: 0, failed: 0 };
+      return { agencyId, total: 0, created: 0, failed: 0, skipped: 0 };
     }
 
     logger.info('discover-agency-batch START', { agencyId, total: targets.length });
 
     const batch = await discoverAgencyAttemptTask.batchTriggerAndWait(
-      targets.map((t) => ({ payload: { attemptId: t.id, agencyId, clerkUserId } })),
+      targets.map((t) => ({
+        payload: { attemptId: t.id, agencyId, clerkUserId },
+        options: { idempotencyKey: `discover-attempt-${t.id}`, idempotencyKeyTTL: '20m' },
+      })),
     );
 
-    let ready = 0;
+    let created = 0;
     let failed = 0;
+    let skipped = 0;
     for (const run of batch.runs) {
-      if (run.ok && run.output?.status === 'ready') ready++;
-      else failed++;
+      if (!run.ok) { failed++; continue; }
+      const r = run.output?.result;
+      if (r === 'created') created++;
+      else if (r === 'failed') failed++;
+      else skipped++;
     }
 
-    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, ready, failed });
+    logger.info('discover-agency-batch DONE', { agencyId, total: targets.length, created, failed, skipped });
 
-    // Fase 4: notifyAgencyBatchTask.trigger({ agencyId, kind: 'discovery', ready, failed, total: targets.length })
-
-    return { agencyId, total: targets.length, ready, failed };
+    // Email summary (D29/D30) is sent by the caller/reconciler once the agency settles.
+    return { agencyId, total: targets.length, created, failed, skipped };
   },
 });

@@ -27,7 +27,7 @@ function getClientIp(c: { req: { header: (name: string) => string | undefined } 
 }
 
 // ── Country-specific defaults for new bots ───────────────
-const COUNTRY_DEFAULTS: Record<string, { maxReschedules?: number; targetDateBefore?: string }> = {
+export const COUNTRY_DEFAULTS: Record<string, { maxReschedules?: number; targetDateBefore?: string }> = {
   pe: { maxReschedules: 1, targetDateBefore: '2026-04-01' },
   ca: { maxReschedules: 3 }, // Canada portal caps at 3 reschedules per fr-ca/en-ca warning page
 };
@@ -144,7 +144,7 @@ function validateUpdateBot(body: Record<string, unknown>): string | null {
 // Returns an existing bot that shares (scheduleId, applicantIds) — the US-embassy
 // account is the same in real life and only one bot should poll it at a time.
 // applicantIds is order-insensitive: ["A","B"] == ["B","A"].
-async function findDuplicateBot(
+export async function findDuplicateBot(
   scheduleId: string,
   applicantIds: string[],
   excludeBotId?: number,
