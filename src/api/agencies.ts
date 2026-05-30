@@ -117,6 +117,7 @@ agenciesRouter.get('/me', clerkAuth({ required: true }), async (c) => {
       rescheduleCount: bots.rescheduleCount,
       maxReschedules: bots.maxReschedules,
       targetDateBefore: bots.targetDateBefore,
+      cohort: bots.cohort,
       activatedAt: bots.activatedAt,
       createdAt: bots.createdAt,
     })

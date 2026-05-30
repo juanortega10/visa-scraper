@@ -132,6 +132,7 @@ export const bots = pgTable(
     activatedAt: timestamp('activated_at'),
     agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
     clientType: varchar('client_type', { length: 3 }).notNull().default('b2c'), // 'b2c' (direct user) | 'b2b' (agency client)
+    cohort: varchar('cohort', { length: 5 }).notNull().default('paid'), // 'pilot' (free POC) | 'paid' (billable). New = paid; only pilots are labeled.
     testMode: boolean('test_mode').notNull().default(false),     // when true, bot is shown as active but never polls/contacts the embassy
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
