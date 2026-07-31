@@ -112,6 +112,8 @@ export const bots = pgTable(
     clerkUserId: varchar('clerk_user_id', { length: 50 }),
     casCacheJson: jsonb('cas_cache_json').$type<CasCacheData | null>(),
     targetDateBefore: date('target_date_before'),                       // hard cutoff: only reschedule to dates < this (YYYY-MM-DD exclusive)
+    targetDateAfter: date('target_date_after'),                         // sniper window lower bound (YYYY-MM-DD inclusive); only meaningful with sniperMode
+    sniperMode: boolean('sniper_mode').notNull().default(false),        // true = accept ANY date in [targetDateAfter, targetDateBefore) even if NOT earlier than current (overrides strictly-earlier protection). Requires both window bounds set.
     maxReschedules: integer('max_reschedules'),                         // null = unlimited, e.g. Peru = 2
     rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
@@ -121,10 +123,19 @@ export const bots = pgTable(
     pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
     targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
+    // Quiet polls skipped (not logged) since this bot's last written poll_logs row. Carries
+    // across runs so the next written row's polls_since_prev = 1 + this. See poll-logging.ts.
+    skippedPollsSinceLog: integer('skipped_polls_since_log').notNull().default(0),
     webhookUrl: text('webhook_url'),
     notificationEmail: text('notification_email'),   // operational alerts (all events) — typically the admin
     ownerEmail: text('owner_email'),                  // bot owner — only gets reschedule_success
     notificationPhone: text('notification_phone'),    // WhatsApp phone, digits only (e.g. "573142963759")
+    // Identidad de WhatsApp para el match 1:1 con el chat. El BSUID llega
+    // siempre en el webhook; el teléfono solo mientras dure la ventana de 30
+    // días de Meta, y ya desapareció de la UI de WhatsApp.
+    linkToken: varchar('link_token', { length: 32 }),  // token del link de activación que creó este bot
+    waBsuid: text('wa_bsuid'),                         // Business-Scoped User ID, ej. "CO.1049384871137821"
+    waUsername: text('wa_username'),                   // @handle, solo si el usuario lo activó
     visaCategory: varchar('visa_category', { length: 20 }),  // normalized code: "B1/B2", "F1", "J1", "TN", etc.
     visaTypeRaw: text('visa_type_raw'),                       // full label from groups page (locale-specific, human-readable)
     visaClassId: integer('visa_class_id'),                    // canonical server-side ID from applicant edit page (1=B1, 2=B1/B2, 11=F1, 22/88=J1, 49=TN, ...)
@@ -231,14 +242,23 @@ export const pollLogs = pgTable(
       tcpSubcategory?: 'socket_immediate_close' | 'pool_exhausted' | 'connection_reset' | 'connection_timeout' | 'dns_fail' | 'proxy_tunnel_fail' | 'connection_refused';
       poolExhausted?: boolean;
       socketBytesRead?: number;
-      blockClassification?: 'transient' | 'ip_ban' | 'account_ban';
+      blockClassification?: 'transient' | 'ip_ban' | 'account_ban' | 'schedule_blocked';
       sessionAgeMs?: number;           // ms since session.createdAt — enables session-age vs block correlation
       pollRateRecentPerMin?: number;   // polls/min from last 5 polls — enables rate vs block correlation
     }>(),
+    // Real polls this row represents: 1 + quiet polls skipped since the previous logged row.
+    // Steady-state write reduction logs ≤1 quiet 'ok' row per HEARTBEAT_MS; SUM(polls_since_prev)
+    // reconstructs true poll counts/rates for the dashboard. See poll-logging.ts.
+    pollsSincePrev: integer('polls_since_prev').notNull().default(1),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (table) => [
     index('poll_logs_bot_created_idx').on(table.botId, table.createdAt),
+    // Latest-poll lookup orders by id DESC filtered by bot_id. Without this, the
+    // planner does a backward scan of the pkey(id) index filtering bot_id — instant
+    // for bots WITH history, but a full ~9M-row scan (→ hang) for newly-onboarded bots
+    // with zero poll_logs. This index makes that an instant seek. (root cause 2026-06-09)
+    index('poll_logs_bot_id_desc_idx').on(table.botId, table.id.desc()),
   ],
 );
 
@@ -547,7 +567,10 @@ export const botCredentialAttempts = pgTable(
   'bot_credential_attempts',
   {
     id: serial('id').primaryKey(),
-    agencyId: integer('agency_id').notNull(),                         // FK to agencies.id (validated app-side)
+    // B2B: FK to agencies.id (validated app-side). B2C (self-serve /activar): NULL,
+    // and clerkUserId identifies the owner instead. Exactly one of the two is set.
+    agencyId: integer('agency_id'),
+    clerkUserId: varchar('clerk_user_id', { length: 64 }),            // set for B2C attempts (agencyId null)
     visaEmail: text('visa_email').notNull(),                          // encrypted (AES-256-GCM)
     visaPassword: text('visa_password').notNull(),                    // encrypted
     country: varchar('country', { length: 2 }).notNull(),             // 2-letter code (co, pe, br, ...)
@@ -567,6 +590,7 @@ export const botCredentialAttempts = pgTable(
   (table) => [
     index('credential_attempts_agency_idx').on(table.agencyId),
     index('credential_attempts_status_idx').on(table.status),
+    index('credential_attempts_clerk_idx').on(table.clerkUserId),
   ],
 );
 
@@ -578,7 +602,6 @@ export type Session = typeof sessions.$inferSelect;
 export type PollLog = typeof pollLogs.$inferSelect;
 export type RescheduleLog = typeof rescheduleLogs.$inferSelect;
 export type CasPrefetchLog = typeof casPrefetchLogs.$inferSelect;
-export type DispatchLog = typeof dispatchLogs.$inferSelect;
 export type AuthLog = typeof authLogs.$inferSelect;
 export type NotificationLog = typeof notificationLogs.$inferSelect;
 export type BookableEvent = typeof bookableEvents.$inferSelect;

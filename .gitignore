@@ -36,4 +36,4 @@ scripts/output/
 # All other scripts/*.ts are personal/operational and intentionally untracked.
 
 # WhatsApp exports
-WhatsApp*
+/WhatsApp*
