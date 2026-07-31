@@ -55,7 +55,7 @@ describe('sendWhatsAppText', () => {
     fetchMock.mockResolvedValue(ok());
     const r = await sendWhatsAppText({ waBsuid: 'CO.1049384871137821' }, 'hola');
     expect(r).toMatchObject({ ok: true, via: 'bsuid' });
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body);
     expect(body.recipient).toBe('CO.1049384871137821');
     expect(body.to).toBeUndefined();
   });
@@ -63,7 +63,7 @@ describe('sendWhatsAppText', () => {
   it('nunca manda to y recipient juntos: Meta le daría precedencia al teléfono', async () => {
     fetchMock.mockResolvedValue(ok());
     await sendWhatsAppText({ waBsuid: 'CO.1049384871137821', phone: '573135359930' }, 'hola');
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body);
     expect('to' in body && 'recipient' in body).toBe(false);
   });
 
@@ -109,7 +109,7 @@ describe('sendWhatsAppText', () => {
   it('usa X-API-Key, no Bearer: Kapso no acepta Bearer', async () => {
     fetchMock.mockResolvedValue(ok());
     await sendWhatsAppText({ waBsuid: 'CO.1049384871137821' }, 'hola');
-    const headers = fetchMock.mock.calls[0][1].headers;
+    const headers = fetchMock.mock.calls[0]![1].headers;
     expect(headers['X-API-Key']).toBe('test-key');
     expect(headers.Authorization).toBeUndefined();
   });
