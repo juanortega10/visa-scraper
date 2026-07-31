@@ -100,6 +100,23 @@ function validateCreateBot(body: Record<string, unknown>): string | null {
       return 'notificationPhone must be 10-15 digits (no + or spaces)';
   }
 
+  // Identidad de WhatsApp para el match 1:1. El BSUID es la llave estable;
+  // el teléfono puede faltar y el handle es opcional.
+  if (body.wa_bsuid !== undefined && body.wa_bsuid !== null) {
+    if (typeof body.wa_bsuid !== 'string' || !/^[A-Z]{2}\.[A-Za-z0-9]{1,128}$/.test(body.wa_bsuid))
+      return 'wa_bsuid must look like CO.1049384871137821';
+  }
+  if (body.link_token !== undefined && body.link_token !== null) {
+    if (typeof body.link_token !== 'string' || !/^[A-Za-z0-9_-]{16,32}$/.test(body.link_token))
+      return 'link_token must be 16-32 url-safe characters';
+  }
+  if (body.wa_username !== undefined && body.wa_username !== null) {
+    // Reglas del Help Center de WhatsApp: 3-35, a-z 0-9 . _, al menos una letra.
+    if (typeof body.wa_username !== 'string' ||
+        !/^(?=.{3,35}$)(?=.*[a-z])[a-z0-9._]+$/.test(body.wa_username))
+      return 'wa_username must be 3-35 chars of a-z, 0-9, . or _ with at least one letter';
+  }
+
   return validateExclusions(body);
 }
 
@@ -138,6 +155,20 @@ function validateUpdateBot(body: Record<string, unknown>): string | null {
     if (typeof body.notificationPhone !== 'string' || !/^\d{10,15}$/.test(body.notificationPhone))
       return 'notificationPhone must be 10-15 digits (no + or spaces)';
   }
+  if (body.targetDateBefore !== undefined && body.targetDateBefore !== null &&
+      !DATE_RE.test(body.targetDateBefore as string))
+    return 'targetDateBefore must be YYYY-MM-DD';
+  if (body.targetDateAfter !== undefined && body.targetDateAfter !== null &&
+      !DATE_RE.test(body.targetDateAfter as string))
+    return 'targetDateAfter must be YYYY-MM-DD';
+  // Sniper window consistency: lower bound must be strictly before upper bound.
+  const tdaAfter = (body.targetDateAfter ?? null) as string | null;
+  const tdaBefore = (body.targetDateBefore ?? null) as string | null;
+  if (tdaAfter && tdaBefore && tdaAfter >= tdaBefore)
+    return 'targetDateAfter must be earlier than targetDateBefore';
+  // sniperMode requires a fully-bounded window so the strictly-earlier override has a defined range.
+  if (body.sniperMode === true && !(tdaAfter && tdaBefore))
+    return 'sniperMode requires both targetDateAfter and targetDateBefore';
   return validateExclusions(body);
 }
 
@@ -242,14 +273,19 @@ botsRouter.get('/countries', (c) => {
 
 // Shared helper: single poll_logs scan for 24h stats + 1h subset + uptime buckets
 async function fetchPollStats(since24: Date, since1h: Date) {
+  // Counts are weighted by polls_since_prev to reconstruct REAL polls (steady-state quiet
+  // polls are heartbeat-skipped; one row stands in for N polls — see poll-logging.ts). Quiet
+  // 'ok' rows carry N>1; interesting rows always carry 1, so `else polls_since_prev - 1` only
+  // strips the single interesting poll, attributing its preceding quiet polls to 'ok'.
+  // Uptime buckets stay count-distinct (one logged row per 5-min bucket is enough).
   const rows = await db.select({
     botId: pollLogs.botId,
-    total24h:      sql<number>`count(*)::int`,
-    ok24h:         sql<number>`count(*) filter (where ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+    total24h:      sql<number>`coalesce(sum(${pollLogs.pollsSincePrev}), 0)::int`,
+    ok24h:         sql<number>`coalesce(sum(case when ${pollLogs.status} in ('ok', 'filtered_out') then ${pollLogs.pollsSincePrev} else ${pollLogs.pollsSincePrev} - 1 end), 0)::int`,
     tcp24h:        sql<number>`count(*) filter (where ${pollLogs.status} = 'tcp_blocked')::int`,
     error24h:      sql<number>`count(*) filter (where ${pollLogs.status} not in ('ok', 'filtered_out', 'tcp_blocked'))::int`,
-    total1h:       sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h})::int`,
-    ok1h:          sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h} and ${pollLogs.status} in ('ok', 'filtered_out'))::int`,
+    total1h:       sql<number>`coalesce(sum(${pollLogs.pollsSincePrev}) filter (where ${pollLogs.createdAt} > ${since1h}), 0)::int`,
+    ok1h:          sql<number>`coalesce(sum(case when ${pollLogs.status} in ('ok', 'filtered_out') then ${pollLogs.pollsSincePrev} else ${pollLogs.pollsSincePrev} - 1 end) filter (where ${pollLogs.createdAt} > ${since1h}), 0)::int`,
     tcp1h:         sql<number>`count(*) filter (where ${pollLogs.createdAt} > ${since1h} and ${pollLogs.status} = 'tcp_blocked')::int`,
     totalBuckets:  sql<number>`count(distinct floor(extract(epoch from ${pollLogs.createdAt}) / 300))::int`,
     okBuckets:     sql<number>`count(distinct case when ${pollLogs.status} in ('ok', 'filtered_out') then floor(extract(epoch from ${pollLogs.createdAt}) / 300) end)::int`,
@@ -303,6 +339,7 @@ botsRouter.get('/landing', async (c) => {
     db.select({
       id: bots.id, locale: bots.locale, status: bots.status,
       ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
+      waBsuid: bots.waBsuid,
       currentConsularDate: bots.currentConsularDate,
       currentConsularTime: bots.currentConsularTime,
       consecutiveErrors: bots.consecutiveErrors,
@@ -359,6 +396,10 @@ botsRouter.get('/landing', async (c) => {
       ...rest,
       visaEmail: visaEmailPlain,
       originalConsularDate: origDateByBot[b.id] ?? null,
+      // Recent tcp_blocked poll counts so the dashboard can surface blocked bots
+      // (tcp_blocked does NOT raise consecutiveErrors, so otherwise they look healthy).
+      recentTcp1h: health1h[b.id]?.tcp ?? 0,
+      recentTcp24h: health[b.id]?.tcp ?? 0,
       trackerSummary: {
         blockedCount: entries.filter(e => e.blockedUntil && new Date(e.blockedUntil).getTime() > nowMs).length,
         totalEntries: entries.length,
@@ -473,6 +514,9 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
     targetDateBefore,
     maxReschedules,
     notificationPhone,
+    link_token,
+    wa_bsuid,
+    wa_username,
     agencyId: agencyIdFromBody,
     credentialAttemptId,
   } = body;
@@ -595,6 +639,9 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       notificationEmail: finalNotificationEmail,
       ownerEmail: finalOwnerEmail,
       notificationPhone: notificationPhone ?? null,
+      linkToken: link_token ?? null,
+      waBsuid: wa_bsuid ?? null,
+      waUsername: wa_username ?? null,
       proxyProvider: 'webshare',
       clerkUserId: c.get('clerkUser')?.clerkUserId || clerkUserId || null,
       agencyId: agency?.id ?? null,
@@ -991,6 +1038,7 @@ botsRouter.get('/:id', async (c) => {
     currentConsularDate: bots.currentConsularDate, currentConsularTime: bots.currentConsularTime,
     currentCasDate: bots.currentCasDate, currentCasTime: bots.currentCasTime,
     targetDateBefore: bots.targetDateBefore,
+    targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     maxCasGapDays: bots.maxCasGapDays,
     minDaysFromToday: bots.minDaysFromToday,
@@ -1001,6 +1049,7 @@ botsRouter.get('/:id', async (c) => {
     activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
     pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
     notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
+    waBsuid: bots.waBsuid, waUsername: bots.waUsername, linkToken: bots.linkToken,
     webhookUrl: bots.webhookUrl,
     visaEmail: bots.visaEmail, applicantIds: bots.applicantIds, clerkUserId: bots.clerkUserId,
     activatedAt: bots.activatedAt, createdAt: bots.createdAt, updatedAt: bots.updatedAt,
@@ -1050,6 +1099,8 @@ botsRouter.get('/:id', async (c) => {
     currentCasTime: bot.currentCasTime,
     originalConsularDate: firstRescheduleLog?.oldConsularDate ?? null,
     targetDateBefore: bot.targetDateBefore,
+    targetDateAfter: bot.targetDateAfter ?? null,
+    sniperMode: bot.sniperMode ?? false,
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
     maxCasGapDays: bot.maxCasGapDays ?? null,
@@ -1061,6 +1112,8 @@ botsRouter.get('/:id', async (c) => {
     notificationEmail: bot.notificationEmail ?? null,
     ownerEmail: bot.ownerEmail ?? null,
     notificationPhone: bot.notificationPhone ?? null,
+    waBsuid: bot.waBsuid ?? null,
+    waUsername: bot.waUsername ?? null,
     visaEmail: (() => { try { return decrypt(bot.visaEmail); } catch { return null; } })(),
     applicantIds: bot.applicantIds,
     clerkEmail,
@@ -1117,6 +1170,8 @@ botsRouter.put('/:id', async (c) => {
   if (body.cloudEnabled !== undefined) updates.cloudEnabled = !!body.cloudEnabled;
   if (body.pollEnvironments !== undefined) updates.pollEnvironments = body.pollEnvironments;
   if (body.targetDateBefore !== undefined) updates.targetDateBefore = body.targetDateBefore;
+  if (body.targetDateAfter !== undefined) updates.targetDateAfter = body.targetDateAfter;
+  if (body.sniperMode !== undefined) updates.sniperMode = !!body.sniperMode;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
   if (body.maxCasGapDays !== undefined) updates.maxCasGapDays = body.maxCasGapDays != null ? parseInt(body.maxCasGapDays as string, 10) : null;
   if (body.minDaysFromToday !== undefined) updates.minDaysFromToday = body.minDaysFromToday != null ? parseInt(body.minDaysFromToday as string, 10) : null;

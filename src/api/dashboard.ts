@@ -1,6 +1,10 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import { createHmac } from 'node:crypto';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/client.js';
+import { bots } from '../db/schema.js';
+import { sendWhatsAppText } from '../services/whatsapp-send.js';
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 const COOKIE_SECRET = process.env.COOKIE_SECRET;
@@ -40,6 +44,39 @@ dashboardRouter.use('*', async (c, next) => {
     return c.html(renderLoginPage());
   }
   return next();
+});
+
+/**
+ * Cobro por WhatsApp. Antes esto abría un deep link del navegador que exigía
+ * un teléfono: con los handles de WhatsApp ese camino se muere. Ahora el
+ * servidor manda el mensaje por Kapso, direccionado por BSUID.
+ */
+dashboardRouter.post('/api/cobro-wa', async (c) => {
+  const body = await c.req.json().catch(() => null) as { botId?: number; message?: string } | null;
+  const botId = Number(body?.botId);
+  const message = String(body?.message ?? '').trim();
+  if (!Number.isInteger(botId) || botId <= 0) {
+    return c.json({ ok: false, error: 'botId inválido' }, 400);
+  }
+  if (!message) return c.json({ ok: false, error: 'mensaje vacío' }, 400);
+
+  const [bot] = await db
+    .select({
+      id: bots.id,
+      waBsuid: bots.waBsuid,
+      notificationPhone: bots.notificationPhone,
+    })
+    .from(bots)
+    .where(eq(bots.id, botId))
+    .limit(1);
+  if (!bot) return c.json({ ok: false, error: 'bot no encontrado' }, 404);
+
+  const result = await sendWhatsAppText(
+    { waBsuid: bot.waBsuid, phone: bot.notificationPhone },
+    message,
+  );
+  if (!result.ok) return c.json(result, 502);
+  return c.json(result);
 });
 
 dashboardRouter.get('/', (c) => c.html(renderLanding()));
@@ -319,8 +356,12 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .agy-bot-chip-paused{background:rgba(252,211,77,.1);color:var(--amber)}
 .agy-bot-chip-error{background:rgba(248,113,113,.1);color:var(--red)}
 .agy-bot-chip-login_required,.agy-bot-chip-created{background:rgba(96,165,250,.1);color:var(--blue)}
+.agy-bot-tcp{background:rgba(248,113,113,.18);color:var(--red);letter-spacing:0}
 .agy-bot-rs{font-size:8px;font-weight:700;color:var(--green);white-space:nowrap}
 .agy-bot-test{font-size:7px;color:var(--amber);font-style:italic;margin-left:2px}
+.agy-caret{font-size:8px;color:var(--muted);display:inline-block;width:10px}
+.agy-botcount{font-size:8px;color:var(--muted);margin-left:auto;font-weight:700}
+.agy-bots{margin-top:6px}
 .agy-summary{display:flex;gap:10px;font-size:8px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
 .agy-summary span{font-weight:700}
 .agy-summary .ok{color:var(--green)}
@@ -456,6 +497,14 @@ function timeAgo(iso){
   return Math.floor(h/24)+'d';
 }
 
+function toggleAgency(id){
+  var e=document.getElementById('agy-bots-'+id);
+  var c=document.getElementById('agy-caret-'+id);
+  if(!e)return;
+  var open=e.style.display==='none';
+  e.style.display=open?'':'none';
+  if(c)c.textContent=open?'▼':'▶';
+}
 function renderAgencies(agencies,bots,events,health1h){
   var el=document.getElementById('agencies-section');
   if(!el)return;
@@ -496,11 +545,12 @@ function renderAgencies(agencies,bots,events,health1h){
     var contactHtml=contactBits.length?'<span class="agy-contact">'+contactBits.join(' <span style="color:var(--dim)">·</span> ')+'</span>':'';
 
     /* summary counters */
-    var active=0,paused=0,errors=0,reschedSum=0;
+    var active=0,paused=0,errors=0,reschedSum=0,tcpBlocked=0;
     agencyBots.forEach(function(b){
       if(b.status==='active')active++;
       else if(b.status==='paused')paused++;
       if(b.status==='error'||(b.consecutiveErrors||0)>=3)errors++;
+      if(b.recentTcp1h>0)tcpBlocked++;
       reschedSum+=(b.rescheduleCount||0);
     });
 
@@ -532,12 +582,16 @@ function renderAgencies(agencies,bots,events,health1h){
         var testTag=b.testMode?' <span class="agy-bot-test">demo</span>':'';
         var emailShort=(b.visaEmail||b.ownerEmail||'').split('@')[0]||'cuenta #'+b.id;
         var statusChip='<span class="agy-bot-chip agy-bot-chip-'+b.status+'">'+b.status+'</span>';
+        var tcpChip=(b.recentTcp1h>0)
+          ?'<span class="agy-bot-chip agy-bot-tcp" title="'+b.recentTcp1h+' polls TCP-bloqueados en la última hora ('+(b.recentTcp24h||0)+' en 24h)">⛔ '+b.recentTcp1h+'</span>'
+          :'';
         rowsHtml+='<a class="agy-bot" href="/dashboard/'+b.id+'">'
           +'<span class="agy-bot-id">#'+b.id+'</span>'
           +'<span class="agy-bot-email">'+emailShort+testTag+'</span>'
           +rsHtml
           +dateHtml
           +daysHtml
+          +tcpChip
           +statusChip
         +'</a>';
       });
@@ -548,15 +602,18 @@ function renderAgencies(agencies,bots,events,health1h){
     if(active>0)summaryBits.push('<span class="ok">'+active+' activos</span>');
     if(paused>0)summaryBits.push('<span class="warn">'+paused+' pausados</span>');
     if(errors>0)summaryBits.push('<span class="err">'+errors+' con errores</span>');
+    if(tcpBlocked>0)summaryBits.push('<span class="err">⛔ '+tcpBlocked+' bloqueados (TCP)</span>');
     if(reschedSum>0)summaryBits.push('<span class="ok">'+reschedSum+' reagendados</span>');
 
     html+='<div class="'+cardCls+'">'
-      +'<div class="agy-top">'
+      +'<div class="agy-top" onclick="toggleAgency('+a.id+')" style="cursor:pointer">'
+        +'<span class="agy-caret" id="agy-caret-'+a.id+'">▶</span> '
         +'<span class="agy-name">'+a.name+'</span>'
         +modeChip
         +contactHtml
+        +'<span class="agy-botcount">'+agencyBots.length+' bots</span>'
       +'</div>'
-      +'<div class="agy-bots">'+rowsHtml+'</div>'
+      +'<div class="agy-bots" id="agy-bots-'+a.id+'" style="display:none">'+rowsHtml+'</div>'
       +'<div class="agy-summary">'+summaryBits.join(' <span style="color:var(--dim)">·</span> ')+'</div>'
     +'</div>';
   });
@@ -578,6 +635,8 @@ var _fhFilter={status:'active',search:''};
 
 function renderFleetHealth(bots,health,events,health1h,uptime){
   var container=document.getElementById('fleet-health');
+  // B2C only — agency bots are shown under their (collapsible) agency card.
+  bots=(bots||[]).filter(function(b){return b.agencyId==null;});
   if(!bots.length){container.innerHTML='';return;}
 
   /* Build persistent filter bar (only once) */
@@ -765,6 +824,8 @@ function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
 }
 
 function renderBotList(bots,events){
+  // B2C only — agency bots live under their (collapsible) agency card, not the main list.
+  bots=(bots||[]).filter(function(b){return b.agencyId==null;});
   var groups={};
   bots.forEach(function(b){
     var code=cc(b.locale);
@@ -814,6 +875,9 @@ function renderBotList(bots,events){
       if(b.trackerSummary&&b.trackerSummary.blockedCount>0){
         var bc=b.trackerSummary.blockedCount;
         evPills+='<span class="ev-pill ev-err">\u2298 '+bc+(bc===1?' fecha bloqueada':' fechas bloqueadas')+'</span>';
+      }
+      if(b.recentTcp1h>0){
+        evPills+='<span class="ev-pill ev-err" title="'+(b.recentTcp24h||0)+' en 24h">\u26d4 '+b.recentTcp1h+' TCP bloq (1h)</span>';
       }
       html+='<a class="bot-card" href="/dashboard/'+b.id+'">';
       html+='<span class="bot-id">#'+b.id+'</span>';
@@ -948,12 +1012,15 @@ async function loadFull(){
       renderAgencies(_agencies,_bots,_lastEvents,data.health1h||{});
       return;
     }
-    var active=_bots.filter(function(b){return b.status==='active';}).length;
-    var countries=new Set(_bots.map(function(b){return cc(b.locale);})).size;
+    var b2c=_bots.filter(function(b){return b.agencyId==null;});
+    var agencyBotCount=_bots.length-b2c.length;
+    var active=b2c.filter(function(b){return b.status==='active';}).length;
+    var countries=new Set(b2c.map(function(b){return cc(b.locale);})).size;
     document.getElementById('summary').innerHTML=
-      '<div class="stat"><div class="stat-val">'+_bots.length+'</div><div class="stat-lbl">bots</div></div>'+
+      '<div class="stat"><div class="stat-val">'+b2c.length+'</div><div class="stat-lbl">bots b2c</div></div>'+
       '<div class="stat"><div class="stat-val">'+active+'</div><div class="stat-lbl">activos</div></div>'+
-      '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>';
+      '<div class="stat"><div class="stat-val">'+countries+'</div><div class="stat-lbl">paises</div></div>'+
+      (agencyBotCount>0?'<div class="stat"><div class="stat-val">'+agencyBotCount+'</div><div class="stat-lbl">en agencias</div></div>':'');
     renderAgencies(_agencies,_bots,_lastEvents,data.health1h||{});
     renderFleetHealth(_bots,data.health||{},_lastEvents,data.health1h||{},data.uptime||null);
     renderBotList(_bots,_lastEvents);
@@ -2104,6 +2171,7 @@ function tickCd(){
 }
 
 async function fetchJ(u){var r=await fetch(u);if(!r.ok)throw new Error(r.status+'');return r.json()}
+function putBot(fields){return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)}).then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j&&j.error?j.error:('HTTP '+r.status))});return r.json()});}
 
 /* ── Main refresh ── */
 async function refresh(){
@@ -2169,7 +2237,9 @@ async function refresh(){
     var batchRateEl=document.getElementById('batchRate');
     var cutoff5m=Date.now()-5*60*1000;
     var recent5=polls.filter(function(p){return new Date(p.createdAt).getTime()>cutoff5m;});
-    var ppm=recent5.length/5;
+    /* weight by pollsSincePrev: quiet polls are heartbeat-skipped, one row stands in for N */
+    var realPolls5=recent5.reduce(function(s,p){return s+(p.pollsSincePrev||1);},0);
+    var ppm=realPolls5/5;
     var curRunId=polls.length>0?polls[0].runId:null;
     var batchPolls=curRunId?polls.filter(function(p){return p.runId===curRunId;}):[];
     var batchSize=batchPolls.length;
@@ -2251,8 +2321,22 @@ async function refresh(){
     var targetRow=document.getElementById('targetRow');
     var targetVal=document.getElementById('targetVal');
     var targetWindow=document.getElementById('targetWindow');
-    if(bot.targetDateBefore){
+    var targetLbl=targetRow?targetRow.querySelector('.appt-lbl'):null;
+    if(bot.sniperMode&&bot.targetDateAfter&&bot.targetDateBefore){
+      /* SNIPER: show the [after, before) window as an inclusive range "1 jun -> 20 jul" */
       targetRow.style.display='';
+      if(targetLbl){targetLbl.textContent='sniper';targetLbl.style.color='var(--accent)';}
+      var _endD=new Date(bot.targetDateBefore+'T12:00:00');_endD.setDate(_endD.getDate()-1);
+      var _endStr=_endD.toISOString().split('T')[0];
+      var sDays=daysUntilNum(bot.targetDateBefore);
+      var sColor=sDays<=0?'var(--red)':sDays<=14?'var(--amber)':'var(--accent)';
+      var sText=sDays<=0?'ventana cerrada':sDays+'d de ventana';
+      targetVal.innerHTML=fmtD(bot.targetDateAfter)+' <span style="color:var(--dim)">&#8594;</span> '+fmtD(_endStr);
+      targetVal.style.color=sDays<=0?'var(--red)':'var(--text)';
+      targetWindow.innerHTML='<span style="color:'+sColor+'">'+sText+'</span>';
+    }else if(bot.targetDateBefore){
+      targetRow.style.display='';
+      if(targetLbl){targetLbl.textContent='objetivo';targetLbl.style.color='var(--muted)';}
       var wDays=daysUntilNum(bot.targetDateBefore);
       var wColor=wDays<=0?'var(--red)':wDays<=14?'var(--amber)':'var(--muted)';
       var wText=wDays<=0?'ventana cerrada':wDays+'d de ventana';
@@ -2291,6 +2375,7 @@ async function refresh(){
     var minDateStr=_md.toISOString().split('T')[0];
     var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">restricciones: </span>';
     if(_minDays>0)eh+='<span style="background:rgba(96,165,250,.1);color:var(--accent);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">&#9654; no antes: '+fmtDs(minDateStr)+'</span>';
+    if(bot.maxCasGapDays!=null)eh+='<span style="background:rgba(74,222,128,.1);color:var(--green);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">gap CAS &#8804; '+bot.maxCasGapDays+'d</span>';
     var excls=bot.excludedDateRanges||[];
     var actEx=excls.filter(function(e){return e.endDate>=today3;});
     for(var ei=0;ei<Math.min(actEx.length,3);ei++){
@@ -2356,7 +2441,13 @@ async function refresh(){
       }else{lpMR.style.display='none';}
     }
 
-    document.getElementById('cdPhase').textContent=polls.length>0?guessPhase():'--';
+    var _phaseTxt=polls.length>0?guessPhase():'--';
+    var _cdPhaseEl=document.getElementById('cdPhase');
+    if(bot.sniperMode){
+      _cdPhaseEl.innerHTML='<span style="color:var(--accent);font-weight:800;letter-spacing:.5px">&#127919; SNIPER</span> <span style="color:var(--dim)">·</span> '+_phaseTxt;
+    }else{
+      _cdPhaseEl.textContent=_phaseTxt;
+    }
 
     /* Health panel */
     renderHealth(health);
@@ -2710,18 +2801,21 @@ function computeHealth(polls,windowMinutes){
     var status=p.status||'unknown';
     var ts=new Date(p.createdAt).toISOString();
     var isSuccess=status==='ok'||status==='filtered_out';
+    /* weight by pollsSincePrev: quiet polls are heartbeat-skipped (one row = N polls). Quiet
+       rows are always 'ok', so non-ok rows have w=1 → success/tcp counts stay event-accurate. */
+    var w=p.pollsSincePrev||1;
     /* chain */
     if(!chainMap[chain])chainMap[chain]={polls:0,latencySum:0,latencyCount:0,lastPollAt:ts,statuses:{}};
     var ch=chainMap[chain];
-    ch.polls++;
+    ch.polls+=w;
     if(latency>0){ch.latencySum+=latency;ch.latencyCount++;}
     ch.statuses[status]=(ch.statuses[status]||0)+1;
     /* ip */
     if(!ipMap[ip])ipMap[ip]={polls:0,latencySum:0,latencyCount:0,chain:chain,successCount:0,tcpBlockedCount:0,lastSeenAt:ts,provider:p.provider||'unknown'};
     var ip2=ipMap[ip];
-    ip2.polls++;
+    ip2.polls+=w;
     if(latency>0){ip2.latencySum+=latency;ip2.latencyCount++;}
-    if(isSuccess)ip2.successCount++;
+    if(isSuccess)ip2.successCount+=w;
     if(status==='tcp_blocked')ip2.tcpBlockedCount++;
   }
   /* build chains */
@@ -2740,10 +2834,12 @@ function computeHealth(polls,windowMinutes){
   }
   /* alerts */
   var alerts=[];
-  var threeMinAgo=Date.now()-3*60000;
+  /* 8min, not 3: steady-state quiet polls are heartbeat-logged at most every 5min
+     (poll-logging.ts write reduction) — a healthy idle bot can be ~5-6min between rows. */
+  var silentCutoff=Date.now()-8*60000;
   for(var ai=0;ai<chainKeys.length;ai++){
     var an=chainKeys[ai];var av=chainMap[an];
-    if(new Date(av.lastPollAt).getTime()<threeMinAgo){
+    if(new Date(av.lastPollAt).getTime()<silentCutoff){
       var mins=Math.round((Date.now()-new Date(av.lastPollAt).getTime())/60000);
       alerts.push({type:'chain_silent',message:an+' chain: no polls in '+mins+'min',severity:'warning'});
     }
@@ -2761,7 +2857,8 @@ function computeHealth(polls,windowMinutes){
       }
     }
   }
-  return{windowMinutes:windowMinutes,totalPolls:recent.length,ratePerMin:+(recent.length/(windowMs/60000)).toFixed(1),chains:chains,ips:ips,alerts:alerts};
+  var realPolls=recent.reduce(function(s,p){return s+(p.pollsSincePrev||1);},0);
+  return{windowMinutes:windowMinutes,totalPolls:realPolls,ratePerMin:+(realPolls/(windowMs/60000)).toFixed(1),chains:chains,ips:ips,alerts:alerts};
 }
 
 function renderHealth(h){
@@ -3004,12 +3101,14 @@ var cfgCalMonth=null;
 var cfgRangeStart=null;
 var cfgRangeEnd=null;
 var cfgCalState=0;
+var cfgSniper=null;
 
 function openCfgModal(){
   if(!lastBot)return;
   cfgSavedTarget=lastBot.targetDateBefore||null;
   cfgSavedRanges=JSON.parse(JSON.stringify(lastBot.excludedDateRanges||[]));
   cfgPendingRanges=JSON.parse(JSON.stringify(cfgSavedRanges));
+  cfgSniper={sniperMode:!!lastBot.sniperMode,targetDateAfter:lastBot.targetDateAfter||null,targetDateBefore:lastBot.targetDateBefore||null,maxCasGapDays:(lastBot.maxCasGapDays!=null?lastBot.maxCasGapDays:null)};
   var ov=document.createElement('div');
   ov.id='cfgOverlay';ov.className='cfg-overlay';
   ov.onclick=function(){closeCfgModal()};
@@ -3027,6 +3126,11 @@ function openCfgModal(){
       '<div class="cfg-section-desc">Solo reagendar a fechas anteriores a esta. Dejar vacio para sin limite.</div>'+
       '<div id="cfgTargetContent"></div>'+
     '</div>'+
+    '<div class="cfg-section" id="cfgSectionS">'+
+      '<div class="cfg-section-title">&#127919; sniper</div>'+
+      '<div class="cfg-section-desc">Busca una fecha dentro de una ventana [desde, hasta) y la toma <b>aunque sea posterior</b> a la cita actual (puede perder el slot actual). Tambien fija el gap maximo CAS&#8596;consular.</div>'+
+      '<div id="cfgSniperContent"></div>'+
+    '</div>'+
     '<div class="cfg-section" id="cfgSectionB">'+
       '<div class="cfg-section-title">fechas excluidas<span id="cfgUnsaved" class="cfg-unsaved" style="display:none">(sin guardar)</span></div>'+
       '<div class="cfg-section-desc">Rangos de fechas que el bot debe ignorar al reagendar.</div>'+
@@ -3039,8 +3143,70 @@ function openCfgModal(){
   });
   document.addEventListener('keydown',cfgEscHandler);
   renderCfgTargetSection();
+  renderCfgSniperSection();
   cfgCalState=0; cfgRangeStart=null; cfgRangeEnd=null;
   renderCfgRangesSection();
+}
+
+function renderCfgSniperSection(){
+  var el=document.getElementById('cfgSniperContent');
+  if(!el||!cfgSniper)return;
+  var on=!!cfgSniper.sniperMode;
+  var h='';
+  h+='<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:10px">';
+  h+='<input type="checkbox" id="cfgSniperOn" '+(on?'checked':'')+' onchange="cfgSniperToggle()" style="width:15px;height:15px;cursor:pointer">';
+  h+='<span style="font-size:12px;font-weight:700;color:'+(on?'var(--accent)':'var(--muted)')+'">modo sniper '+(on?'activo':'inactivo')+'</span></label>';
+  h+='<div id="cfgSniperFields" style="'+(on?'':'display:none')+'">';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:10px;color:var(--muted);width:46px">desde</span><input type="date" id="cfgSniperFrom" class="cfg-date-input" value="'+(cfgSniper.targetDateAfter||'')+'"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="font-size:10px;color:var(--muted);width:46px">hasta</span><input type="date" id="cfgSniperTo" class="cfg-date-input" value="'+(cfgSniper.targetDateBefore||'')+'"></div>';
+  h+='<div style="font-size:9px;color:var(--dim);margin-bottom:8px">"hasta" es exclusivo (no incluido). Equivale a la fecha limite de arriba.</div>';
+  h+='</div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin:10px 0 4px;padding-top:8px;border-top:1px solid var(--border)"><span style="font-size:10px;color:var(--muted);width:120px">gap CAS max (dias)</span><input type="number" min="1" max="60" id="cfgGapInput" class="cfg-date-input" style="width:70px" value="'+(cfgSniper.maxCasGapDays!=null?cfgSniper.maxCasGapDays:'')+'" placeholder="8"></div>';
+  h+='<div style="font-size:9px;color:var(--dim);margin-bottom:8px">Maximo de dias entre CAS y consular. Vacio = 8 (default).</div>';
+  h+='<div class="cfg-btn-row"><button class="cfg-btn cfg-btn-save" id="cfgSniperSave" onclick="cfgSaveSniper()">guardar</button></div>';
+  h+='<div class="cfg-err" id="cfgSniperErr" style="display:none"></div>';
+  el.innerHTML=h;
+}
+
+function cfgSniperToggle(){
+  var cb=document.getElementById('cfgSniperOn');
+  if(!cb||!cfgSniper)return;
+  cfgSniper.sniperMode=cb.checked;
+  renderCfgSniperSection();
+}
+
+function cfgSaveSniper(){
+  var on=document.getElementById('cfgSniperOn');
+  var from=document.getElementById('cfgSniperFrom');
+  var to=document.getElementById('cfgSniperTo');
+  var gap=document.getElementById('cfgGapInput');
+  var errEl=document.getElementById('cfgSniperErr');
+  var btn=document.getElementById('cfgSniperSave');
+  var sniperOn=on?on.checked:false;
+  var tda=(from&&from.value)?from.value:null;
+  var tdb=(to&&to.value)?to.value:null;
+  var gapRaw=gap?gap.value.trim():'';
+  var gapVal=gapRaw===''?null:parseInt(gapRaw,10);
+  function showErr(msg){if(errEl){errEl.textContent=msg;errEl.style.display='block';}}
+  if(errEl)errEl.style.display='none';
+  if(gapVal!==null&&(isNaN(gapVal)||gapVal<1||gapVal>60)){showErr('gap CAS: 1-60 dias (o vacio).');return;}
+  if(sniperOn&&!(tda&&tdb)){showErr('Modo sniper requiere "desde" y "hasta".');return;}
+  if(tda&&tdb&&tda>=tdb){showErr('"desde" debe ser anterior a "hasta".');return;}
+  if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='guardando...';}
+  var body={sniperMode:sniperOn,targetDateAfter:tda,targetDateBefore:tdb,maxCasGapDays:gapVal};
+  putBot(body)
+  .then(function(){
+    showToast('Sniper guardado',true);
+    lastBot.sniperMode=sniperOn;lastBot.targetDateAfter=tda;lastBot.targetDateBefore=tdb;lastBot.maxCasGapDays=gapVal;
+    cfgSavedTarget=tdb;
+    cfgSniper={sniperMode:sniperOn,targetDateAfter:tda,targetDateBefore:tdb,maxCasGapDays:gapVal};
+    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+    renderCfgSniperSection();renderCfgTargetSection();
+  })
+  .catch(function(e){
+    showErr('Error: '+e.message);
+    if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
+  });
 }
 
 function cfgHasUnsavedChanges(){
@@ -3121,16 +3287,16 @@ function cfgSaveTarget(){
   if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
   if(errEl)errEl.style.display='none';
   var doSaveTarget=function(warn){
-    return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDateBefore:newVal||null})})
-    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+    return putBot({targetDateBefore:newVal||null})
     .then(function(){
       showToast('Fecha limite guardada',true);
       lastBot.targetDateBefore=newVal||null;
       cfgSavedTarget=newVal||null;
+      if(cfgSniper){cfgSniper.targetDateBefore=newVal||null;}
       if(errEl&&warn){errEl.textContent='Advertencia: no hay fechas disponibles ahora con esta config, pero se guardó.';errEl.style.display='block';}
       else if(errEl){errEl.style.display='none';}
       if(btn){btn.classList.remove('cfg-btn-loading');btn.disabled=false;btn.textContent='guardar';}
-      renderCfgTargetSection();
+      renderCfgTargetSection();renderCfgSniperSection();
     })
     .catch(function(){
       showToast('Error al guardar. Reintenta.',false);
@@ -3148,13 +3314,13 @@ function cfgSaveTarget(){
 
 function cfgClearTarget(){
   if(!confirm('Quitar la fecha limite? El bot buscara cualquier fecha anterior a la cita actual.'))return;
-  fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDateBefore:null})})
-  .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+  putBot({targetDateBefore:null})
   .then(function(){
     showToast('Fecha limite eliminada',true);
     lastBot.targetDateBefore=null;
     cfgSavedTarget=null;
-    renderCfgTargetSection();
+    if(cfgSniper){cfgSniper.targetDateBefore=null;}
+    renderCfgTargetSection();renderCfgSniperSection();
   })
   .catch(function(){showToast('Error al guardar. Reintenta.',false);});
 }
@@ -3304,8 +3470,7 @@ function cfgSaveRanges(){
   if(btn){btn.classList.add('cfg-btn-loading');btn.disabled=true;btn.textContent='validando...';}
   if(errEl)errEl.style.display='none';
   var doSaveRanges=function(warn){
-    return fetch(API+'/bots/'+BID,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({excludedDateRanges:cfgPendingRanges})})
-    .then(function(r){if(!r.ok)throw new Error(r.status+'');return r.json()})
+    return putBot({excludedDateRanges:cfgPendingRanges})
     .then(function(){
       showToast('Rangos guardados',true);
       lastBot.excludedDateRanges=JSON.parse(JSON.stringify(cfgPendingRanges));
@@ -4374,14 +4539,14 @@ function renderCobros(){
   html+='<div class="cobro-detail" id="cobroDetail"></div>';
 
   /* WA button + preview */
-  if(lastBot.notificationPhone){
+  if(lastBot.waBsuid || lastBot.notificationPhone){
     html+='<div class="cobro-actions">';
     html+='<button class="cobro-wa-btn" onclick="openCobroWa()" id="cobroWaBtn" disabled>'+WA_SVG+' Enviar</button>';
     html+='<div class="cobro-preview-wrap"><textarea class="cobro-preview" id="cobroPreview" readonly placeholder="selecciona reagendamientos..."></textarea>';
     html+='<span class="cobro-copy" onclick="copyCobroMsg()">copiar</span></div>';
     html+='</div>';
   }else{
-    html+='<div class="cobro-no-phone">\\u26a0 sin whatsapp configurado \\u2014 agr\\u00e9galo en info cuenta</div>';
+    html+='<div class="cobro-no-phone">\\u26a0 este cliente no tiene BSUID ni telefono \\u2014 escribele desde WhatsApp y vuelve a intentar</div>';
   }
 
   el.innerHTML=html;
@@ -4448,10 +4613,21 @@ function generateCobroMsg(bot,selected,tariff,currency,nPersonas,totalDays,total
 }
 
 function openCobroWa(){
-  if(!lastBot||!lastBot.notificationPhone)return;
+  if(!lastBot)return;
   var msg=document.getElementById('cobroPreview').value;
   if(!msg)return;
-  window.open('https://api.whatsapp.com/send?phone='+lastBot.notificationPhone+'&text='+encodeURIComponent(msg),'_blank');
+  var btn=document.getElementById('cobroWaBtn');
+  if(btn){btn.disabled=true;btn.textContent='enviando...';}
+  fetch('/dashboard/api/cobro-wa',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({botId:lastBot.id,message:msg})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      if(btn){
+        btn.textContent = d.ok ? ('\\u2713 enviado por '+d.via) : ('\\u2717 '+(d.error||'fallo'));
+        if(!d.ok) btn.disabled=false;
+      }
+    })
+    .catch(function(){ if(btn){btn.textContent='\\u2717 sin conexion';btn.disabled=false;} });
 }
 
 function copyCobroMsg(){
