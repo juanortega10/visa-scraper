@@ -709,8 +709,20 @@ const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'bot_paused']);
 // Always receives reschedule_success regardless of bot owner
 const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
 
+// Función de Kapso `send-cobro`: recibe el reschedule_success, deja la cotización pendiente en
+// el CRM (leads.pending_days / pending_amount_cop) y, si el gate `cobro_enabled` está en 1,
+// manda el template de cobro. Es global — no depende de que cada bot tenga `webhook_url`, que
+// es la razón por la que hasta ahora nunca recibió una sola llamada.
+const COBRO_WEBHOOK_URL = process.env.KAPSO_COBRO_WEBHOOK_URL
+  ?? 'https://api.kapso.ai/platform/v1/functions/f3d28192-e744-4061-8469-ddf455aac24d/invoke';
+
 export async function notifyUser(
-  bot: { id: number; notificationEmail: string | null; ownerEmail?: string | null; notificationPhone?: string | null; webhookUrl: string | null; visaEmail?: string | null; agencyName?: string | null },
+  bot: {
+    id: number; notificationEmail: string | null; ownerEmail?: string | null;
+    notificationPhone?: string | null; webhookUrl: string | null; visaEmail?: string | null;
+    agencyName?: string | null; applicantIds?: string[] | null;
+    visaCategory?: string | null; clientType?: string | null;
+  },
   event: string,
   data: Record<string, unknown>,
 ): Promise<void> {
@@ -761,6 +773,27 @@ export async function notifyUser(
 
   if (bot.webhookUrl) {
     promises.push(sendWebhook(bot.id, event, bot.webhookUrl, payload));
+  }
+
+  // Cobro por WhatsApp: solo adelantos de clientes directos. Los b2b se facturan a la agencia
+  // quincenalmente, así que cobrarle al pasajero sería cobrar dos veces.
+  if (event === 'reschedule_success' && bot.clientType !== 'b2b' && bot.notificationPhone) {
+    const cobroPayload = {
+      event,
+      data: {
+        ...data,
+        phone: bot.notificationPhone,
+        numPeople: Array.isArray(bot.applicantIds) ? bot.applicantIds.length : 1,
+        visaType: bot.visaCategory ?? '',
+      },
+      timestamp: payload.timestamp,
+    };
+    // Best-effort: que un fallo del CRM nunca tumbe la notificación al cliente.
+    promises.push(
+      sendWebhook(bot.id, 'cobro_' + event, COBRO_WEBHOOK_URL, cobroPayload).catch((e) => {
+        console.error(`[notify] cobro webhook failed bot=${bot.id} error=${e instanceof Error ? e.message : String(e)}`);
+      }),
+    );
   }
 
   if (!(bot.notificationEmail && NOTIFICATION_EMAIL_EVENTS.has(event)) && !(bot.ownerEmail && event === 'reschedule_success') && !bot.webhookUrl) {
