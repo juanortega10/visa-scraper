@@ -457,6 +457,21 @@ function tickClock(){
   document.getElementById('clock').textContent=n.toLocaleTimeString('es-CO',{...TZ,hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
 }
 
+function escH(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+/* Etiqueta humana del bot: nombre(s) del applicant si los tenemos.
+   full=true devuelve todos los nombres (para el tooltip); si no, el primer
+   nombre recortado a nombre+apellido más "+N" cuando hay más applicants. */
+function botWho(b,full){
+  var names=(b.applicantNames||[]).filter(Boolean);
+  if(!names.length)return '';
+  if(full)return names.join(', ');
+  var parts=String(names[0]).trim().split(/\\s+/);
+  var first=parts.length>1?parts[0]+' '+parts[1]:parts[0];
+  if(first.length>18)first=first.substring(0,18)+'\\u2026';
+  return first+(names.length>1?' +'+(names.length-1):'');
+}
+
 function cc(locale){return locale?locale.split('-')[1]||'xx':'xx'}
 function meta(code){return COUNTRIES[code]||{flag:'\\u{1F3F3}\\uFE0F',name:code.toUpperCase()}}
 
@@ -580,7 +595,11 @@ function renderAgencies(agencies,bots,events,health1h){
           rsHtml='<span class="agy-bot-rs" style="color:var(--muted)">'+b.rescheduleCount+'×</span>';
         }
         var testTag=b.testMode?' <span class="agy-bot-test">demo</span>':'';
-        var emailShort=(b.visaEmail||b.ownerEmail||'').split('@')[0]||'cuenta #'+b.id;
+        /* Nombre del applicant si lo tenemos; si no, el prefijo del email */
+        var emailShort=botWho(b,false)
+          ||(b.visaEmail||b.ownerEmail||'').split('@')[0]
+          ||'cuenta #'+b.id;
+        emailShort=escH(emailShort);
         var statusChip='<span class="agy-bot-chip agy-bot-chip-'+b.status+'">'+b.status+'</span>';
         var tcpChip=(b.recentTcp1h>0)
           ?'<span class="agy-bot-chip agy-bot-tcp" title="'+b.recentTcp1h+' polls TCP-bloqueados en la última hora ('+(b.recentTcp24h||0)+' en 24h)">⛔ '+b.recentTcp1h+'</span>'
@@ -779,7 +798,11 @@ function renderFleetHealthRows(visible,allBots,health,events,health1h,uptime){
 
     var statusBadge=isPaused?'<span class="fh-status-badge fh-status-paused">PAUSED</span>':'';
     var caution=!isPaused&&((p1.total>0&&pct1!==null&&pct1<50)||p1.total===0);
-    var ownerTxt=b.ownerEmail?' <span class="fh-owner">'+b.ownerEmail.split('@')[0]+'</span>':'';
+    /* Nombre del applicant si lo tenemos; si no, el prefijo del email del owner */
+    var whoName=botWho(b,false);
+    var ownerTxt=whoName
+      ?' <span class="fh-owner" title="'+escH(botWho(b,true))+'">'+escH(whoName)+'</span>'
+      :(b.ownerEmail?' <span class="fh-owner">'+b.ownerEmail.split('@')[0]+'</span>':'');
     var phoneTxt=b.notificationPhone?' <span class="fh-phone">wa:'+b.notificationPhone.slice(-4)+'</span>':'';
     var agyTag='';
     if(b.agencyId&&_agencyById[b.agencyId]){
@@ -852,7 +875,13 @@ function renderBotList(bots,events){
       var metaParts=[];
       var envs=(b.pollEnvironments||['dev']);
       metaParts.push(envs.join('+'));
-      if(b.ownerEmail){var em=b.ownerEmail.split('@');var short=em[0].length>10?em[0].substring(0,10)+'\u2026':em[0];metaParts.unshift('<span style="color:var(--accent);font-size:9px">'+short+'</span>');}
+      var whoTxt=botWho(b,false);
+      if(whoTxt){
+        metaParts.unshift('<span style="color:var(--accent);font-size:9px" title="'+escH(botWho(b,true))+'">'+escH(whoTxt)+'</span>');
+      }else if(b.ownerEmail){
+        var em=b.ownerEmail.split('@');var short=em[0].length>10?em[0].substring(0,10)+'\u2026':em[0];
+        metaParts.unshift('<span style="color:var(--accent);font-size:9px">'+short+'</span>');
+      }
       if(b.notificationPhone){metaParts.push('<span style="color:var(--green);font-size:9px">wa:'+b.notificationPhone.slice(-4)+'</span>');}
       if(b.consecutiveErrors>0)metaParts.push('<span style="color:var(--red)">'+b.consecutiveErrors+' err</span>');
       if(b.targetDateBefore)metaParts.push('target &lt; '+fmtD(b.targetDateBefore));
@@ -1087,6 +1116,7 @@ body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--tex
 .hdr{display:flex;justify-content:space-between;align-items:baseline;padding:2px 0 6px}
 .hdr-title{font-size:15px;font-weight:800;color:var(--bright);letter-spacing:.5px}
 .hdr-title span{color:var(--accent)}
+.hdr-title span.hdr-who{color:var(--bright);font-weight:600;font-size:12px;letter-spacing:0;margin-left:8px}
 .cursor{animation:blink 1s step-end infinite;color:var(--muted)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 .hdr-clock{font-size:11px;color:var(--muted)}
@@ -1588,7 +1618,7 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
 <!-- Header -->
 <div class="hdr">
   <a href="/dashboard" style="text-decoration:none;color:var(--muted);font-size:14px;margin-right:6px" title="todos los bots">‹</a>
-  <div class="hdr-title"><span id="botFlag"></span> visa bot <span>#${botId}</span><span class="cursor">_</span><span id="cfgBtn" class="cfg-gear" onclick="openCfgModal()" title="configuracion">&#x2699;</span></div>
+  <div class="hdr-title"><span id="botFlag"></span> visa bot <span>#${botId}</span><span id="botWho" class="hdr-who"></span><span class="cursor">_</span><span id="cfgBtn" class="cfg-gear" onclick="openCfgModal()" title="configuracion">&#x2699;</span></div>
   <div class="hdr-clock" id="clock">--:--:--</div>
 </div>
 
@@ -2213,7 +2243,12 @@ async function refresh(){
     var cc=bot.locale?bot.locale.split('-')[1]:'';
     var cm=CMETA[cc];
     document.getElementById('botFlag').textContent=cm?cm.flag:'';
-    document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — '+(cm?cm.name:'');
+    /* Nombre(s) del applicant en el header y en el título de la pestaña */
+    var whoNames=(bot.applicantNames||[]).filter(Boolean);
+    var whoEl=document.getElementById('botWho');
+    whoEl.textContent=whoNames.length?whoNames.join(' · '):'';
+    whoEl.title=(bot.applicantIds||[]).join(', ');
+    document.title=(cm?cm.flag+' ':'')+'Bot #'+BID+' — '+(whoNames.length?whoNames[0]:(cm?cm.name:''));
 
     /* Status */
     var sc=document.getElementById('statusChip');
@@ -2266,7 +2301,12 @@ async function refresh(){
       var clerkRow=document.getElementById('infoClerkRow');
       if(bot.clerkEmail){clerkRow.style.display='flex';document.getElementById('infoClerkEmail').textContent=bot.clerkEmail;}else{clerkRow.style.display='none';}
       document.getElementById('infoSchedule').textContent=bot.scheduleId||'--';
-      document.getElementById('infoApplicants').textContent=bot.applicantIds?bot.applicantIds.join(', '):'--';
+      /* Nombres completos cuando los tenemos; los IDs quedan en el tooltip */
+      var apNames=(bot.applicantNames||[]).filter(Boolean);
+      var apIds=bot.applicantIds||[];
+      var apEl=document.getElementById('infoApplicants');
+      apEl.textContent=apNames.length?apNames.join(', '):(apIds.length?apIds.join(', '):'--');
+      apEl.title=apIds.join(', ');
       var infoOwnerRow=document.getElementById('infoOwnerRow');
       if(bot.ownerEmail){infoOwnerRow.style.display='flex';document.getElementById('infoOwner').textContent=bot.ownerEmail;}else{infoOwnerRow.style.display='none';}
       var infoNotifRow=document.getElementById('infoNotifRow');

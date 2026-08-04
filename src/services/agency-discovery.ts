@@ -26,12 +26,6 @@ export interface DiscoverAttemptResult {
   locale?: string;
 }
 
-/** True for failures worth retrying (transient: portal down, network). Invalid
- * credentials / bad country / corrupt are permanent and must NOT be retried. */
-export function isTransientDiscoverError(code?: DiscoverErrorCode): boolean {
-  return code === 'discovery_failed';
-}
-
 /**
  * Run discovery (login + extract) for ONE credential attempt and persist the result.
  * Shared by the single-attempt PATCH endpoint and the bulk Trigger.dev task so the

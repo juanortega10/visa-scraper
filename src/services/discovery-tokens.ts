@@ -45,14 +45,3 @@ export function consumeDiscoveryToken(token: string | undefined | null): Discove
   tokens.delete(token); // one-time use
   return entry.result;
 }
-
-export function peekDiscoveryToken(token: string | undefined | null): DiscoverResult | undefined {
-  if (!token) return undefined;
-  const entry = tokens.get(token);
-  if (!entry) return undefined;
-  if (entry.expiresAt < Date.now()) {
-    tokens.delete(token);
-    return undefined;
-  }
-  return entry.result;
-}

@@ -1,3 +1,5 @@
+import { MIN_DAYS_FROM_TODAY } from './constants.js';
+
 export interface DateRange {
   startDate: string; // YYYY-MM-DD
   endDate: string;   // YYYY-MM-DD
@@ -29,10 +31,12 @@ export function filterDates(
   excludedDates: DateRange[],
   targetDateBefore?: string | null,
   minDate?: string | null,
+  targetDateAfter?: string | null,
 ): Array<{ date: string }> {
   return dates.filter((d) => {
     if (isDateExcluded(d.date, excludedDates)) return false;
     if (targetDateBefore && d.date >= targetDateBefore) return false;
+    if (targetDateAfter && d.date < targetDateAfter) return false; // sniper window lower bound (inclusive)
     if (minDate && d.date < minDate) return false;
     return true;
   });
@@ -68,6 +72,14 @@ export function isAtLeastNDaysEarlier(candidate: string, current: string, minDay
   return diffDays >= minDays;
 }
 
+/** Should the bot act on `candidate`? Non-sniper: only if it's an initial booking (no current) or strictly >=1 day earlier than current. Sniper: the window check is applied separately by the caller, so sniper short-circuits to true here. */
+export function isActionableDate(candidate: string | null | undefined, currentConsularDate: string | null | undefined, sniperMode: boolean): boolean {
+  if (!candidate) return false;
+  if (sniperMode) return true;
+  if (currentConsularDate === null || currentConsularDate === undefined) return true;
+  return isAtLeastNDaysEarlier(candidate, currentConsularDate, 1);
+}
+
 export function toBogotaDate(date: Date = new Date()): Date {
   return new Date(date.toLocaleString('en-US', { timeZone: 'America/Bogota' }));
 }
@@ -75,4 +87,30 @@ export function toBogotaDate(date: Date = new Date()): Date {
 export function computeDaysImprovement(candidate: string, current: string | null | undefined): number | null {
   if (!current) return null;
   return Math.round((new Date(current).getTime() - new Date(candidate).getTime()) / 86_400_000);
+}
+
+/** Earliest bookable date = today (Bogota) + N days. N defaults to MIN_DAYS_FROM_TODAY when null/undefined. */
+export function computeMinDate(minDaysFromToday?: number | null): string {
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' });
+  return addDays(today, minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
+}
+
+/** Sniper mode is active only when explicitly enabled AND both window bounds are set. */
+export function isSniperActive(
+  sniperMode?: boolean | null,
+  targetDateAfter?: string | null,
+  targetDateBefore?: string | null,
+): boolean {
+  return !!sniperMode && !!targetDateAfter && !!targetDateBefore;
+}
+
+/** True if `date` falls inside the sniper window [targetDateAfter, targetDateBefore) — lower inclusive, upper exclusive. */
+export function isWithinWindow(
+  date: string | null | undefined,
+  targetDateAfter?: string | null,
+  targetDateBefore?: string | null,
+): boolean {
+  return !!date
+    && (!targetDateAfter || date >= targetDateAfter)
+    && (!targetDateBefore || date < targetDateBefore);
 }

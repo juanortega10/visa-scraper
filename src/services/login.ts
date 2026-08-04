@@ -2,7 +2,7 @@ import { ProxyAgent } from 'undici';
 import { USER_AGENT, BROWSER_HEADERS, getBaseUrl, getLocaleTexts } from '../utils/constants.js';
 import type { VisaSession } from './visa-client.js';
 import { logAuth } from '../utils/auth-logger.js';
-import { getEffectiveWebshareUrls } from './proxy-fetch.js';
+import { getEffectiveWebshareUrls, proxyPool } from './proxy-fetch.js';
 import {
   extractScheduleId,
   extractApplicantIdsFromGroups,
@@ -429,27 +429,8 @@ export async function discoverAccount(
  * 1. pureFetchLogin via IV sign_in (less trafficked, same cookies)
  * 2. pureFetchLogin via NIV sign_in (standard path)
  */
-export async function performLogin(creds: LoginCredentials): Promise<LoginResult> {
-  const locale = creds.locale ?? 'es-co';
-
-  // es-pe goes directly to NIV — IV endpoint doesn't exist for Peru
-  if (!locale.startsWith('es-pe')) {
-    // Level 1: IV sign_in
-    try {
-      const result = await pureFetchLogin(creds, { visaType: 'iv' });
-      console.log(`[login] IV succeeded — cookie=${result.cookie.length}chars hasTokens=${result.hasTokens} csrf=${result.csrfToken?.substring(0, 10) || '(none)'}`);
-      return result;
-    } catch (e) {
-      if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
-      console.warn(`[login] IV failed: ${e instanceof Error ? e.message : e}`);
-    }
-  }
-
-  // Level 2 (or direct for es-pe): NIV sign_in
-  const result = await pureFetchLogin(creds, { visaType: 'niv' });
-  console.log(`[login] NIV succeeded — cookie=${result.cookie.length}chars hasTokens=${result.hasTokens} csrf=${result.csrfToken?.substring(0, 10) || '(none)'}`);
-  return result;
-}
+// How many rotating webshare IPs to try before falling back to a direct connection.
+const LOGIN_WEBSHARE_TRIES = 2;
 
 function classifyLoginError(e: unknown): string {
   if (!(e instanceof Error)) return `unknown:${String(e)}`;
@@ -462,67 +443,119 @@ function classifyLoginError(e: unknown): string {
   return 'network';
 }
 
+/** IV→NIV login through an optional proxy URL (es-pe goes straight to NIV). */
+async function loginViaEndpoints(creds: LoginCredentials, proxyUrl?: string): Promise<LoginResult> {
+  const locale = creds.locale ?? 'es-co';
+  if (!locale.startsWith('es-pe')) {
+    try {
+      return await pureFetchLogin(creds, { visaType: 'iv', proxyUrl });
+    } catch (e) {
+      if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
+      console.warn(`[login] IV failed${proxyUrl ? ' (proxy)' : ''}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  return await pureFetchLogin(creds, { visaType: 'niv', proxyUrl });
+}
+
 /**
- * performLogin with Webshare fallback.
- * On network error (not InvalidCredentialsError), tries up to 4 Webshare IPs.
- * Returns { result, via } where via is a compact attempt chain (e.g. "direct:ok",
- * "direct[dns_or_all_failed] → ws:64.137.96.74[ok]"). Suitable for logging.
+ * Core login router — WEBSHARE first, direct fallback.
+ *
+ * Webshare login is validated working (8/8 across distinct IPs, 2026-06-09/10) — the earlier
+ * "datacenter IPs blocked on sign_in" finding (2026-06-03) no longer reproduces. Webshare-first
+ * lets login run from ANY host (cloud included) and spreads load across IPs, removing the
+ * residential-only dependency that the login throttle (withLoginThrottle) was built around.
+ * Direct stays as a fallback: it's the proven path from a residential host (RPi), but from a
+ * cloud datacenter IP it usually fails on sign_in — which is fine, webshare-first already won.
+ *
+ * Returns { result, via } with a compact attempt chain for logging.
  */
-export async function loginWithFallback(
-  creds: LoginCredentials,
-): Promise<{ result: LoginResult; via: string }> {
+async function loginRouted(creds: LoginCredentials): Promise<{ result: LoginResult; via: string }> {
   const attempts: string[] = [];
 
+  // Webshare first. Pick healthy IPs via the circuit-breaker pool — NOT the raw URL list.
+  // The raw list includes dead/circuit-broken IPs that fail with ECONNREFUSED
+  // (proxy_unreachable); proxyPool.selectUrl() skips them, same as the polling path.
+  let wsErr: unknown;
   try {
-    const result = await performLogin(creds);
-    return { result, via: 'direct:ok' };
+    const urls = await getEffectiveWebshareUrls();
+    const seen = new Set<string>();
+    for (let i = 0; i < LOGIN_WEBSHARE_TRIES && urls.length > 0; i++) {
+      const sel = proxyPool.selectUrl(urls);
+      if (sel.url === 'direct' || seen.has(sel.ip)) break; // no healthy webshare left
+      seen.add(sel.ip);
+      try {
+        const result = await loginViaEndpoints(creds, sel.url);
+        attempts.push(`ws:${sel.ip}[ok]`);
+        console.log(`[login] ✓ ws:${sel.ip} hasTokens=${result.hasTokens}`);
+        return { result, via: attempts.join(' → ') };
+      } catch (e) {
+        if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
+        attempts.push(`ws:${sel.ip}[${classifyLoginError(e)}]`);
+        console.warn(`[login] ✗ ws:${sel.ip}: ${e instanceof Error ? e.message : e}`);
+        wsErr = e;
+      }
+    }
+  } catch (apiErr) {
+    attempts.push('ws_api_error');
+    console.warn(`[login] Webshare URL load failed: ${apiErr instanceof Error ? apiErr.message : apiErr}`);
+  }
+
+  // Direct fallback (residential host only — cloud datacenter usually fails on sign_in).
+  try {
+    const result = await loginViaEndpoints(creds, undefined);
+    attempts.push('direct[ok]');
+    console.log(`[login] ✓ direct hasTokens=${result.hasTokens}`);
+    return { result, via: attempts.join(' → ') };
   } catch (e) {
     if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError) throw e;
-    const label = classifyLoginError(e);
-    attempts.push(`direct[${label}]`);
-    console.warn(`[login] Direct failed [${label}]: ${e instanceof Error ? e.message : e}`);
-  }
-
-  let webshareUrls: string[];
-  try {
-    webshareUrls = await getEffectiveWebshareUrls();
-  } catch (apiErr) {
-    const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
-    console.warn(`[login] Webshare API load failed: ${msg}`);
-    attempts.push(`ws_api_error[${msg}]`);
-    throw new Error(attempts.join(' → '));
-  }
-  if (webshareUrls.length === 0) {
-    attempts.push('ws_no_ips');
-    throw new Error(attempts.join(' → '));
-  }
-
-  const candidates = webshareUrls.slice(0, 4);
-  const ips = candidates.map(u => { try { return new URL(u).hostname; } catch { return u; } });
-  console.log(`[login] Webshare fallback — trying: ${ips.join(', ')}`);
-
-  let lastRawErr: unknown;
-  for (let i = 0; i < candidates.length; i++) {
-    const proxyUrl = candidates[i];
-    const ip = ips[i];
-    try {
-      console.log(`[login] → ws:${ip}`);
-      const result = await pureFetchLogin(creds, { proxyUrl });
-      attempts.push(`ws:${ip}[ok]`);
-      console.log(`[login] ✓ ws:${ip} succeeded`);
-      return { result, via: attempts.join(' → ') };
-    } catch (e2) {
-      if (e2 instanceof InvalidCredentialsError || e2 instanceof AccountLockedError) throw e2;
-      const label = classifyLoginError(e2);
-      attempts.push(`ws:${ip}[${label}]`);
-      console.warn(`[login] ✗ ws:${ip} [${label}]: ${e2 instanceof Error ? e2.message : e2}`);
-      lastRawErr = e2;
-    }
+    attempts.push(`direct[${classifyLoginError(e)}]`);
   }
 
   const chain = attempts.join(' → ');
-  console.warn(`[login] All attempts failed: ${chain}`);
+  console.warn(`[login] All login attempts failed: ${chain}`);
   const err = new Error(chain);
-  if (lastRawErr instanceof Error) err.cause = lastRawErr.cause;
+  err.cause = wsErr instanceof Error ? wsErr.cause : undefined;
   throw err;
+}
+
+// ── Login throttle ─────────────────────────────────────
+// Login is direct-only (webshare is blocked on the sign_in page), so we cannot spread a burst
+// of logins across IPs. Instead cap concurrent logins worker-wide + add jitter, so activating
+// N bots at once never fires N simultaneous direct logins from the one residential IP (which
+// the embassy TCP-blocks). This is the autonomous safeguard for mass activation.
+const MAX_CONCURRENT_LOGINS = 2;
+let activeLogins = 0;
+const loginWaiters: Array<() => void> = [];
+
+function acquireLoginSlot(): Promise<void> {
+  if (activeLogins < MAX_CONCURRENT_LOGINS) { activeLogins++; return Promise.resolve(); }
+  return new Promise<void>((resolve) => loginWaiters.push(resolve));
+}
+function releaseLoginSlot(): void {
+  const next = loginWaiters.shift();
+  if (next) next();          // hand the slot directly to the next waiter (activeLogins unchanged)
+  else activeLogins--;
+}
+
+async function withLoginThrottle<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireLoginSlot();
+  try {
+    // jitter de-syncs cohorts that onboarded together (their ~50min re-logins would otherwise spike)
+    await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 1500)));
+    return await fn();
+  } finally {
+    releaseLoginSlot();
+  }
+}
+
+/** Login (direct-first). Throttled worker-wide. Throws InvalidCredentialsError/AccountLockedError as-is. */
+export async function performLogin(creds: LoginCredentials): Promise<LoginResult> {
+  return withLoginThrottle(async () => (await loginRouted(creds)).result);
+}
+
+/** Same as performLogin but also returns the attempt chain (`via`) for audit logging. Throttled. */
+export async function loginWithFallback(
+  creds: LoginCredentials,
+): Promise<{ result: LoginResult; via: string }> {
+  return withLoginThrottle(() => loginRouted(creds));
 }

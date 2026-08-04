@@ -140,6 +140,7 @@ export const bots = pgTable(
     visaTypeRaw: text('visa_type_raw'),                       // full label from groups page (locale-specific, human-readable)
     visaClassId: integer('visa_class_id'),                    // canonical server-side ID from applicant edit page (1=B1, 2=B1/B2, 11=F1, 22/88=J1, 49=TN, ...)
     applicantVisaTypes: jsonb('applicant_visa_types').$type<string[] | null>(), // per-applicant raw labels (parallel to applicantIds when complete)
+    applicantNames: jsonb('applicant_names').$type<string[] | null>(),          // full names from the /groups page (parallel to applicantIds when complete)
     activatedAt: timestamp('activated_at'),
     agencyId: integer('agency_id'),                              // FK to agencies.id, nullable (individual users have no agency)
     clientType: varchar('client_type', { length: 3 }).notNull().default('b2c'), // 'b2c' (direct user) | 'b2b' (agency client)

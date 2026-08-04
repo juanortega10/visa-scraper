@@ -1,8 +1,8 @@
-/** Default polling interval (7s).
- * 9s (0.135% ban-trigger) → 5s (0.578% ban-trigger, 4x increase after 3h A/B).
- * 7s = middle ground: ~7.5/min effective (+35% vs 9s) within safe 5-8/min bucket.
+/** Default polling interval (20s = 3 polls/min).
+ * Lowered from 9s (6.67/min) to 3/min fleet-wide (2026-07-06) to reduce ban/cost surface;
+ * es-pe keeps its own 6s override below. Per-bot faster rates set via targetPollsPerMin.
  * Response: 791ms direct, 1608ms webshare. Start-to-start timing subtracts elapsed. */
-export const DEFAULT_POLL_INTERVAL_S = 9;
+export const DEFAULT_POLL_INTERVAL_S = 20;
 
 /** Per-locale override for the normal polling interval. */
 const LOCALE_POLL_INTERVALS: Record<string, number> = {
@@ -88,6 +88,38 @@ function jitter(baseSeconds: number): string {
   const factor = 0.95 + Math.random() * 0.1; // 0.95–1.05
   const seconds = Math.round(baseSeconds * factor);
   return `${seconds}s`;
+}
+
+/**
+ * Account-level ban backoff — SINGLE SOURCE OF TRUTH.
+ *
+ * An account ban lasts 6h+ and rotating the proxy IP does NOT help (the ban is on
+ * the account, not the IP), so webshare and direct share ONE aggressive curve.
+ * Keyed on `count` = consecutive account_ban polls in the last 5 poll_logs
+ * (saturates at 5 under a sustained ban).
+ *
+ * Imported by BOTH poll-visa.ts (picks the self-trigger delay) and ensure-chain.ts
+ * (gates whether the guardian may resurrect a dead chain). They MUST agree, so any
+ * tier edit happens HERE only — never inline in a caller.
+ *
+ * Curve: pure "2x" doubling from a 30m base — 30m → 60m → 120m → 240m → 480m (cap).
+ * `count` saturates at 5 (the last-5 poll_logs window), so 480m (8h) is the natural
+ * ceiling. Starts at 30m (not the old 10m, which just kept the ban warm) so a transient
+ * misclassified as a ban recovers fast; only a fully-confirmed sustained ban reaches 480m.
+ *
+ * The bot is NEVER paused for a sustained ban — it holds at the 480m cap and keeps
+ * probing every ~8h forever, so a lifted ban recovers automatically (the next `ok`
+ * poll returns to normal cadence) with NO manual reactivation. Wasted work on a dead
+ * account is bounded to ~3 probes/day, the price of hands-off self-healing.
+ */
+export function accountBanBackoffMs(count: number): number {
+  const step = Math.min(Math.max(count, 1), 5) - 1; // 0..4
+  return 30 * 60_000 * 2 ** step; // 30m,60m,120m,240m,480m
+}
+
+/** Trigger.dev delay string form of {@link accountBanBackoffMs}. */
+export function accountBanBackoffDelay(count: number): string {
+  return `${Math.round(accountBanBackoffMs(count) / 60_000)}m`;
 }
 
 /**

@@ -562,22 +562,6 @@ class ProxyPoolManager {
 }
 
 export const proxyPool = new ProxyPoolManager();
-export function getPoolState() { return proxyPool.getState(); }
-
-/** Backward-compat wrapper: records a TCP failure with 0 latency */
-export function recordWebshareIpFailure(ip: string): void {
-  proxyPool.recordOutcome(ip, false, 0, 'embassy_block');
-}
-
-/** Backward-compat wrapper: returns a legacy-style summary of breaker state */
-export function getIpBreakerState(): Record<string, { failures: number; state: string }> {
-  const { ips } = proxyPool.getState();
-  const out: Record<string, { failures: number; state: string }> = {};
-  for (const [ip, h] of Object.entries(ips)) {
-    out[ip] = { failures: h.totalErrors, state: h.state };
-  }
-  return out;
-}
 
 function getDirectAgent(): Agent {
   if (!sharedDirectAgent) {

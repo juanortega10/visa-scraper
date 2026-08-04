@@ -1,5 +1,5 @@
 import { schedules, logger } from '@trigger.dev/sdk/v3';
-import { and, eq, lt, or } from 'drizzle-orm';
+import { and, eq, isNotNull, lt, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { botCredentialAttempts } from '../db/schema.js';
 import { processAgencyDue } from '../services/agency-batch.js';
@@ -24,18 +24,24 @@ export const reconcileAgencyAttempts = schedules.task({
       .selectDistinct({ agencyId: botCredentialAttempts.agencyId })
       .from(botCredentialAttempts)
       .where(
-        or(
-          eq(botCredentialAttempts.status, 'pending'),
-          and(
-            eq(botCredentialAttempts.status, 'failed'),
-            lt(botCredentialAttempts.retryCount, MAX_TOTAL_ATTEMPTS),
-            lt(botCredentialAttempts.lastAttemptAt, cutoff),
+        and(
+          // B2C attempts (agencyId NULL) are owned by the /activar flow, not by an
+          // agency batch — they must never enter this reconciler.
+          isNotNull(botCredentialAttempts.agencyId),
+          or(
+            eq(botCredentialAttempts.status, 'pending'),
+            and(
+              eq(botCredentialAttempts.status, 'failed'),
+              lt(botCredentialAttempts.retryCount, MAX_TOTAL_ATTEMPTS),
+              lt(botCredentialAttempts.lastAttemptAt, cutoff),
+            ),
           ),
         ),
       );
 
     let processed = 0;
     for (const { agencyId } of due) {
+      if (agencyId == null) continue; // narrowed by isNotNull above; keeps TS honest
       const counts = await processAgencyDue(agencyId, (m, d) => logger.info(m, d as Record<string, unknown>));
       processed += counts.total;
     }
