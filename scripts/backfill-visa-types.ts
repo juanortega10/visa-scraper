@@ -1,9 +1,9 @@
 /**
- * Backfill bots.visa_category, bots.visa_type_raw, and bots.applicant_visa_types
- * for existing bots by re-fetching the /groups/{userId} page.
+ * Backfill bots.visa_category, bots.visa_type_raw, bots.applicant_visa_types and
+ * bots.applicant_names for existing bots by re-fetching the /groups/{userId} page.
  *
  * Safe & idempotent:
- *   - Skips bots that already have visa_category set (use --force to overwrite).
+ *   - Skips bots that already have visa_category AND applicant_names (use --force to overwrite).
  *   - Reuses live session when fresh; falls back to a fresh login on 302/401.
  *   - Dry-run by default — show what would change. Add --commit to persist.
  *
@@ -35,6 +35,7 @@ interface Plan {
   primaryVisaCategory: string | null;
   primaryVisaTypeRaw: string | null;
   applicantVisaTypes: string[];
+  applicantNames: string[];
   reason: string;
 }
 
@@ -52,8 +53,8 @@ async function fetchGroupsHtml(cookie: string, baseUrl: string, userId: string):
 }
 
 async function planForBot(bot: typeof bots.$inferSelect): Promise<Plan | { skip: string }> {
-  if (!force && bot.visaCategory) {
-    return { skip: `already has visa_category=${bot.visaCategory}` };
+  if (!force && bot.visaCategory && bot.applicantNames?.length) {
+    return { skip: `already has visa_category=${bot.visaCategory} + names` };
   }
   if (!bot.userId) {
     return { skip: 'no userId stored — cannot fetch /groups page' };
@@ -69,7 +70,7 @@ async function planForBot(bot: typeof bots.$inferSelect): Promise<Plan | { skip:
     try {
       const r = await fetchGroupsHtml(cookie, baseUrl, bot.userId);
       if (r.status === 200 && /\/groups\//.test(r.html)) {
-        return parsePlan(bot.id, r.html, 'cached-session');
+        return parsePlan(bot, r.html, 'cached-session');
       }
     } catch {
       // fall through to fresh login
@@ -91,28 +92,34 @@ async function planForBot(bot: typeof bots.$inferSelect): Promise<Plan | { skip:
   if (groupsResp.status !== 200) {
     return { skip: `groups page returned HTTP ${groupsResp.status} after fresh login` };
   }
-  return parsePlan(bot.id, groupsResp.html, 'fresh-login');
+  return parsePlan(bot, groupsResp.html, 'fresh-login');
 }
 
-function parsePlan(botId: number, groupsHtml: string, source: string): Plan {
+function parsePlan(bot: typeof bots.$inferSelect, groupsHtml: string, source: string): Plan {
   const groups = extractGroups(groupsHtml);
   const pairs = extractScheduleApplicantPairs(groupsHtml);
 
-  // Match the same primary-group selection as discoverAccount
+  // An account can hold several schedule groups (e.g. a parent on B1/B2 and a
+  // child on F1) and each bot manages exactly one of them, so match the bot's
+  // OWN scheduleId. Only fall back to discoverAccount's primary-group heuristic
+  // when the group is gone from the page (archived / schedule changed).
   const today = new Date().toISOString().slice(0, 10);
-  const primary = groups.find(g => g.currentConsularDate != null && g.currentConsularDate > today)
+  const own = groups.find(g => g.scheduleId === bot.scheduleId);
+  const group = own
+    ?? groups.find(g => g.currentConsularDate != null && g.currentConsularDate > today)
     ?? groups[0];
 
-  const applicantVisaTypes = primary?.applicantVisaTypes ?? [];
-  const primaryVisaCategory = primary?.primaryVisaCategory ?? null;
+  const applicantVisaTypes = group?.applicantVisaTypes ?? [];
+  const primaryVisaCategory = group?.primaryVisaCategory ?? null;
   const primaryVisaTypeRaw = applicantVisaTypes.find(Boolean) ?? null;
 
   return {
-    botId,
+    botId: bot.id,
     primaryVisaCategory,
     primaryVisaTypeRaw,
     applicantVisaTypes,
-    reason: `${source}; groups=${groups.length} schedules=${pairs.size}`,
+    applicantNames: group?.applicantNames ?? [],
+    reason: `${source}; groups=${groups.length} schedules=${pairs.size}${own ? '' : '; NO group for schedule ' + bot.scheduleId}`,
   };
 }
 
@@ -137,7 +144,7 @@ async function main() {
         continue;
       }
       console.log(
-        `${out.primaryVisaCategory ?? '(unparsed)'}  raw="${out.primaryVisaTypeRaw?.slice(0, 60) ?? ''}"  applicants=${out.applicantVisaTypes.length}  [${out.reason}]`,
+        `${out.primaryVisaCategory ?? '(unparsed)'}  raw="${out.primaryVisaTypeRaw?.slice(0, 60) ?? ''}"  applicants=${out.applicantVisaTypes.length}  names="${out.applicantNames.join(' / ') || '(none)'}"  [${out.reason}]`,
       );
       if (commit) {
         await db.update(bots)
@@ -145,6 +152,7 @@ async function main() {
             visaCategory: out.primaryVisaCategory,
             visaTypeRaw: out.primaryVisaTypeRaw,
             applicantVisaTypes: out.applicantVisaTypes.length ? out.applicantVisaTypes : null,
+            applicantNames: out.applicantNames.length ? out.applicantNames : null,
           })
           .where(eq(bots.id, out.botId));
         updated++;
