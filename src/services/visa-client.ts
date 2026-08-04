@@ -260,7 +260,8 @@ export class VisaClient {
   async getCurrentAppointment(): Promise<CurrentAppointment | null> {
     if (!this.userId) return null;
 
-    const resp = await this.doDirectFetch(`${this.baseUrl}/groups/${this.userId}`, {
+    const url = `${this.baseUrl}/groups/${this.userId}`;
+    const options: RequestInit = {
       headers: {
         Cookie: `_yatri_session=${this.session.cookie}`,
         'User-Agent': USER_AGENT,
@@ -269,7 +270,23 @@ export class VisaClient {
         ...BROWSER_HEADERS,
       },
       redirect: 'manual',
-    });
+    };
+
+    // Direct first, then the bot's own provider. On the RPi the residential IP is
+    // blocked for this HTML page (ECONNREFUSED / connection_reset) even while the
+    // JSON polling endpoints work, which silently killed the appointment sync for
+    // every dev-polled bot. This is a GET, so any provider is fine (the direct-only
+    // rule in doDirectFetch exists for POSTs, where Bright Data returns 402).
+    let resp: Response;
+    try {
+      resp = await this.doDirectFetch(url, options);
+    } catch (err) {
+      if (this.config.proxyProvider === 'direct') throw err;
+      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls);
+      this.lastProxyMeta = meta;
+      this.updateCookieFromResponse(response);
+      resp = response;
+    }
 
     if (resp.status !== 200) return null;
 
