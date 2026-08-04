@@ -13,6 +13,7 @@ vi.mock('../../utils/constants.js', () => ({
 
 vi.mock('../proxy-fetch.js', () => ({
   getEffectiveWebshareUrls: () => [],
+  proxyPool: { selectUrl: () => ({ url: 'direct', ip: 'direct' }) },
 }));
 
 vi.mock('../../utils/auth-logger.js', () => ({

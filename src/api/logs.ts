@@ -400,6 +400,7 @@ logsRouter.get('/bots/:id/logs/polls', async (c) => {
       runId: pollLogs.runId,
       fetchIndex: pollLogs.fetchIndex,
       connectionInfo: pollLogs.connectionInfo,
+      pollsSincePrev: pollLogs.pollsSincePrev,
       createdAt: pollLogs.createdAt,
     })
     .from(pollLogs)
@@ -712,7 +713,7 @@ logsRouter.get('/bots/:id/ban-status', async (c) => {
   `);
 
   const historicalStats: Record<string, { count: number; avgMin: number; medianMin: number; p90Min: number }> = {};
-  for (const row of stats) {
+  for (const row of stats.rows) {
     historicalStats[row.classification] = {
       count: parseInt(row.count), avgMin: parseInt(row.avg_min),
       medianMin: parseInt(row.median_min), p90Min: parseInt(row.p90_min),
@@ -739,7 +740,7 @@ logsRouter.get('/bots/:id/ban-status', async (c) => {
         FROM ban_episodes WHERE ended_at IS NOT NULL AND duration_min IS NOT NULL
           AND classification = ${openBan.classification}
       `);
-      const g = globalStats[0];
+      const g = globalStats.rows[0];
       if (g && parseInt(g.count) > 0) {
         clsStats = { count: parseInt(g.count), avgMin: 0, medianMin: parseInt(g.median_min), p90Min: parseInt(g.p90_min) };
       }
@@ -797,7 +798,7 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
     WHERE bot_id = ${botId} AND detected_at >= ${since} GROUP BY outcome ORDER BY count DESC
   `);
   let failureBreakdown: Record<string, number> = {};
-  for (const r of outcomeRows) failureBreakdown[r.outcome] = parseInt(r.count);
+  for (const r of outcomeRows.rows) failureBreakdown[r.outcome] = parseInt(r.count);
 
   // Fallback to poll_logs.reschedule_result if bookable_events is empty (older bots)
   if (Object.keys(failureBreakdown).length === 0) {
@@ -806,7 +807,7 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
       FROM poll_logs WHERE bot_id = ${botId} AND created_at >= ${since} AND reschedule_result IS NOT NULL
       GROUP BY 1 ORDER BY count DESC
     `);
-    for (const r of pollOutcomes) failureBreakdown[r.outcome] = parseInt(r.count);
+    for (const r of pollOutcomes.rows) failureBreakdown[r.outcome] = parseInt(r.count);
   }
 
   const hourly = await db.execute<{ hour: string; successes: string; total: string }>(sql`
@@ -814,7 +815,7 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
       SUM(CASE WHEN success THEN 1 ELSE 0 END)::text as successes, COUNT(*)::text as total
     FROM reschedule_logs WHERE bot_id = ${botId} AND created_at >= ${since} GROUP BY 1 ORDER BY 1
   `);
-  const byHourBogota = [...hourly].map(r => ({
+  const byHourBogota = hourly.rows.map(r => ({
     hour: parseInt(r.hour), successes: parseInt(r.successes), attempts: parseInt(r.total),
   }));
 
@@ -824,7 +825,7 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
     FROM reschedule_logs WHERE bot_id = ${botId} AND created_at >= ${since} GROUP BY 1 ORDER BY 1
   `);
   const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-  const byDayOfWeek = [...daily].map(r => ({
+  const byDayOfWeek = daily.rows.map(r => ({
     day: dayNames[parseInt(r.dow)] ?? r.dow, successes: parseInt(r.successes), attempts: parseInt(r.total),
   }));
 
@@ -832,8 +833,8 @@ logsRouter.get('/bots/:id/reschedule-analytics', async (c) => {
     SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_ms
     FROM date_sightings WHERE bot_id = ${botId} AND appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0
   `);
-  const medianSlotDurationMin = durationStats[0]?.median_ms
-    ? Math.round(parseInt(durationStats[0].median_ms) / 60000 * 10) / 10 : null;
+  const medianSlotDurationMin = durationStats.rows[0]?.median_ms
+    ? Math.round(parseInt(durationStats.rows[0].median_ms) / 60000 * 10) / 10 : null;
 
   const improvements = successes
     .filter(r => r.oldConsularDate && r.newConsularDate)
@@ -973,7 +974,7 @@ logsRouter.get('/slot-patterns', async (c) => {
       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms)::text as median_duration_ms
     FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0 GROUP BY 1 ORDER BY 1
   `);
-  const hourlyDistribution = [...hourly].map(r => ({
+  const hourlyDistribution = hourly.rows.map(r => ({
     hour: parseInt(r.hour), sightings: parseInt(r.count),
     medianDurationMin: r.median_duration_ms ? Math.round(parseInt(r.median_duration_ms) / 60000 * 10) / 10 : null,
   }));
@@ -983,7 +984,7 @@ logsRouter.get('/slot-patterns', async (c) => {
     FROM date_sightings WHERE appeared_at >= ${since} GROUP BY 1 ORDER BY 1
   `);
   const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-  const dayOfWeekDistribution = [...daily].map(r => ({
+  const dayOfWeekDistribution = daily.rows.map(r => ({
     day: dayNames[parseInt(r.dow)] ?? r.dow, sightings: parseInt(r.count),
   }));
 
@@ -994,7 +995,7 @@ logsRouter.get('/slot-patterns', async (c) => {
     FROM date_sightings WHERE appeared_at >= ${since} AND duration_ms IS NOT NULL AND duration_ms > 0 AND days_from_now IS NOT NULL GROUP BY 1
   `);
   const closeDateStats: Record<string, { count: number; medianDurationMin: number | null }> = {};
-  for (const r of proximity) {
+  for (const r of proximity.rows) {
     closeDateStats[r.bucket] = {
       count: parseInt(r.count),
       medianDurationMin: r.median_duration_ms ? Math.round(parseInt(r.median_duration_ms) / 60000 * 10) / 10 : null,
@@ -1022,9 +1023,9 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
       SUM(CASE WHEN status = 'soft_ban' THEN 1 ELSE 0 END)::text as soft_ban
     FROM poll_logs WHERE created_at >= ${since}
   `);
-  const totalPolls = parseInt(overall[0]?.total ?? '0');
-  const tcpBlocked = parseInt(overall[0]?.tcp_blocked ?? '0');
-  const softBan = parseInt(overall[0]?.soft_ban ?? '0');
+  const totalPolls = parseInt(overall.rows[0]?.total ?? '0');
+  const tcpBlocked = parseInt(overall.rows[0]?.tcp_blocked ?? '0');
+  const softBan = parseInt(overall.rows[0]?.soft_ban ?? '0');
 
   // Rate vs ban: use banPhase to exclude sustained blocks (backoff polls inflate low-rate buckets).
   // Only include normal polls + ban triggers. Sustained/recovery polls are excluded.
@@ -1057,7 +1058,7 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
       COUNT(*)::text as polls, SUM(CASE WHEN status = 'tcp_blocked' THEN 1 ELSE 0 END)::text as blocked
     FROM filtered GROUP BY 1 ORDER BY MIN(rate_per_min)
   `);
-  const rateVsBanCorrelation = [...rateCorrelation].map(r => ({
+  const rateVsBanCorrelation = rateCorrelation.rows.map(r => ({
     rateRange: r.rate_bucket, polls: parseInt(r.polls), blocked: parseInt(r.blocked),
     blockRate: parseInt(r.polls) > 0 ? Math.round(parseInt(r.blocked) / parseInt(r.polls) * 10000) / 10000 : 0,
   }));
@@ -1069,7 +1070,7 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
     FROM poll_logs WHERE created_at >= ${since} GROUP BY 1 ORDER BY COUNT(*) DESC
   `);
   const byProvider: Record<string, { polls: number; blockRate: number; avgResponseMs: number }> = {};
-  for (const r of byProviderRows) {
+  for (const r of byProviderRows.rows) {
     const p = parseInt(r.polls);
     byProvider[r.provider] = { polls: p, blockRate: p > 0 ? Math.round(parseInt(r.blocked) / p * 10000) / 10000 : 0, avgResponseMs: parseInt(r.avg_ms) };
   }
@@ -1094,7 +1095,7 @@ logsRouter.get('/poll-rate-analysis', async (c) => {
        OR (ban_phase IS NULL AND (status != 'tcp_blocked' OR prev_status IS NULL OR prev_status != 'tcp_blocked'))
     GROUP BY 1 ORDER BY MIN((session_age_ms)::int)
   `);
-  const sessionAgeVsBlock = [...sessionAge].map(r => ({
+  const sessionAgeVsBlock = sessionAge.rows.map(r => ({
     ageRange: r.age_bucket, polls: parseInt(r.polls),
     blockRate: parseInt(r.polls) > 0 ? Math.round(parseInt(r.blocked) / parseInt(r.polls) * 10000) / 10000 : 0,
   }));

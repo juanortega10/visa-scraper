@@ -6,7 +6,10 @@ import {
   filterTimes,
   isEarlierDate,
   isAtLeastNDaysEarlier,
+  isActionableDate,
   addDays,
+  isSniperActive,
+  isWithinWindow,
 } from '../../utils/date-helpers.js';
 
 describe('isDateExcluded', () => {
@@ -104,6 +107,56 @@ describe('filterDates', () => {
     const dates = [{ date: '2026-04-15' }, { date: '2026-04-17' }];
     expect(filterDates(dates, [], undefined, '2026-04-18')).toEqual([]);
   });
+
+  it('filters dates before targetDateAfter (sniper window lower bound, inclusive)', () => {
+    const dates = [
+      { date: '2026-05-31' },
+      { date: '2026-06-01' },
+      { date: '2026-07-20' },
+      { date: '2026-07-21' },
+    ];
+    // window [2026-06-01, 2026-07-21): includes 06-01 and 07-20, excludes 05-31 and 07-21
+    expect(filterDates(dates, [], '2026-07-21', undefined, '2026-06-01')).toEqual([
+      { date: '2026-06-01' },
+      { date: '2026-07-20' },
+    ]);
+  });
+
+  it('keeps all dates when targetDateAfter is undefined', () => {
+    const dates = [{ date: '2026-05-01' }, { date: '2026-08-01' }];
+    expect(filterDates(dates, [], undefined, undefined, undefined)).toEqual(dates);
+  });
+});
+
+describe('isSniperActive', () => {
+  it('is true only when enabled AND both bounds set', () => {
+    expect(isSniperActive(true, '2026-06-01', '2026-07-21')).toBe(true);
+  });
+  it('is false when disabled', () => {
+    expect(isSniperActive(false, '2026-06-01', '2026-07-21')).toBe(false);
+  });
+  it('is false when a bound is missing', () => {
+    expect(isSniperActive(true, '2026-06-01', null)).toBe(false);
+    expect(isSniperActive(true, null, '2026-07-21')).toBe(false);
+    expect(isSniperActive(true, undefined, undefined)).toBe(false);
+  });
+});
+
+describe('isWithinWindow', () => {
+  it('lower bound inclusive, upper bound exclusive', () => {
+    expect(isWithinWindow('2026-06-01', '2026-06-01', '2026-07-21')).toBe(true);  // lower inclusive
+    expect(isWithinWindow('2026-07-20', '2026-06-01', '2026-07-21')).toBe(true);
+    expect(isWithinWindow('2026-07-21', '2026-06-01', '2026-07-21')).toBe(false); // upper exclusive
+    expect(isWithinWindow('2026-05-31', '2026-06-01', '2026-07-21')).toBe(false);
+  });
+  it('open bounds when a side is null/undefined', () => {
+    expect(isWithinWindow('2099-01-01', '2026-06-01', null)).toBe(true);   // no upper
+    expect(isWithinWindow('1999-01-01', null, '2026-07-21')).toBe(true);   // no lower
+  });
+  it('false for empty date', () => {
+    expect(isWithinWindow(null, '2026-06-01', '2026-07-21')).toBe(false);
+    expect(isWithinWindow(undefined, '2026-06-01', '2026-07-21')).toBe(false);
+  });
 });
 
 describe('addDays', () => {
@@ -181,5 +234,31 @@ describe('isAtLeastNDaysEarlier', () => {
 
   it('handles minDays=0', () => {
     expect(isAtLeastNDaysEarlier('2026-06-20', '2026-06-20', 0)).toBe(true);
+  });
+});
+
+describe('isActionableDate', () => {
+  it('returns false for null candidate', () => {
+    expect(isActionableDate(null, '2026-06-20', false)).toBe(false);
+  });
+
+  it('returns true in sniper mode (window check is applied separately by caller)', () => {
+    expect(isActionableDate('2026-07-01', '2026-06-20', true)).toBe(true);
+  });
+
+  it('non-sniper: returns true for initial booking (current null)', () => {
+    expect(isActionableDate('2026-07-01', null, false)).toBe(true);
+  });
+
+  it('non-sniper: returns true when candidate is strictly earlier', () => {
+    expect(isActionableDate('2026-03-01', '2026-06-20', false)).toBe(true);
+  });
+
+  it('non-sniper: returns false when candidate is the same day', () => {
+    expect(isActionableDate('2026-06-20', '2026-06-20', false)).toBe(false);
+  });
+
+  it('non-sniper: returns false when candidate is later', () => {
+    expect(isActionableDate('2026-07-01', '2026-06-20', false)).toBe(false);
   });
 });

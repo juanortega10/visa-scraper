@@ -5,9 +5,8 @@ import { bots, sessions, excludedDates, excludedTimes, pollLogs, rescheduleLogs,
 import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
-import { filterDates, isAtLeastNDaysEarlier, computeDaysImprovement, addDays } from '../utils/date-helpers.js';
-import { MIN_DAYS_FROM_TODAY } from '../utils/constants.js';
-import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval } from '../services/scheduling.js';
+import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
+import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -16,6 +15,37 @@ import { classifyProxyError, classifyTcpSubcategory, extractBytesRead, deriveBlo
 import { logAuth } from '../utils/auth-logger.js';
 import type { CasCacheData, DateFailureEntry } from '../db/schema.js';
 import { isBlocked, pruneDisappeared, CROSS_POLL_WINDOW_MS } from '../services/date-failure-tracker.js';
+import { shouldSkipHeartbeatPoll, type HeartbeatState } from '../services/poll-logging.js';
+import { Agent } from 'undici';
+
+/**
+ * Public IP resolution — cached across polls in the long-lived worker process.
+ * Previously this hit api.ipify.org on EVERY poll via the global undici dispatcher;
+ * aborted/errored requests left bodies unconsumed → sockets stuck in CLOSE-WAIT
+ * (377 leaked sockets observed over ~2.5d uptime). Fix: dedicated short-keepalive
+ * Agent + always consume the body + 10min TTL cache (the Pi's egress IP rarely changes).
+ */
+const IPIFY_AGENT = new Agent({ keepAliveTimeout: 5_000, keepAliveMaxTimeout: 10_000, connections: 2, connectTimeout: 5_000 });
+const PUBLIC_IP_TTL_MS = 10 * 60_000;
+let cachedPublicIp: { ip: string; at: number } | null = null;
+
+async function resolvePublicIp(): Promise<string | null> {
+  if (cachedPublicIp && Date.now() - cachedPublicIp.at < PUBLIC_IP_TTL_MS) {
+    return cachedPublicIp.ip;
+  }
+  try {
+    const res = await fetch('https://api.ipify.org?format=text', {
+      signal: AbortSignal.timeout(3000),
+      // @ts-expect-error undici dispatcher works with global fetch
+      dispatcher: IPIFY_AGENT,
+    });
+    const ip = (await res.text()).trim(); // always consume body so the socket is released
+    if (ip) cachedPublicIp = { ip, at: Date.now() };
+  } catch {
+    /* non-fatal: fall back to stale cache (if any) */
+  }
+  return cachedPublicIp?.ip ?? null;
+}
 
 /**
  * Cancel the bot's previous delayed poll-visa run (if any) to prevent pile-up.
@@ -109,9 +139,10 @@ export const pollVisaTask = task({
       userId: bots.userId, consecutiveErrors: bots.consecutiveErrors,
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
-      activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore,
+      activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore, targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
       maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, minDaysFromToday: bots.minDaysFromToday,
       pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
+      skippedPollsSinceLog: bots.skippedPollsSinceLog,
       proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
@@ -136,6 +167,16 @@ export const pollVisaTask = task({
     const isRuntimeCloud = runtimeEnv === 'PRODUCTION';
     if (isRuntimeCloud && !bot.cloudEnabled && !botPollEnvs.includes('prod')) {
       logger.info('Chain stopped — bot not configured for cloud polling', { botId, chainId, runtimeEnv, pollEnvironments: botPollEnvs });
+      return;
+    }
+    // Symmetric DEV guard: stop a DEV (RPi) self-chain once the bot no longer includes 'dev'
+    // (e.g. flipped to ['prod']). Without this the dev chain keeps self-triggering and collides
+    // with the cloud chain on the same account → ban (canary 221 stall, 2026-06-11). Clear the
+    // stale dev activeRunId so the orphan check can't resurrect a ghost and a later flip-back is clean.
+    if (!isRuntimeCloud && !botPollEnvs.includes('dev')) {
+      logger.info('Chain stopped — bot not configured for dev polling', { botId, chainId, runtimeEnv, pollEnvironments: botPollEnvs });
+      await db.update(bots).set({ activeRunId: null, updatedAt: new Date() }).where(eq(bots.id, botId))
+        .catch((e) => logger.error('dev guard activeRunId clear failed', { botId, error: String(e) }));
       return;
     }
 
@@ -217,11 +258,10 @@ export const pollVisaTask = task({
       currentCas: bot.currentCasDate ? `${bot.currentCasDate} ${bot.currentCasTime}` : 'N/A',
     });
 
-    // Resolve public IP via ipify (always — webshare with "direct" entries needs it as fallback)
-    ipPromise = fetch('https://api.ipify.org?format=text', { signal: AbortSignal.timeout(3000) })
-      .then(r => r.text())
-      .then(ip => { publicIp = ip.trim(); logger.info('Public IP resolved', { botId, publicIp }); })
-      .catch(() => { /* non-fatal */ });
+    // Resolve public IP via ipify (always — webshare with "direct" entries needs it as fallback).
+    // Cached (10min TTL) + dedicated dispatcher to avoid the per-poll CLOSE-WAIT socket leak.
+    ipPromise = resolvePublicIp()
+      .then(ip => { if (ip) { publicIp = ip; logger.info('Public IP resolved', { botId, publicIp }); } });
 
     metadata.set("phase", "Cargando sesion...");
     // Load session + exclusions + last poll (for date diff) in parallel
@@ -256,8 +296,9 @@ export const pollVisaTask = task({
     const effectiveLastDatesCount = payload.lastDatesCount ?? (lastPollResult[0]?.rawDatesCount ?? undefined);
     timings.load = Date.now() - loadStart;
     if (!session) {
-      logger.warn('No session found, requesting manual login', { botId });
-      await loginVisaTask.trigger({ botId }, { tags: [`bot:${botId}`] });
+      logger.warn('No session found, requesting manual login', { botId, chainId });
+      // Propagate chainId so a cloud-owned bot's login-recovery restarts in cloud, not on the RPi (dev).
+      await loginVisaTask.trigger({ botId, chainId }, { tags: [`bot:${botId}`] });
       return;
     }
 
@@ -272,6 +313,14 @@ export const pollVisaTask = task({
       .where(eq(pollLogs.botId, botId))
       .orderBy(desc(pollLogs.createdAt))
       .limit(5);
+    // Heartbeat gate state: createdAt of the most recent poll_log row for this bot.
+    // The DB is the only cross-run state (Trigger.dev runs are stateless; the self-trigger
+    // payload is unreliable on cron restart — see effectiveLastDatesCount above). logPoll
+    // skips steady-state "nothing happened" polls unless this is >HEARTBEAT_MS old.
+    // Mutable per-run heartbeat state: logPoll skips quiet polls and counts them in `skipped`,
+    // updating `lastLoggedAt` on each write. `skipped` is seeded from / persisted to the bot row
+    // so the count carries across runs (handles batch bursts AND cron 1-poll/run exactly).
+    const hb: HeartbeatState = { lastLoggedAt: rateQuery[0]?.createdAt ?? null, skipped: bot.skippedPollsSinceLog ?? 0 };
     if (rateQuery.length >= 2) {
       const newest = rateQuery[0]!.createdAt.getTime();
       const oldest = rateQuery[rateQuery.length - 1]!.createdAt.getTime();
@@ -415,7 +464,15 @@ export const pollVisaTask = task({
     );
 
     const dateExclusions = exDates.map((d) => ({ startDate: d.startDate, endDate: d.endDate }));
-    const minDate = addDays(new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' }), bot.minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
+    const minDate = computeMinDate(bot.minDaysFromToday);
+
+    // SNIPER MODE: hunt ANY consular date inside [targetDateAfter, targetDateBefore), even if it is
+    // NOT earlier than the current appointment (owner-authorized override of the strictly-earlier rule).
+    // `days` is already window-bounded via filterDates(targetDateAfter) below, so a present `earliest`
+    // implies an in-window slot. executeReschedule enforces the same window + the secure-then-improve loop.
+    const sniperMode = isSniperActive(bot.sniperMode, bot.targetDateAfter, bot.targetDateBefore);
+    const inSniperWindow = (d: string | null | undefined): boolean =>
+      isWithinWindow(d, bot.targetDateAfter, bot.targetDateBefore);
 
     let capturedConnInfo: LogPollExtra['connectionInfo'] = null;
     try {
@@ -575,7 +632,7 @@ export const pollVisaTask = task({
 
         allDays = firstDaysResult;
         runRawDatesCount = allDays.length;
-        days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
+        days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter);
         metadata.set("phase", days.length > 0 ? `Analizando ${days.length} fechas...` : "Sin fechas disponibles");
 
         // Detect soft ban: dramatic date count drop.
@@ -636,7 +693,7 @@ export const pollVisaTask = task({
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
 
-          if (firstEarliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(firstEarliest, bot.currentConsularDate, 1))) {
+          if (firstEarliest && isActionableDate(firstEarliest, bot.currentConsularDate, sniperMode)) {
             foundImprovement = true;
           }
 
@@ -667,7 +724,7 @@ export const pollVisaTask = task({
             const fetchStart = Date.now();
             try {
               allDays = await client.getConsularDays();
-              days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
+              days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter);
               consecutiveErrors = 0;
               consecutive5xx = 0;
             } catch (fetchErr) {
@@ -771,7 +828,7 @@ export const pollVisaTask = task({
 
             if (allDays.length > 0) runRawDatesCount = allDays.length;
 
-            if (fetchEarliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(fetchEarliest, bot.currentConsularDate, 1))) {
+            if (fetchEarliest && isActionableDate(fetchEarliest, bot.currentConsularDate, sniperMode)) {
               foundImprovement = true;
             }
           }
@@ -815,7 +872,7 @@ export const pollVisaTask = task({
               }).catch(e => logger.error('bookable_event insert failed', { error: String(e) }))
             );
           }
-        } else if (earliest && (bot.currentConsularDate === null || isAtLeastNDaysEarlier(earliest, bot.currentConsularDate, 1))) {
+        } else if (earliest && isActionableDate(earliest, bot.currentConsularDate, sniperMode)) {
           const isInitialBooking = bot.currentConsularDate === null;
           const RESCHEDULE_DEDUP_MS = 3 * 60 * 1000;
           const [recentReschedule] = await db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
@@ -942,7 +999,7 @@ export const pollVisaTask = task({
           // If all candidates were blocked, no point calling executeReschedule — skip silently.
           // For initial booking (currentConsularDate=null), any unblocked date is a valid candidate.
           const effectiveEarliest = daysForReschedule.find(
-            d => bot.currentConsularDate === null || isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1),
+            d => sniperMode ? inSniperWindow(d.date) : (bot.currentConsularDate === null || isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1)),
           )?.date;
           if (!effectiveEarliest) {
             logger.info('All earlier dates blocked — skipping reschedule', {
@@ -1109,7 +1166,7 @@ export const pollVisaTask = task({
           persistDateSightings(pending, botId, finalDateChanges, bot.currentConsularDate, bot.targetDateBefore);
           if (days.length === 0) {
             logger.info('No available dates', { botId, responseTimeMs, softBan: softBanNotified });
-            logPoll(pending, botId, null, 0, responseTimeMs, finalStatus, undefined, topDatesRaw, undefined, extra);
+            logPoll(pending, botId, null, 0, responseTimeMs, finalStatus, undefined, topDatesRaw, undefined, extra, hb);
           } else {
             logger.info('Dates found', {
               botId,
@@ -1119,7 +1176,7 @@ export const pollVisaTask = task({
               current: bot.currentConsularDate,
               responseTimeMs,
             });
-            logPoll(pending, botId, earliest!, days.length, responseTimeMs, finalStatus, undefined, topDatesRaw, rescheduleResultLabel, extra);
+            logPoll(pending, botId, earliest!, days.length, responseTimeMs, finalStatus, undefined, topDatesRaw, rescheduleResultLabel, extra, hb);
           }
         } else if (rescheduleResultLabel) {
           // Super-critical/burst: update the most recent poll_log with the reschedule result
@@ -1234,7 +1291,7 @@ export const pollVisaTask = task({
           allDays = await client.getConsularDays();
           { const proxyMeta = client.getLastProxyMeta(); if (proxyMeta.proxyAttemptIp) publicIp = proxyMeta.proxyAttemptIp; capturedConnInfo = captureConnInfo(proxyMeta, connInfoExtra); }
           runRawDatesCount = allDays.length;
-          days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate);
+          days = filterDates(allDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter);
         } catch (fetchErr) {
           if (fetchErr instanceof SessionExpiredError) throw fetchErr;
           const errMsg = extractErrorMessage(fetchErr);
@@ -1588,6 +1645,28 @@ export const pollVisaTask = task({
       cancelPreviousRun(ctx.run.id, activeRunIdField);
       const elapsedMs = Date.now() - startMs;
       const normalDelay = getPollingDelay(bot.locale, getEffectiveInterval(bot.locale, bot.pollIntervalSeconds, bot.targetPollsPerMin), elapsedMs);
+      // Recompute backoff escalation counters here (shared path) so they are correct
+      // regardless of how the TCP block was detected. The in-catch recompute only runs when an
+      // exception propagates to the outer catch; the common webshare path handles blocks INSIDE
+      // the batch loop (inner catch → break, no throw), which bypassed the recompute and left the
+      // counters at 0 → backoff was stuck at the lowest tier and never escalated (30m/120m/240m).
+      if (tcpBlockNotified) {
+        const recentForBackoff = await db
+          .select({ status: pollLogs.status, blockCls: sql<string>`${pollLogs.connectionInfo}->>'blockClassification'` })
+          .from(pollLogs)
+          .where(eq(pollLogs.botId, botId))
+          .orderBy(desc(pollLogs.createdAt))
+          .limit(5);
+        const firstNonTcp = recentForBackoff.findIndex((r) => r.status !== 'tcp_blocked');
+        sustainedTcpBlockCount = firstNonTcp === -1 ? recentForBackoff.length : firstNonTcp;
+        const firstNonAccountBan = recentForBackoff.findIndex((r) => r.blockCls !== null && r.blockCls !== 'account_ban');
+        sustainedAccountBanCount = firstNonAccountBan === -1 ? recentForBackoff.length : firstNonAccountBan;
+      }
+
+      // NOTE: a sustained account ban is NEVER auto-paused — the bot must recover on its
+      // own without manual reactivation. It holds at the aggressive backoff cap (480m) and
+      // keeps probing every ~8h; the first `ok` poll drops straight back to normal cadence.
+
       // tcp_blocked:
       //   webshare → ProxyPoolManager rotates to a healthy IP, use normalDelay (or 5min if sustained)
       //   direct/brightdata/firecrawl → escalating backoff to avoid escalating a single-IP ban
@@ -1599,29 +1678,20 @@ export const pollVisaTask = task({
         // use a long delay so the bot doesn't burn resources. Auto-pause handles the
         // sustained case (see above); this covers the first occurrence.
         delay = '240m';
+      } else if (tcpBlockNotified && blockCls === 'account_ban') {
+        // Account-level ban — provider-agnostic aggressive backoff. Rotating the
+        // webshare pool does nothing (ban is on the account, not the IP), so webshare
+        // and direct share one curve. Single source of truth in scheduling.ts, also
+        // used by ensure-chain's resurrect gate so the guardian never re-polls early.
+        delay = accountBanBackoffDelay(sustainedAccountBanCount);
       } else if (tcpBlockNotified && bot.proxyProvider === 'webshare') {
-        if (blockCls === 'account_ban') {
-          // Account ban lasts 6h+. Probe first occurrence (could be transient pool exhaustion),
-          // then escalate as the ban is confirmed to be sustained.
-          delay = sustainedAccountBanCount <= 1 ? '10m'
-            : sustainedAccountBanCount <= 3 ? '30m'
-            : '120m';
-        } else {
-          // ip_ban / pool partially degraded — pool rotates IPs, 5min is fine
-          delay = sustainedTcpBlockCount >= 3 ? '5m' : normalDelay;
-        }
+        // ip_ban / pool partially degraded — pool rotates IPs, 5min is fine
+        delay = sustainedTcpBlockCount >= 3 ? '5m' : normalDelay;
       } else if (tcpBlockNotified) {
-        if (blockCls === 'account_ban') {
-          // Direct IP ban — escalate aggressively (ban lasts 6h+, no pool to rotate)
-          delay = sustainedAccountBanCount <= 1 ? '10m'
-            : sustainedAccountBanCount <= 3 ? '30m'
-            : '240m';
-        } else {
-          // Transient / connection_reset — existing behavior
-          delay = sustainedTcpBlockCount <= 2 ? normalDelay
-            : sustainedTcpBlockCount <= 4 ? '10m'
-            : '30m';
-        }
+        // Transient / connection_reset (direct) — existing behavior
+        delay = sustainedTcpBlockCount <= 2 ? normalDelay
+          : sustainedTcpBlockCount <= 4 ? '10m'
+          : '30m';
       } else if (throttleNotified) {
         delay = '3m';
       } else {
@@ -1652,7 +1722,7 @@ export const pollVisaTask = task({
       const runIdField = isCloud ? { activeCloudRunId: handle.id } : { activeRunId: handle.id };
       pending.push(
         db.update(bots)
-          .set({ ...runIdField, updatedAt: new Date() })
+          .set({ ...runIdField, skippedPollsSinceLog: hb.skipped, updatedAt: new Date() })
           .where(eq(bots.id, botId))
           .catch((e) => logger.error('activeRunId persist failed', { error: String(e) })),
       );
@@ -1665,7 +1735,7 @@ export const pollVisaTask = task({
       const clearField = isCloud ? { activeCloudRunId: null } : { activeRunId: null };
       pending.push(
         db.update(bots)
-          .set({ ...clearField, updatedAt: new Date() } as Record<string, unknown>)
+          .set({ ...clearField, skippedPollsSinceLog: hb.skipped, updatedAt: new Date() } as Record<string, unknown>)
           .where(eq(bots.id, botId))
           .catch((e) => logger.error('activeRunId clear failed', { error: String(e) })),
       );
@@ -1749,7 +1819,39 @@ function logPoll(
   topDates?: string[],
   rescheduleResult?: string | null,
   extra?: LogPollExtra,
+  // Steady-state write reduction: when `heartbeat` is provided and this poll is a quiet 'ok'
+  // within the heartbeat window, skip the INSERT and just count it (~94% fewer rows). Only the
+  // normal path passes it — super-critical/burst always log every fetch. Uptime (5-min buckets) +
+  // 30-min date trends are preserved because a row is written at least every HEARTBEAT_MS.
+  // `heartbeat` is mutated: skips increment `skipped`, writes flush it into polls_since_prev.
+  heartbeat?: HeartbeatState,
 ): void {
+  const now = Date.now();
+  if (
+    heartbeat &&
+    shouldSkipHeartbeatPoll(
+      {
+        status,
+        pollPhase: extra?.pollPhase,
+        rescheduleResult,
+        reloginHappened: extra?.reloginHappened,
+        banPhase: extra?.banPhase,
+        dateChanges: extra?.dateChanges,
+      },
+      heartbeat.lastLoggedAt,
+      now,
+    )
+  ) {
+    heartbeat.skipped++; // counted, not logged — flushed into the next written row's polls_since_prev
+    return;
+  }
+  // This row stands for itself + every quiet poll skipped since the last written row (exact count).
+  let pollsSincePrev = 1;
+  if (heartbeat) {
+    pollsSincePrev = 1 + heartbeat.skipped;
+    heartbeat.skipped = 0;
+    heartbeat.lastLoggedAt = new Date(now);
+  }
   pending.push(
     db.insert(pollLogs).values({
       botId,
@@ -1774,6 +1876,7 @@ function logPoll(
       dateChanges: extra?.dateChanges ?? null,
       banPhase: extra?.banPhase ?? null,
       connectionInfo: extra?.connectionInfo ?? null,
+      pollsSincePrev,
     }).catch((e) => logger.error('logPoll failed', { error: String(e) })),
   );
 }

@@ -123,14 +123,5 @@ export function resolveLocale(countryCode: string): string | null {
   return matches[0]!;
 }
 
-/** Get all valid country codes (unique, sorted). */
-export function getValidCountryCodes(): string[] {
-  const codes = new Set<string>();
-  for (const locale of Object.keys(VALID_LOCALES)) {
-    codes.add(locale.split('-')[1]!);
-  }
-  return [...codes].sort();
-}
-
 /** Minimum days from today a candidate reschedule date must be. Global rule: never book within 3 days. */
 export const MIN_DAYS_FROM_TODAY = 3;

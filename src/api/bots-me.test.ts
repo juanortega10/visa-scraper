@@ -82,7 +82,7 @@ vi.mock('../utils/constants.js', () => ({
 }));
 
 import { db } from '../db/client.js';
-import { botsRouter } from './bots.js';
+import { botsRouter, pickApplicantNames } from './bots.js';
 
 // ── Helpers ───────────────────────────────────────────
 
@@ -667,5 +667,44 @@ describe('tracker endpoints', () => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toBe('Bot not found');
+  });
+});
+
+// ── pickApplicantNames ────────────────────────────────
+// An account can hold several schedule groups (parent on B1/B2, child on F1),
+// so the bot's own scheduleId decides which names it gets — not the discovery
+// result's primary group.
+
+describe('pickApplicantNames', () => {
+  const group = (scheduleId: string, applicantNames: string[]) =>
+    ({ scheduleId, applicantIds: [], applicantNames, applicantVisaTypes: [], primaryVisaCategory: null,
+       currentConsularDate: null, currentConsularTime: null, currentCasDate: null, currentCasTime: null }) as any;
+
+  const discovery = {
+    scheduleId: '111',
+    applicantNames: ['Alejandro Gaviria Uribe'],
+    groups: [group('111', ['Alejandro Gaviria Uribe']), group('222', ['Tomas Gaviria Soto'])],
+  } as any;
+
+  it('matches the group for the bot own scheduleId, not the primary group', () => {
+    expect(pickApplicantNames(discovery, undefined, '222')).toEqual(['Tomas Gaviria Soto']);
+    expect(pickApplicantNames(discovery, undefined, '111')).toEqual(['Alejandro Gaviria Uribe']);
+  });
+
+  it('falls back to the top-level names only when the scheduleId matches', () => {
+    const noGroups = { scheduleId: '111', applicantNames: ['Alejandro Gaviria Uribe'], groups: [] } as any;
+    expect(pickApplicantNames(noGroups, undefined, '111')).toEqual(['Alejandro Gaviria Uribe']);
+    expect(pickApplicantNames(noGroups, undefined, '999')).toBeNull();
+  });
+
+  it('accepts names from the request body when there is no discovery result', () => {
+    expect(pickApplicantNames(undefined, ['Ana Perez'], '111')).toEqual(['Ana Perez']);
+  });
+
+  it('returns null for missing or malformed body names', () => {
+    expect(pickApplicantNames(undefined, undefined, '111')).toBeNull();
+    expect(pickApplicantNames(undefined, [], '111')).toBeNull();
+    expect(pickApplicantNames(undefined, ['', '  '], '111')).toBeNull();
+    expect(pickApplicantNames(undefined, [42], '111')).toBeNull();
   });
 });

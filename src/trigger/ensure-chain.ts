@@ -1,10 +1,10 @@
 import { schedules, logger, runs } from '@trigger.dev/sdk/v3';
 import { db } from '../db/client.js';
 import { bots, pollLogs } from '../db/schema.js';
-import { eq, inArray, and, desc } from 'drizzle-orm';
+import { eq, inArray, and, desc, sql } from 'drizzle-orm';
 import { notifyUserTask } from './notify-user.js';
 import { visaPollingPerBotQueue } from './queues.js';
-import { calculatePriority } from '../services/scheduling.js';
+import { calculatePriority, accountBanBackoffMs } from '../services/scheduling.js';
 
 type RunAction = 'executing' | 'pulled_forward' | 'resurrected' | 'cron_ok';
 
@@ -16,6 +16,46 @@ async function getRunStatus(runId: string | null): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Detect an intentional TCP account-ban backoff.
+ *
+ * When a bot's account is banned, poll-visa schedules a long DELAYED self-trigger
+ * (30m → 60m → 120m → 240m → 480m as the ban is confirmed sustained — see scheduling.ts).
+ * ensure-chain must NOT cancel+pull-forward that DELAYED run, nor resurrect a
+ * dead run early: doing either re-polls the banned account every ~10 min and
+ * defeats the backoff (the bot 231 incident — 100% account_ban for ~116h at a
+ * ~10 min cadence instead of the intended long backoff).
+ *
+ * Returns `banned` + how long the intended backoff is, computed the SAME way as
+ * poll-visa (last 5 poll_logs, consecutive account_ban count → tier) using the
+ * shared `accountBanBackoffMs` helper so the two can never drift.
+ */
+async function getBanBackoff(
+  botId: number,
+): Promise<{ banned: boolean; lastPollAgeMs: number; backoffMs: number }> {
+  const recent = await db
+    .select({
+      status: pollLogs.status,
+      createdAt: pollLogs.createdAt,
+      blockCls: sql<string | null>`${pollLogs.connectionInfo}->>'blockClassification'`,
+    })
+    .from(pollLogs)
+    .where(eq(pollLogs.botId, botId))
+    .orderBy(desc(pollLogs.id))
+    .limit(5);
+
+  const last = recent[0];
+  if (!last || last.status !== 'tcp_blocked' || last.blockCls !== 'account_ban') {
+    return { banned: false, lastPollAgeMs: 0, backoffMs: 0 };
+  }
+
+  // Consecutive account_ban rows (mirrors poll-visa.ts backoff-counter recompute).
+  const firstNonBan = recent.findIndex((r) => r.blockCls !== null && r.blockCls !== 'account_ban');
+  const count = firstNonBan === -1 ? recent.length : firstNonBan;
+
+  return { banned: true, lastPollAgeMs: Date.now() - last.createdAt.getTime(), backoffMs: accountBanBackoffMs(count) };
 }
 
 /**
@@ -35,6 +75,28 @@ async function ensureChainForBot(
   const status = await getRunStatus(runId);
 
   if (status === 'EXECUTING') return { action: 'executing' };
+
+  // Respect an intentional account-ban backoff (poll-visa scheduled a long DELAYED run).
+  // Without this guard the guardian re-polls the banned account every ~10 min and defeats
+  // the 30m→60m→120m→240m→480m escalation. Mirrors poll-visa's DEDUP FALLBACK (poll-visa.ts:229-238).
+  const ban = await getBanBackoff(botId);
+  if (ban.banned) {
+    // Live backoff run → leave it; it fires when the delay elapses (like EXECUTING).
+    if (status === 'DELAYED' || status === 'QUEUED') {
+      return { action: 'cron_ok' };
+    }
+    // Dead/null run: only resurrect once the intended backoff has actually elapsed.
+    // (When the ban clears, the next probe recovers within one backoff window.)
+    if (ban.lastPollAgeMs < ban.backoffMs) {
+      logger.info('ensure-chain: bot in account-ban backoff, skipping', {
+        botId,
+        lastPollAgeMin: Math.round(ban.lastPollAgeMs / 60_000),
+        backoffMin: Math.round(ban.backoffMs / 60_000),
+      });
+      return { action: 'cron_ok' };
+    }
+    // Backoff elapsed and no live run → fall through to resurrect a single fresh probe.
+  }
 
   // For cron bots, null activeRunId is normal (cleared between cron ticks).
   // Only resurrect if no recent poll_log (cron should fire every 2 min, 5 min gap = something's wrong).

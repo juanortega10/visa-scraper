@@ -45,7 +45,7 @@ blockIntelRouter.get('/cross-bot', async (c) => {
     bots: Array<{ botId: number; totalPolls: number; tcpBlocked: number; blockRate: number; firstBlock: string | null; lastBlock: string | null; provider: string }>;
   }>();
 
-  for (const r of rows) {
+  for (const r of rows.rows) {
     const ip = r.public_ip as string;
     let entry = ipMap.get(ip);
     if (!entry) { entry = { bots: [] }; ipMap.set(ip, entry); }
@@ -196,7 +196,7 @@ blockIntelRouter.get('/episodes', async (c) => {
 
   let current: EpisodeBuilder | null = null;
 
-  for (const r of rows) {
+  for (const r of rows.rows) {
     const poll = r as unknown as PollRow;
     if (poll.status === 'tcp_blocked') {
       if (!current || current.botId !== poll.bot_id) {
@@ -279,15 +279,15 @@ blockIntelRouter.get('/risk-factors', async (c) => {
   ]);
 
   const result = {
-    byProvider: [...byProvider],
-    byHour: [...byHour].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byDayOfWeek: [...byDow].map(r => ({
+    byProvider: byProvider.rows,
+    byHour: byHour.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byDayOfWeek: byDow.rows.map(r => ({
       ...r,
       day_name: typeof r.day_name === 'string' ? r.day_name.trim() : r.day_name,
       block_rate: Number(r.block_rate),
     })),
-    byLocale: [...byLocale],
-    classificationBreakdown: [...byClassification],
+    byLocale: byLocale.rows,
+    classificationBreakdown: byClassification.rows,
     windowHours: hours,
   };
   setCached(cacheKey, result, 2 * 60_000);
@@ -346,9 +346,9 @@ blockIntelRouter.get('/trends', async (c) => {
   ]);
 
   const result = {
-    timeseries: [...mainResult].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byProvider: [...providerResult].map(r => ({ ...r, block_rate: Number(r.block_rate) })),
-    byClassification: [...clsResult],
+    timeseries: mainResult.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byProvider: providerResult.rows.map(r => ({ ...r, block_rate: Number(r.block_rate) })),
+    byClassification: clsResult.rows,
     windowHours: hours,
     granularity,
   };

@@ -1,0 +1,13 @@
+import { db } from '../src/db/client.js';
+import { bots, sessions, pollLogs, authLogs } from '../src/db/schema.js';
+import { eq, desc, gte } from 'drizzle-orm';
+const id = parseInt(process.argv[2]!);
+const [b] = await db.select().from(bots).where(eq(bots.id, id));
+const [s] = await db.select({ createdAt: sessions.createdAt }).from(sessions).where(eq(sessions.botId, id));
+const ps = await db.select({ st: pollLogs.status, at: pollLogs.createdAt, rt: pollLogs.responseTimeMs, ed: pollLogs.earliestDate }).from(pollLogs).where(eq(pollLogs.botId, id)).orderBy(desc(pollLogs.createdAt)).limit(4);
+const since = new Date(Date.now() - 6*60_000);
+const al = await db.select().from(authLogs).where(gte(authLogs.createdAt, since)).orderBy(desc(authLogs.createdAt)).limit(6);
+console.log(`bot ${id}: status=${b?.status} session=${s?`age ${Math.round((Date.now()-s.createdAt.getTime())/1000)}s`:'NONE'} consec=${b?.consecutiveErrors}`);
+console.log(`recent polls: ${ps.length?ps.map(p=>`${p.st}(${p.rt}ms${p.ed?' earliest='+p.ed:''})@${p.at.toISOString().slice(11,19)}`).join('  '):'NONE'}`);
+console.log(`recent auth_logs(6m): ${al.length?al.map(a=>`${a.action}/${a.result}${a.errorMessage?' '+a.errorMessage.slice(0,50):''}`).join(' | '):'none'}`);
+process.exit(0);

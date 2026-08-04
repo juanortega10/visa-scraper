@@ -4,8 +4,7 @@ import { bots, sessions, rescheduleLogs } from '../db/schema.js';
 import { eq, sql, or, lt, isNull, and } from 'drizzle-orm';
 import { encrypt } from './encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js';
-import { filterDates, filterTimes, isAtLeastNDaysEarlier, isDateExcluded, addDays } from '../utils/date-helpers.js';
-import { MIN_DAYS_FROM_TODAY } from '../utils/constants.js';
+import { filterDates, filterTimes, isAtLeastNDaysEarlier, isDateExcluded, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
 import { notifyUserTask } from '../trigger/notify-user.js';
 import type { DateRange, TimeRange } from '../utils/date-helpers.js';
 import type { CasCacheData, CasCacheEntry, DateFailureEntry, FailureDimension } from '../db/schema.js';
@@ -19,6 +18,8 @@ export interface RescheduleBot {
   currentCasTime: string | null;
   ascFacilityId: string;
   targetDateBefore?: string | null;
+  targetDateAfter?: string | null;
+  sniperMode?: boolean | null;
   maxCasGapDays?: number | null;
   skipCas?: boolean;
   speculativeTimeFallback?: boolean;
@@ -117,7 +118,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     } : {}),
   });
   let successfulPosts = 0; // Track POSTs in this invocation for maxReschedules guard
-  const minDate = addDays(new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Bogota' }), bot.minDaysFromToday ?? MIN_DAYS_FROM_TODAY);
+  const minDate = computeMinDate(bot.minDaysFromToday);
+
+  // SNIPER MODE: accept ANY consular date inside the window [targetDateAfter, targetDateBefore),
+  // even if it is NOT earlier than the current appointment (overrides the strictly-earlier
+  // protection — owner-authorized per bot). Requires both window bounds. Once a date is secured,
+  // the secure-then-improve loop still drives toward the earliest in-window date.
+  const sniperMode = isSniperActive(bot.sniperMode, bot.targetDateAfter, bot.targetDateBefore);
+  const inSniperWindow = (d: string | null | undefined): boolean =>
+    isWithinWindow(d, bot.targetDateAfter, bot.targetDateBefore);
 
 
   if (dryRun) {
@@ -196,8 +205,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
   const currentConsularDate = freshData.currentConsularDate;
 
-  // Check if candidate is still better than the FRESH currentConsularDate
-  if (candidateDate && currentConsularDate) {
+  // Check if candidate is still better than the FRESH currentConsularDate.
+  // SNIPER MODE skips this guard: acceptance is window-based (not strictly-earlier), and the
+  // attempt loop re-filters candidates to the window via filterDates(targetDateAfter) below.
+  if (!sniperMode && candidateDate && currentConsularDate) {
     if (!isAtLeastNDaysEarlier(candidateDate, currentConsularDate, 1)) {
       logger.info('RACE CONDITION GUARD: candidate no longer better after DB re-read', {
         botId,
@@ -407,9 +418,12 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       }
     }
 
-    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore, minDate);
+    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter);
     const candidates = filteredDays
-      .filter((d) => effectiveCurrentDate ? isAtLeastNDaysEarlier(d.date, effectiveCurrentDate, 1) : true)
+      // SNIPER (before securing): accept any in-window date even if not earlier than current —
+      // filteredDays is already bounded to [targetDateAfter, targetDateBefore). After securing,
+      // require strictly earlier than the secured date so the improve loop only goes earlier.
+      .filter((d) => (sniperMode && !securedResult) ? true : (effectiveCurrentDate ? isAtLeastNDaysEarlier(d.date, effectiveCurrentDate, 1) : true))
       .filter((d) => !exhaustedDates.has(d.date))
       .filter((d) => (transientFailCount.get(d.date) ?? 0) < 2);
 
@@ -994,7 +1008,11 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             }).where(eq(bots.id, botId));
 
             const isImprovement = verifyAppt.consularDate && prevConsularDate
-              ? isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1)
+              ? (sniperMode
+                  // SNIPER: a verified in-window date counts as success unless we'd already
+                  // secured an earlier one (then it must be strictly earlier to not regress).
+                  ? (inSniperWindow(verifyAppt.consularDate) && (!securedResult || isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1)))
+                  : isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1))
               : false;
 
             if (isImprovement) {

@@ -8,10 +8,12 @@ export const visaPollingQueue = queue({
 /** Per-bot polling queue. Each bot is serialized via concurrencyKey (poll-{botId}).
  * Global concurrencyLimit caps how many polls run simultaneously across all bots —
  * with 60+ active bots on the RPi (4 cores), 10 caused load avg 5+ and starved the
- * API. 4 keeps the RPi healthy; extra polls queue and run within 1-2s of their slot. */
+ * API. Raised 4→8 (2026-06-09): with 36 active bots, 4 slots starved newly-onboarded
+ * chainless bots (their cron runs were superseded/Cancelled-0ms before getting a slot,
+ * so they never executed a first poll → never self-chained). Watch RPi load avg. */
 export const visaPollingPerBotQueue = queue({
   name: 'visa-polling-per-bot',
-  concurrencyLimit: 4,
+  concurrencyLimit: 8,
 });
 
 export const visaRescheduleQueue = queue({

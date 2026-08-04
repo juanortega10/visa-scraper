@@ -664,3 +664,72 @@ describe('Speculative time fallback', () => {
     expect(speculativeLog).toBeUndefined();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sniper mode — window targeting overrides the strictly-earlier protection
+// ─────────────────────────────────────────────────────────────────────────────
+describe('Sniper mode — in-window date later than current', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  // current=2026-05-04. Window [2026-06-01, 2026-07-21). Candidate 2026-07-01 is LATER than
+  // current but inside the window. CAS 2026-06-25 = 6 days before → within maxCasGapDays=7.
+  const SNIPER_BOT: RescheduleBot = {
+    ...BASE_BOT,
+    targetDateAfter: '2026-06-01',
+    targetDateBefore: '2026-07-21',
+    sniperMode: true,
+    maxCasGapDays: 7,
+  };
+  const IN_WINDOW_LATER: DaySlot[] = [{ date: '2026-07-01', business_day: true }];
+
+  function sniperClient() {
+    return makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['08:00'] }),
+      getCasDays: vi.fn().mockResolvedValue([{ date: '2026-06-25', business_day: true }]),
+      getCasTimes: vi.fn().mockResolvedValue({ available_times: ['07:00'] }),
+      reschedule: vi.fn().mockResolvedValue(true),
+      getCurrentAppointment: vi.fn().mockResolvedValue({
+        consularDate: '2026-07-01', consularTime: '08:00',
+        casDate: '2026-06-25', casTime: '07:00',
+      }),
+    });
+  }
+
+  it('ACCEPTS an in-window date later than the current appointment when sniperMode=true', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    setupDbMocks('2026-05-04'); // race guard re-reads current = May 4
+    const client = sniperClient();
+
+    const result = await executeReschedule({
+      client, botId: 222, bot: SNIPER_BOT,
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: IN_WINDOW_LATER,
+      casCacheJson: null, dryRun: false, maxAttempts: 1, pending: [],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.date).toBe('2026-07-01');
+    expect(client.reschedule).toHaveBeenCalled();
+  });
+
+  it('REJECTS the same later date when sniperMode is OFF (strictly-earlier protection holds)', async () => {
+    const { executeReschedule } = await import('../reschedule-logic.js');
+    setupDbMocks('2026-05-04');
+    const client = sniperClient();
+
+    const result = await executeReschedule({
+      client, botId: 222,
+      bot: { ...BASE_BOT, maxCasGapDays: 7 }, // no sniper, no window
+      dateExclusions: [], timeExclusions: [],
+      preFetchedDays: IN_WINDOW_LATER,
+      casCacheJson: null, dryRun: false, maxAttempts: 1, pending: [],
+    });
+
+    expect(result.success).not.toBe(true);
+    expect(client.reschedule).not.toHaveBeenCalled();
+  });
+});

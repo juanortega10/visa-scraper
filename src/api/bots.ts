@@ -195,6 +195,26 @@ export async function findDuplicateBot(
   return null;
 }
 
+// Full applicant names for the bot being created. An account can hold several
+// schedule groups (e.g. a parent on B1/B2 and a child on F1), and the discovery
+// result's top-level `applicantNames` only describes the *primary* group — so
+// match the bot's own scheduleId first and fall back to the primary group.
+export function pickApplicantNames(
+  discovery: DiscoverResult | undefined,
+  fromBody: unknown,
+  scheduleId: string,
+): string[] | null {
+  const group = discovery?.groups?.find((g) => g.scheduleId === scheduleId);
+  if (group?.applicantNames.length) return group.applicantNames;
+  if (discovery?.applicantNames?.length && discovery.scheduleId === scheduleId) {
+    return discovery.applicantNames;
+  }
+  if (Array.isArray(fromBody) && fromBody.every((n) => typeof n === 'string' && n.trim())) {
+    return fromBody.length ? (fromBody as string[]) : null;
+  }
+  return null;
+}
+
 // ── Routes ─────────────────────────────────────────────────
 
 // List all bots (summary for dashboard)
@@ -351,6 +371,7 @@ botsRouter.get('/landing', async (c) => {
       testMode: bots.testMode,
       activatedAt: bots.activatedAt,
       visaEmail: bots.visaEmail,
+      applicantNames: bots.applicantNames,
     }).from(bots),
 
     db.select({
@@ -626,6 +647,10 @@ botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
       visaPassword: encrypt(visaPassword),
       scheduleId,
       applicantIds,
+      // Names come from the discovery result when the caller reused a discoveryToken;
+      // otherwise the frontend may pass them through explicitly. Null when unknown —
+      // backfill-visa-types.ts fills them in later from the /groups page.
+      applicantNames: pickApplicantNames(cachedDiscovery, body.applicantNames, scheduleId),
       consularFacilityId,
       ascFacilityId,
       locale,
@@ -1051,7 +1076,8 @@ botsRouter.get('/:id', async (c) => {
     notificationEmail: bots.notificationEmail, ownerEmail: bots.ownerEmail, notificationPhone: bots.notificationPhone,
     waBsuid: bots.waBsuid, waUsername: bots.waUsername, linkToken: bots.linkToken,
     webhookUrl: bots.webhookUrl,
-    visaEmail: bots.visaEmail, applicantIds: bots.applicantIds, clerkUserId: bots.clerkUserId,
+    visaEmail: bots.visaEmail, applicantIds: bots.applicantIds, applicantNames: bots.applicantNames,
+    clerkUserId: bots.clerkUserId,
     activatedAt: bots.activatedAt, createdAt: bots.createdAt, updatedAt: bots.updatedAt,
     casCacheJson: bots.casCacheJson,
   }).from(bots).where(eq(bots.id, id));
@@ -1116,6 +1142,7 @@ botsRouter.get('/:id', async (c) => {
     waUsername: bot.waUsername ?? null,
     visaEmail: (() => { try { return decrypt(bot.visaEmail); } catch { return null; } })(),
     applicantIds: bot.applicantIds,
+    applicantNames: bot.applicantNames ?? null,
     clerkEmail,
     consecutiveErrors: bot.consecutiveErrors,
     activeRunId: bot.activeRunId,

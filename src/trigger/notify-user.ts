@@ -32,6 +32,12 @@ export const notifyUserTask = task({
       webhookUrl: bots.webhookUrl,
       visaEmailEnc: bots.visaEmail,
       agencyName: agencies.name,
+      // Contexto de cobro: el webhook de Kapso necesita saber a cuánta gente y qué tipo de
+      // visa corresponde el adelanto para cotizarlo, y si es b2b para NO cobrarle al cliente
+      // final (esos van en la factura quincenal de la agencia).
+      applicantIds: bots.applicantIds,
+      visaCategory: bots.visaCategory,
+      clientType: bots.clientType,
     }).from(bots).leftJoin(agencies, eq(bots.agencyId, agencies.id)).where(eq(bots.id, botId));
     if (!row) {
       logger.warn('Bot not found for notification', { botId });
