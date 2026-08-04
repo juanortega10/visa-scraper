@@ -21,7 +21,10 @@ import { db } from '../db/client.js';
 
 // table → { column used for age, days to keep }
 const RETENTION: { table: string; column: string; days: number }[] = [
-  { table: 'poll_logs', column: 'created_at', days: 30 },
+  // 10 dias: la ventana mas larga que consulta poll_logs es 168h (block-intelligence
+  // /trends y dashboard hours=168), asi que 10 deja 3 dias de margen. Bajar a 7 dejaria
+  // esas vistas justo en el borde.
+  { table: 'poll_logs', column: 'created_at', days: 10 },
   { table: 'cas_prefetch_logs', column: 'created_at', days: 30 },
   { table: 'auth_logs', column: 'created_at', days: 90 },
   // Analytics tables — small but bounded so they don't creep up over time.
