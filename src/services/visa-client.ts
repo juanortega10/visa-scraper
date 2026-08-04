@@ -31,6 +31,7 @@ export interface CurrentAppointment {
   consularTime: string;       // HH:MM
   casDate: string | null;     // YYYY-MM-DD (null for embassies without CAS, e.g. Peru)
   casTime: string | null;     // HH:MM
+  applicantNames: string[];   // full names from the same groups page (may be empty)
 }
 
 export interface VisaClientConfig {
@@ -284,6 +285,7 @@ export class VisaClient {
       consularTime: myGroup.currentConsularTime,
       casDate: myGroup.currentCasDate,
       casTime: myGroup.currentCasTime,
+      applicantNames: myGroup.applicantNames.filter(Boolean),
     };
   }
 

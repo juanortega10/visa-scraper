@@ -106,6 +106,21 @@ Cómo llegar
 </div>
 </body></html>`;
 
+// Same shape as GROUPS_CO plus the applicant table the portal renders above the
+// appointment block — this is where the full names come from.
+const GROUPS_CO_WITH_NAMES = `
+<html><body>
+<a href="/es-co/niv/schedule/99999/appointment">Reagendar</a>
+<table><tbody>
+<tr><td>ALEJANDRO GAVIRIA URIBE</td><td>AV1234567</td></tr>
+<tr><td>maria del pilar soto</td><td>AV7654321</td></tr>
+</tbody></table>
+<p class='consular-appt'>
+  <strong>Cita Consular:</strong>
+  9 marzo, 2026, 08:15 Bogota Hora Local at Bogota
+</p>
+</body></html>`;
+
 // ── Tests ──────────────────────────────────────────────
 
 describe('getCurrentAppointment', () => {
@@ -131,7 +146,20 @@ describe('getCurrentAppointment', () => {
       consularTime: '08:15',
       casDate: '2026-03-05',
       casTime: '10:45',
+      applicantNames: [],
     });
+  });
+
+  it('returns applicant full names when the groups page lists them', async () => {
+    mockProxyFetch.mockResolvedValue(makeResponse(GROUPS_CO_WITH_NAMES));
+    const client = makeClient('12345');
+
+    const result = await client.getCurrentAppointment();
+
+    expect(result?.applicantNames).toEqual([
+      'Alejandro Gaviria Uribe',
+      'Maria Del Pilar Soto',
+    ]);
   });
 
   it('returns consular + null CAS for Peru groups page (no CAS appointment)', async () => {
@@ -145,6 +173,7 @@ describe('getCurrentAppointment', () => {
       consularTime: '10:00',
       casDate: null,
       casTime: null,
+      applicantNames: [],
     });
   });
 
@@ -159,6 +188,7 @@ describe('getCurrentAppointment', () => {
       consularTime: '14:30',
       casDate: null,
       casTime: null,
+      applicantNames: [],
     });
   });
 
@@ -173,6 +203,7 @@ describe('getCurrentAppointment', () => {
       consularTime: '09:00',
       casDate: '2026-11-03',
       casTime: '08:00',
+      applicantNames: [],
     });
   });
 

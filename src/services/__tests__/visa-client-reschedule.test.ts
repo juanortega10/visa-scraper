@@ -153,6 +153,12 @@ describe('getCurrentAppointment (bot 12 real fixture)', () => {
       consularTime: '09:00',
       casDate: '2026-11-03',
       casTime: '08:00',
+      applicantNames: [
+        'Juan Carlos Celedon Reyes',
+        'Angelica Maria Cabrales Rossi',
+        'Juan Pablo Celedon Cabrales',
+        'Angie Paola Celedon Cabrales',
+      ],
     });
   });
 
@@ -493,6 +499,12 @@ describe('full flow: refreshTokens → getCurrentAppointment → reschedule', ()
       consularTime: '09:00',
       casDate: '2026-11-03',
       casTime: '08:00',
+      applicantNames: [
+        'Juan Carlos Celedon Reyes',
+        'Angelica Maria Cabrales Rossi',
+        'Juan Pablo Celedon Cabrales',
+        'Angie Paola Celedon Cabrales',
+      ],
     });
 
     // Step 3: getConsularDays

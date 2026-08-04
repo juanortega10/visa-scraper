@@ -146,6 +146,7 @@ export const pollVisaTask = task({
       proxyUrls: bots.proxyUrls,
       webhookUrl: bots.webhookUrl, notificationEmail: bots.notificationEmail,
       ownerEmail: bots.ownerEmail,
+      applicantNames: bots.applicantNames,
       testMode: bots.testMode,
     }).from(bots).where(eq(bots.id, botId)));
     if (!bot || bot.status === 'paused') {
@@ -555,6 +556,20 @@ export const pollVisaTask = task({
         // ipPromise runs in parallel with consular days fetch (0 extra latency, resolved before logPoll)
         const [firstDaysResult, currentAppt] = await Promise.all([daysPromise, apptPromise, ipPromise]);
         timings.fetch = Date.now() - fetchStart;
+
+        // Backfill applicant names — the groups page we just parsed carries them, so
+        // any bot onboarded before they were stored (or created without them) fills
+        // itself in on its first poll. Zero extra requests, one UPDATE, once per bot.
+        if (currentAppt?.applicantNames.length && !(bot.applicantNames?.length)) {
+          bot.applicantNames = currentAppt.applicantNames;
+          logger.info('Backfilling applicant names', { botId, names: currentAppt.applicantNames });
+          pending.push(
+            db.update(bots)
+              .set({ applicantNames: currentAppt.applicantNames, updatedAt: new Date() })
+              .where(eq(bots.id, botId))
+              .catch((e) => logger.error('applicant names backfill failed', { error: String(e) })),
+          );
+        }
 
         // Sync current appointment from website → DB if changed
         if (currentAppt) {
