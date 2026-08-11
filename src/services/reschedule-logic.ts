@@ -1007,6 +1007,39 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               updatedAt: new Date(),
             }).where(eq(bots.id, botId));
 
+            // ATTRIBUTION GUARD: the POST body names one exact date (candidate.date).
+            // If the server landed on any OTHER date, our POST did not produce it — the
+            // owner rescheduled by hand, or another tool did. Crediting it to the bot
+            // inflates the "days advanced" billing. Sync state, log it as an external
+            // change, and never notify it as a bot success.
+            if (verifyAppt.consularDate !== candidate.date) {
+              logger.error('POST error + appointment changed to a date the bot never targeted — EXTERNAL change, not attributed', {
+                botId, target: candidate.date, actual: verifyAppt.consularDate,
+                prevDate: prevConsularDate, error: errorMsg,
+              });
+              pending.push(
+                db.insert(rescheduleLogs).values({
+                  botId,
+                  oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                  oldCasDate: prevCasDate, oldCasTime: prevCasTime,
+                  newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
+                  newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
+                  success: false,
+                  error: `[external_change] target=${candidate.date} actual=${verifyAppt.consularDate}`,
+                  ...diag({ failReason: 'post_error', failStep: 'post_reschedule', durationMs: Date.now() - attemptStart, error: errorMsg }),
+                }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
+              );
+              // Our POST did not land — give the reschedule allowance back.
+              await releaseSlot('post_error_external_change');
+              effectiveCurrentDate = verifyAppt.consularDate;
+              prevConsularDate = verifyAppt.consularDate;
+              prevConsularTime = verifyAppt.consularTime;
+              prevCasDate = verifyAppt.casDate;
+              prevCasTime = verifyAppt.casTime;
+              exhaustedDates.add(candidate.date);
+              continue;
+            }
+
             const isImprovement = verifyAppt.consularDate && prevConsularDate
               ? (sniperMode
                   // SNIPER: a verified in-window date counts as success unless we'd already
