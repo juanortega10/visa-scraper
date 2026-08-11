@@ -27,6 +27,7 @@
 import { db } from '../src/db/client.js';
 import { rescheduleLogs, bots } from '../src/db/schema.js';
 import { eq, asc } from 'drizzle-orm';
+import { auditReschedules, type AttributionSummary } from '../src/services/reschedule-attribution.js';
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | undefined => {
@@ -37,33 +38,7 @@ const onlyBot = flag('bot') ? Number(flag('bot')) : null;
 const price = flag('price') ? Number(flag('price')) : 0;
 const asJson = args.includes('--json');
 
-const DAY_MS = 86400000;
-/** Whole days between two YYYY-MM-DD dates. Positive = `to` is earlier than `from`. */
-function daysEarlier(from: string, to: string): number {
-  return Math.round((new Date(`${from}T00:00:00Z`).getTime() - new Date(`${to}T00:00:00Z`).getTime()) / DAY_MS);
-}
-
-interface Move {
-  at: string;
-  from: string;
-  to: string;
-  days: number;
-  actor: 'bot' | 'external';
-  kind: 'clean' | 'post_error_recovered' | 'chain_break';
-  suspect: boolean;
-  note: string;
-  logId: number | null;
-}
-
-interface BotAudit {
-  botId: number;
-  firstDate: string | null;
-  lastDate: string | null;
-  botDays: number;
-  externalDays: number;
-  suspectDays: number;
-  moves: Move[];
-}
+type BotAudit = AttributionSummary & { botId: number };
 
 async function auditBot(botId: number): Promise<BotAudit | null> {
   const rows = await db
@@ -72,79 +47,9 @@ async function auditBot(botId: number): Promise<BotAudit | null> {
     .where(eq(rescheduleLogs.botId, botId))
     .orderBy(asc(rescheduleLogs.createdAt), asc(rescheduleLogs.id));
 
-  // Rows that assert the appointment actually moved.
-  const moved = rows.filter(
-    (r) => r.success === true && r.oldConsularDate && r.newConsularDate && r.oldConsularDate !== r.newConsularDate,
-  );
-  if (moved.length === 0) return null;
-
-  // A later portal_reversion cancels the success it names in oldConsularDate.
-  const reverted = new Set(
-    rows
-      .filter((r) => r.success === false && typeof r.error === 'string' && r.error.startsWith('portal_reversion'))
-      .map((r) => `${r.oldConsularDate}->${r.newConsularDate}`),
-  );
-
-  const moves: Move[] = [];
-  let chainDate: string | null = null;
-
-  for (const r of moved) {
-    const from = r.oldConsularDate!;
-    const to = r.newConsularDate!;
-    const err = typeof r.error === 'string' ? r.error : '';
-
-    // Chain break: the appointment was somewhere else before this row's `old`.
-    if (chainDate && chainDate !== from) {
-      moves.push({
-        at: r.createdAt ? new Date(r.createdAt).toISOString() : '',
-        from: chainDate,
-        to: from,
-        days: daysEarlier(chainDate, from),
-        actor: 'external',
-        kind: 'chain_break',
-        suspect: false,
-        note: 'no bot log covers this move — changed outside the bot',
-        logId: null,
-      });
-    }
-
-    if (reverted.has(`${to}->${from}`)) {
-      chainDate = from;
-      continue; // the portal took it back; not a real move
-    }
-
-    // Mis-attribution risk: recovered-from-error rows are only trustworthy when the
-    // portal landed on the exact date the bot POSTed. Pre-fix rows did not check that.
-    const recovered = err.startsWith('[post_error_recovered]');
-    moves.push({
-      at: r.createdAt ? new Date(r.createdAt).toISOString() : '',
-      from,
-      to,
-      days: daysEarlier(from, to),
-      actor: 'bot',
-      kind: recovered ? 'post_error_recovered' : 'clean',
-      suspect: recovered,
-      note: recovered
-        ? 'POST errored; credited by re-read. Pre-fix rows may be an owner move.'
-        : err,
-      logId: r.id,
-    });
-    chainDate = to;
-  }
-
-  const botDays = moves.filter((m) => m.actor === 'bot').reduce((s, m) => s + m.days, 0);
-  const externalDays = moves.filter((m) => m.actor === 'external').reduce((s, m) => s + m.days, 0);
-  const suspectDays = moves.filter((m) => m.suspect).reduce((s, m) => s + m.days, 0);
-
-  return {
-    botId,
-    firstDate: moves[0]?.from ?? null,
-    lastDate: chainDate,
-    botDays,
-    externalDays,
-    suspectDays,
-    moves,
-  };
+  const summary = auditReschedules(rows);
+  if (summary.moves.length === 0) return null;
+  return { botId, ...summary };
 }
 
 async function main() {
@@ -170,15 +75,13 @@ async function main() {
         const when = m.at ? m.at.slice(0, 16).replace('T', ' ') : '      (gap)     ';
         console.log(`   ${tag} ${when}  ${m.from} → ${m.to}  ${String(m.days).padStart(4)}d  ${m.note}`);
       }
-      // Net = first known date → last known date. Days billed to the bot can never
-      // exceed this, whatever the per-move accounting says.
-      const net = a.firstDate && a.lastDate ? daysEarlier(a.firstDate, a.lastDate) : 0;
-      console.log(`   bot=${a.botDays}d  external=${a.externalDays}d  suspect=${a.suspectDays}d  net=${net}d`);
+      console.log(
+        `   bot=${a.botDays}d  external=${a.externalDays}d  suspect=${a.suspectDays}d  net=${a.netDays}d`,
+      );
       if (price > 0) {
-        const billable = Math.min(a.botDays - a.suspectDays, net);
         console.log(
-          `   billing: confirmed ${billable}d = $${(billable * price).toLocaleString('es-CO')}` +
-            (a.suspectDays > 0 ? `  (+${a.suspectDays}d suspect, review before charging; ceiling ${net}d)` : ''),
+          `   billing: confirmed ${a.billableDays}d = $${(a.billableDays * price).toLocaleString('es-CO')}` +
+            (a.suspectDays > 0 ? `  (+${a.suspectDays}d suspect, review before charging)` : ''),
         );
       }
     }
