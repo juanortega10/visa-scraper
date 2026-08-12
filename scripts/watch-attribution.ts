@@ -49,11 +49,17 @@ async function main() {
   const reversion = rows.filter((r) => err(r).startsWith('portal_reversion'));
   const success = rows.filter((r) => r.success === true);
 
+  // Health signal = ATTEMPTS, not successes. A success needs a cancellation to exist;
+  // over 14 days the median gap between successes is 1h but 30% of gaps exceed 3h
+  // (p90 8.5h, max 28.3h), so "no success" says nothing about the fleet being alive.
+  const threeHoursAgo = Date.now() - 3 * 3600000;
+  const attempts3h = rows.filter((r) => new Date(r.createdAt!).getTime() >= threeHoursAgo).length;
+
   const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ');
   console.log(
     `${stamp}Z  since=${from.toISOString().slice(0, 16)}  rows=${rows.length}  ` +
       `success=${success.length}  external_change=${external.length}  ` +
-      `recovered=${recovered.length}  reversion=${reversion.length}`,
+      `recovered=${recovered.length}  reversion=${reversion.length}  attempts3h=${attempts3h}`,
   );
 
   // Any recovered row must name the same date it landed on. The guard makes this
