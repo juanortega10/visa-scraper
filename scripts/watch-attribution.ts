@@ -35,13 +35,32 @@ function cutoff(): Date {
   return new Date(DEPLOYED_AT);
 }
 
+/** Neon's serverless driver talks over WebSockets and drops the socket every so often
+ *  (close code 1006). It throws an ErrorEvent, not an Error, so `withDbRetry` in
+ *  db/client.ts does not match it. A watch that reports every blip is a watch nobody
+ *  reads, so retry anything a few times before calling it a failure. */
+async function retry<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+  let last: unknown;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      if (i < attempts) await new Promise((r) => setTimeout(r, i * 1000));
+    }
+  }
+  throw last;
+}
+
 async function main() {
   const from = cutoff();
-  const rows = await db
-    .select()
-    .from(rescheduleLogs)
-    .where(gte(rescheduleLogs.createdAt, from))
-    .orderBy(desc(rescheduleLogs.createdAt));
+  const rows = await retry(() =>
+    db
+      .select()
+      .from(rescheduleLogs)
+      .where(gte(rescheduleLogs.createdAt, from))
+      .orderBy(desc(rescheduleLogs.createdAt)),
+  );
 
   const err = (r: (typeof rows)[number]) => (typeof r.error === 'string' ? r.error : '');
   const external = rows.filter((r) => err(r).startsWith('[external_change]'));
