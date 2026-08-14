@@ -48,7 +48,8 @@ export type ResultadoBatchDiario = {
 export async function correrBatchDiario(): Promise<ResultadoBatchDiario> {
   {
     const secret = process.env.CRON_SECRET;
-    const baseUrl = process.env.VISAGENTE_BASE_URL ?? 'https://visagente.com';
+    // Con `www`: el apex responde 307 hacia www y el header Authorization no sobrevive el salto.
+    const baseUrl = process.env.VISAGENTE_BASE_URL ?? 'https://www.visagente.com';
     if (!secret) {
       // Un reloj que no puede autenticarse no es "una corrida tranquila": es un reloj parado.
       // Se falla ruidosamente para que aparezca en Trigger.dev y no como silencio.
@@ -60,14 +61,27 @@ export async function correrBatchDiario(): Promise<ResultadoBatchDiario> {
     // no lleva el parámetro y queda como "manual", así que arreglar el lote a mano NO puede
     // tapar un reloj muerto en el verificador.
     const url = `${baseUrl}/api/cron/jobs?origen=trigger_diario`;
+    // `redirect: 'error'` a propósito. `visagente.com` responde 307 hacia `www.visagente.com`,
+    // y fetch NO reenvía el header Authorization en un salto entre hosts: la ruta contestaba
+    // 401 y el motivo real (la falta de `www`) no aparecía por ningún lado. Con esto el
+    // redirect revienta señalando la URL, en vez de disfrazarse de problema de credenciales.
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${secret}` },
+      redirect: 'error',
       signal: AbortSignal.timeout((MAX_DURATION_S - 30) * 1000),
+    }).catch((e) => {
+      throw new Error(
+        `no pude llamar a ${url}: ${String(e)}. Si es un redirect, apunta VISAGENTE_BASE_URL ` +
+          `al host definitivo (con www): el header Authorization no sobrevive el salto.`,
+      );
     });
 
     const bodyText = await res.text();
     if (!res.ok) {
-      throw new Error(`batch diario falló: HTTP ${res.status} ${bodyText.slice(0, 300)}`);
+      throw new Error(
+        `batch diario falló: HTTP ${res.status} ${bodyText.slice(0, 300)}` +
+          (res.status === 401 ? ' · revisa CRON_SECRET y que la URL no redirija.' : ''),
+      );
     }
 
     let data: Record<string, any>;

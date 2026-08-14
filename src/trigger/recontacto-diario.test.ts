@@ -91,8 +91,18 @@ describe('corrida sana', () => {
     await correrBatchDiario();
 
     const [url, opciones] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://visagente.com/api/cron/jobs?origen=trigger_diario');
+    expect(url).toBe('https://www.visagente.com/api/cron/jobs?origen=trigger_diario');
     expect(opciones.headers.Authorization).toBe('Bearer secreto-de-prueba');
+  });
+
+  it('usa el host con www y no sigue redirects', async () => {
+    await correrBatchDiario();
+    // `visagente.com` responde 307 hacia `www`, y fetch descarta el header Authorization en un
+    // salto entre hosts: la ruta contestaba 401 y el motivo no aparecía en ningún lado. Se
+    // comprobó contra producción el 14 de agosto de 2026.
+    const [url, opciones] = fetchMock.mock.calls[0] ?? [];
+    expect(String(url)).toMatch(/^https:\/\/www\./);
+    expect(opciones?.redirect).toBe('error');
   });
 
   it('devuelve el conteo de la reactivación', async () => {
