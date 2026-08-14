@@ -90,7 +90,7 @@ describe('corrida sana', () => {
   it('pega a la ruta con el secreto y el origen auditable', async () => {
     await correrBatchDiario();
 
-    const [url, opciones] = fetchMock.mock.calls[0];
+    const [url, opciones] = fetchMock.mock.calls[0]!;
     expect(url).toBe('https://www.visagente.com/api/cron/jobs?origen=trigger_diario');
     expect(opciones.headers.Authorization).toBe('Bearer secreto-de-prueba');
   });
@@ -117,7 +117,7 @@ describe('corrida sana', () => {
   it('respeta VISAGENTE_BASE_URL para poder apuntar a un preview', async () => {
     process.env.VISAGENTE_BASE_URL = 'https://preview.example.com';
     await correrBatchDiario();
-    expect(fetchMock.mock.calls[0][0]).toBe('https://preview.example.com/api/cron/jobs?origen=trigger_diario');
+    expect(fetchMock.mock.calls[0]![0]).toBe('https://preview.example.com/api/cron/jobs?origen=trigger_diario');
   });
 });
 
