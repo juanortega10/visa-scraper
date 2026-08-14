@@ -474,6 +474,12 @@ export const pollVisaTask = task({
     const sniperMode = isSniperActive(bot.sniperMode, bot.targetDateAfter, bot.targetDateBefore);
     const inSniperWindow = (d: string | null | undefined): boolean =>
       isWithinWindow(d, bot.targetDateAfter, bot.targetDateBefore);
+    // The sniper override (take ANY in-window date, even a later one) applies ONLY while the
+    // current appointment is still OUTSIDE the window. Once the appointment is inside it, the
+    // strictly-earlier rule returns: the bot only improves, it never trades an in-window date
+    // for a later in-window one.
+    // Evaluated at each use — bot.currentConsularDate changes in-memory during the batch loop.
+    const sniperFreeMove = (): boolean => sniperMode && !inSniperWindow(bot.currentConsularDate);
 
     let capturedConnInfo: LogPollExtra['connectionInfo'] = null;
     try {
@@ -708,7 +714,7 @@ export const pollVisaTask = task({
           previousDates = new Set(allDays.map(d => d.date));
           logger.info('Super-critical fetch 1 result', { botId, total: allDays.length, afterFilter: days.length, earliest: firstEarliest });
 
-          if (firstEarliest && isActionableDate(firstEarliest, bot.currentConsularDate, sniperMode)) {
+          if (firstEarliest && isActionableDate(firstEarliest, bot.currentConsularDate, sniperFreeMove())) {
             foundImprovement = true;
           }
 
@@ -843,7 +849,7 @@ export const pollVisaTask = task({
 
             if (allDays.length > 0) runRawDatesCount = allDays.length;
 
-            if (fetchEarliest && isActionableDate(fetchEarliest, bot.currentConsularDate, sniperMode)) {
+            if (fetchEarliest && isActionableDate(fetchEarliest, bot.currentConsularDate, sniperFreeMove())) {
               foundImprovement = true;
             }
           }
@@ -887,7 +893,7 @@ export const pollVisaTask = task({
               }).catch(e => logger.error('bookable_event insert failed', { error: String(e) }))
             );
           }
-        } else if (earliest && isActionableDate(earliest, bot.currentConsularDate, sniperMode)) {
+        } else if (earliest && isActionableDate(earliest, bot.currentConsularDate, sniperFreeMove())) {
           const isInitialBooking = bot.currentConsularDate === null;
           const RESCHEDULE_DEDUP_MS = 3 * 60 * 1000;
           const [recentReschedule] = await db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
@@ -1014,7 +1020,9 @@ export const pollVisaTask = task({
           // If all candidates were blocked, no point calling executeReschedule — skip silently.
           // For initial booking (currentConsularDate=null), any unblocked date is a valid candidate.
           const effectiveEarliest = daysForReschedule.find(
-            d => sniperMode ? inSniperWindow(d.date) : (bot.currentConsularDate === null || isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1)),
+            d => sniperFreeMove()
+              ? inSniperWindow(d.date)
+              : (bot.currentConsularDate === null || isAtLeastNDaysEarlier(d.date, bot.currentConsularDate, 1)),
           )?.date;
           if (!effectiveEarliest) {
             logger.info('All earlier dates blocked — skipping reschedule', {
