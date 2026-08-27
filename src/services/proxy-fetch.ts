@@ -104,7 +104,10 @@ export async function getEffectiveWebshareUrls(): Promise<string[]> {
       dynamicWebshareLoadedAt = Date.now();
       writeWebshareFileCache(urls, dynamicWebshareLoadedAt);
       console.info(`[proxy-fetch] Loaded ${urls.length} valid webshare IPs from API`);
-      await warmupProbeAllIps(urls);
+      // Sin await: el warmup tarda ~1,9 s y bloqueaba al poll desafortunado que
+      // encuentra la cache vencida (medido 3,3 s con la llamada a la API incluida).
+      // El pool funciona sin el; el warmup solo mejora los pesos iniciales.
+      void warmupProbeAllIps(urls).catch(() => { /* el pool arranca sin pesos */ });
     } catch (err) {
       if (dynamicWebshareUrls) {
         // API error but cache is warm — keep using it
@@ -195,7 +198,13 @@ export function deriveBlockClassification(meta: Pick<ProxyFetchMeta, 'socketByte
  * Uses direct fetch (no proxy) so the result is IP-independent of the bot's provider.
  * Times out quickly (5s) to not delay the poll chain.
  */
+const scheduleProbeCache = new Map<string, { verdict: 'schedule_blocked' | 'account_ban'; at: number }>();
+/** Ventana de reuso del veredicto. Un bloqueo del portal no cambia en segundos. */
+const SCHEDULE_PROBE_TTL_MS = 5 * 60_000;
+
 export async function probeScheduleBlock(locale: string = 'es-co'): Promise<'schedule_blocked' | 'account_ban'> {
+  const cached = scheduleProbeCache.get(locale);
+  if (cached && Date.now() - cached.at < SCHEDULE_PROBE_TTL_MS) return cached.verdict;
   const probeUrl = `https://ais.usvisa-info.com/${locale}/niv/users/sign_in`;
   try {
     const r = await fetch(probeUrl, {
@@ -205,9 +214,11 @@ export async function probeScheduleBlock(locale: string = 'es-co'): Promise<'sch
     });
     // Any HTTP response (200, 302, 403, 404) means the domain is reachable → schedule path blocked
     void r.body?.cancel();
+    scheduleProbeCache.set(locale, { verdict: 'schedule_blocked', at: Date.now() });
     return 'schedule_blocked';
   } catch {
     // Domain itself is unreachable → true account/IP ban
+    scheduleProbeCache.set(locale, { verdict: 'account_ban', at: Date.now() });
     return 'account_ban';
   }
 }
@@ -571,6 +582,9 @@ function getDirectAgent(): Agent {
       connections: 10,
       connectTimeout: 10_000,
       headersTimeout: 12_000,
+      // Sin esto, undici deja `bodyTimeout` en 300 s: una respuesta que manda
+      // cabeceras y se cuelga en el cuerpo bloquea el run 5 minutos.
+      bodyTimeout: 30_000,
     });
   }
   return sharedDirectAgent;
@@ -592,17 +606,61 @@ function getBrightDataAgent(): ProxyAgent {
 // Per-bot Webshare agents: cache ProxyAgent instances by URL to reuse TCP connections.
 const perBotAgentCache = new Map<string, ProxyAgent>();
 
-function getNextWebshareAgentFromUrls(urls: string[]): { agent: ProxyAgent | Agent; ip: string } {
+/**
+ * IP pegajosa por clave de llamador (tipicamente un run de un bot).
+ *
+ * Sin esto, `proxyFetch` elegia una IP nueva en CADA peticion. El camino critico
+ * hace 4 o 5 peticiones seguidas, entonces cada una abria un tunel CONNECT frio:
+ * 823 ms p50 contra 105 ms con la conexion viva. Ademas la cookie `_yatri_session`
+ * salia desde 5 IPs distintas en 3 segundos, que es una huella de bot.
+ *
+ * Se suelta sola al vencer el TTL, y se borra en cuanto la IP falla.
+ */
+const stickyIps = new Map<string, { url: string; ip: string; at: number }>();
+const STICKY_TTL_MS = 90_000;
+
+function dropSticky(key: string | undefined) {
+  if (key) stickyIps.delete(key);
+}
+
+function getNextWebshareAgentFromUrls(urls: string[], stickyKey?: string): { agent: ProxyAgent | Agent; ip: string } {
+  if (stickyKey) {
+    const pegada = stickyIps.get(stickyKey);
+    if (pegada && Date.now() - pegada.at < STICKY_TTL_MS && urls.includes(pegada.url)) {
+      const cached = perBotAgentCache.get(pegada.url);
+      if (cached) return { agent: cached, ip: pegada.ip };
+    }
+    if (pegada) stickyIps.delete(stickyKey);
+  }
+  const elegida = pickWebshareAgent(urls);
+  if (stickyKey && elegida.url !== 'direct') {
+    stickyIps.set(stickyKey, { url: elegida.url, ip: elegida.ip, at: Date.now() });
+  }
+  return { agent: elegida.agent, ip: elegida.ip };
+}
+
+function pickWebshareAgent(urls: string[]): { agent: ProxyAgent | Agent; ip: string; url: string } {
   const { url, ip } = proxyPool.selectUrl(urls);
   if (url === 'direct') {
-    return { agent: getDirectAgent(), ip: 'direct' };
+    return { agent: getDirectAgent(), ip: 'direct', url: 'direct' };
   }
   let agent = perBotAgentCache.get(url);
   if (!agent) {
-    agent = new ProxyAgent({ uri: url, connectTimeout: 10_000, headersTimeout: 12_000 });
+    // Sin `keepAliveTimeout` explicito, undici usa 4000 ms. Cualquier hueco mayor
+    // a 4 s reabre el tunel CONNECT y cuesta 260-310 ms extra (medido: 90 ms con
+    // conexion viva contra 348-460 ms tras 6 s ocioso). El camino critico hace 4 o 5
+    // peticiones seguidas, entonces esto se paga varias veces por cupo.
+    agent = new ProxyAgent({
+      uri: url,
+      connectTimeout: 10_000,
+      headersTimeout: 12_000,
+      bodyTimeout: 30_000,
+      keepAliveTimeout: 60_000,
+      keepAliveMaxTimeout: 120_000,
+    });
     perBotAgentCache.set(url, agent);
   }
-  return { agent, ip };
+  return { agent, ip, url };
 }
 
 export async function proxyFetch(
@@ -610,6 +668,8 @@ export async function proxyFetch(
   options: RequestInit,
   provider: ProxyProvider = 'direct',
   proxyUrls?: string[] | null,
+  /** Clave para fijar la IP entre peticiones del mismo run. Ver `stickyIps`. */
+  stickyKey?: string,
 ): Promise<{ response: Response; meta: ProxyFetchMeta }> {
   const meta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null, tcpSubcategory: null, poolExhausted: false, socketBytesRead: null };
 
@@ -655,7 +715,7 @@ export async function proxyFetch(
         };
       }
 
-      const { agent, ip: selectedIp } = getNextWebshareAgentFromUrls(effectiveUrls);
+      const { agent, ip: selectedIp } = getNextWebshareAgentFromUrls(effectiveUrls, stickyKey);
 
       const TCP_RE = /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|other side closed|HTTP Tunneling/i;
       const CODE_RE = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|socket hang up|other side closed/i;
@@ -692,7 +752,10 @@ export async function proxyFetch(
           if (attempt < WEBSHARE_MAX_RETRIES) {
             // Rotate to next IP (circuit breaker already penalized the failed one)
             console.warn(`[proxy-fetch] ${sourceTag} ${attemptIp} failed (${latencyMs}ms), rotating`);
-            ({ agent: attemptAgent, ip: attemptIp } = getNextWebshareAgentFromUrls(effectiveUrls));
+            // La IP pegada fallo: se suelta para que la siguiente eleccion rote
+            // de verdad y no se quede clavada en una IP rota.
+            dropSticky(stickyKey);
+            ({ agent: attemptAgent, ip: attemptIp } = getNextWebshareAgentFromUrls(effectiveUrls, stickyKey));
             continue;
           }
 

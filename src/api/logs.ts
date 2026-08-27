@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { bots, pollLogs, rescheduleLogs, casPrefetchLogs, bookableEvents, dateSightings, banEpisodes } from '../db/schema.js';
-import { eq, desc, and, gte, lte, sql, isNotNull, or } from 'drizzle-orm';
+import { eq, desc, asc, and, gte, lte, sql, isNotNull, or } from 'drizzle-orm';
+import { auditReschedules } from '../services/reschedule-attribution.js';
 
 export const logsRouter = new Hono();
 
@@ -680,6 +681,32 @@ logsRouter.get('/bots/:id/logs/reschedules', async (c) => {
     .offset(offset);
 
   return c.json(logs);
+});
+
+// Billing view for the cobros tab. Replays the FULL reschedule chain (all rows, not
+// just successes — portal_reversion rows are needed to cancel reverted moves) and
+// splits it into what the bot actually produced and what changed outside it.
+//
+// `success = true` alone is not proof of authorship: see
+// src/services/reschedule-attribution.ts and the bot 266 incident in CLAUDE.md.
+logsRouter.get('/bots/:id/billing', async (c) => {
+  const botId = parseInt(c.req.param('id'));
+  if (isNaN(botId)) return c.json({ error: 'Invalid bot ID' }, 400);
+
+  const rows = await db
+    .select({
+      id: rescheduleLogs.id,
+      createdAt: rescheduleLogs.createdAt,
+      oldConsularDate: rescheduleLogs.oldConsularDate,
+      newConsularDate: rescheduleLogs.newConsularDate,
+      success: rescheduleLogs.success,
+      error: rescheduleLogs.error,
+    })
+    .from(rescheduleLogs)
+    .where(eq(rescheduleLogs.botId, botId))
+    .orderBy(asc(rescheduleLogs.createdAt));
+
+  return c.json(auditReschedules(rows));
 });
 
 // ── Ban Status ────────────────────────────────────────────

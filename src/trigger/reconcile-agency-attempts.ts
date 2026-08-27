@@ -3,8 +3,7 @@ import { and, eq, isNotNull, lt, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { botCredentialAttempts } from '../db/schema.js';
 import { processAgencyDue } from '../services/agency-batch.js';
-
-const MAX_TOTAL_ATTEMPTS = 4; // D26: 1 + 3 retries
+import { MAX_TOTAL_ATTEMPTS } from '../utils/constants.js';
 
 /**
  * The RELIABLE processor (D34). Runs every 2 min on the RPi (DEVELOPMENT — the worker

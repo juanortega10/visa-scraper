@@ -5,6 +5,8 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { bots } from '../db/schema.js';
 import { sendWhatsAppText } from '../services/whatsapp-send.js';
+import { sniperPageRouter } from './sniper-page.js';
+import { peruPageRouter } from './peru-page.js';
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 const COOKIE_SECRET = process.env.COOKIE_SECRET;
@@ -80,6 +82,10 @@ dashboardRouter.post('/api/cobro-wa', async (c) => {
 });
 
 dashboardRouter.get('/', (c) => c.html(renderLanding()));
+
+// Pagina del dual sniper. DEBE ir antes de /:botId, que captura cualquier string.
+dashboardRouter.route('/sniper', sniperPageRouter);
+dashboardRouter.route('/peru', peruPageRouter);
 
 dashboardRouter.get('/:botId', async (c) => {
   const raw = c.req.param('botId');
@@ -1595,6 +1601,21 @@ td{padding:4px 3px;border-bottom:1px solid var(--border);white-space:nowrap}
   padding:10px 12px;border-top:1px solid var(--border);margin-top:4px}
 .cobro-total-lbl{font-size:10px;color:var(--muted)}
 .cobro-total-val{font-size:16px;font-weight:800;color:var(--green)}
+/* Atribucion: quien movio la cita */
+.cobro-attr{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;font-size:9px}
+.cobro-attr span{padding:2px 7px;border-radius:4px;font-weight:700}
+.cobro-attr-ok{color:#4ADE80;background:rgba(74,222,128,.08)}
+.cobro-attr-ext{color:#94A3B8;background:rgba(148,163,184,.1)}
+.cobro-attr-sus{color:#FBBF24;background:rgba(251,191,36,.1)}
+.cobro-attr-net{color:var(--dim);background:rgba(255,255,255,.03)}
+.cobro-item.cobro-ext{opacity:.55;cursor:default}
+.cobro-item.cobro-ext:hover{border-color:rgba(255,255,255,.06)}
+.cobro-item.cobro-sus{border-color:rgba(251,191,36,.25)}
+.cobro-cb-off{width:14px;height:14px;flex-shrink:0;text-align:center;color:var(--dim);font-size:10px}
+.cobro-badge{margin-left:6px;padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.03em}
+.cobro-badge-ext{color:#94A3B8;background:rgba(148,163,184,.12)}
+.cobro-badge-sus{color:#FBBF24;background:rgba(251,191,36,.12)}
 .cobro-detail{font-size:9px;color:var(--dim);margin-top:2px}
 .cobro-actions{display:flex;gap:8px;margin-top:12px;align-items:stretch}
 .cobro-wa-btn{display:flex;align-items:center;gap:6px;padding:8px 14px;
@@ -2229,7 +2250,7 @@ async function refresh(){
         fetchJ(API+'/bots/'+BID+'/logs/date-sightings?hours=24'),
         fetchJ(API+'/bots/'+BID+'/logs/bookable-events?hours=168'),
         fetchJ(API+'/bots/'+BID+'/logs/date-history'),
-        fetchJ(API+'/bots/'+BID+'/logs/reschedules?successOnly=true'),
+        fetchJ(API+'/bots/'+BID+'/billing'),
       ]);
       rss=slowRes[0];casLogs=slowRes[1];summary=slowRes[2];cancelServer=slowRes[3];beRows=slowRes[4];
       var dhRes=slowRes[5];
@@ -2416,6 +2437,8 @@ async function refresh(){
     var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">restricciones: </span>';
     if(_minDays>0)eh+='<span style="background:rgba(96,165,250,.1);color:var(--accent);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">&#9654; no antes: '+fmtDs(minDateStr)+'</span>';
     if(bot.maxCasGapDays!=null)eh+='<span style="background:rgba(74,222,128,.1);color:var(--green);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">gap CAS &#8804; '+bot.maxCasGapDays+'d</span>';
+    var exWd=bot.excludedWeekdays||[];
+    if(exWd.length){var DOW=['dom','lun','mar','mie','jue','vie','sab'];eh+='<span style="background:rgba(248,113,113,.1);color:var(--red);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">sin '+exWd.map(function(w){return DOW[w];}).join('/')+'</span>';}
     var excls=bot.excludedDateRanges||[];
     var actEx=excls.filter(function(e){return e.endDate>=today3;});
     for(var ei=0;ei<Math.min(actEx.length,3);ei++){
@@ -4527,20 +4550,20 @@ function getCobroCfg(){
   };
 }
 
-function cobroDays(oldD,newD){
-  return Math.round((new Date(oldD).getTime()-new Date(newD).getTime())/864e5);
-}
-
 function fmtMoney(n){return n.toLocaleString('es-CO')}
 
+/* Cobros se alimenta de /bots/:id/billing, que reproduce la cadena completa de citas
+   (src/services/reschedule-attribution.ts). NO usar reschedule_logs.success directo:
+   una fila con success=true puede ser un movimiento manual del dueno. Ver el incidente
+   del bot 266 en CLAUDE.md. */
 function renderCobros(){
   var el=document.getElementById('cobrosContent');
   if(!lastCobrosRss||!lastBot){el.innerHTML='<div class="cobro-empty">cargando...</div>';return;}
 
-  var okRss=lastCobrosRss.filter(function(r){return r.oldConsularDate&&r.newConsularDate});
-  if(!okRss.length){el.innerHTML='<div class="cobro-empty">sin reagendamientos exitosos</div>';return;}
+  var bill=lastCobrosRss;
+  var moves=(bill.moves||[]).filter(function(m){return m.from&&m.to});
+  if(!moves.length){el.innerHTML='<div class="cobro-empty">sin reagendamientos exitosos</div>';return;}
 
-  okRss.sort(function(a,b){return new Date(a.createdAt)-new Date(b.createdAt)});
   var cfg=getCobroCfg();
   var nPersonas=(lastBot.applicantIds||[]).length||1;
   var tariff=cfg.base+(cfg.extra*(nPersonas-1));
@@ -4555,18 +4578,33 @@ function renderCobros(){
   html+='<span style="font-size:9px;color:var(--dim)">'+nPersonas+'p \\u00d7 $'+fmtMoney(tariff)+'/d</span>';
   html+='</div>';
 
-  /* Reschedule list */
+  /* Resumen de atribucion */
+  html+='<div class="cobro-attr">';
+  html+='<span class="cobro-attr-ok">'+bill.billableDays+'d cobrables</span>';
+  if(bill.externalDays>0)html+='<span class="cobro-attr-ext">'+bill.externalDays+'d del cliente</span>';
+  if(bill.suspectDays>0)html+='<span class="cobro-attr-sus">'+bill.suspectDays+'d por verificar</span>';
+  html+='<span class="cobro-attr-net">neto '+bill.netDays+'d</span>';
+  html+='</div>';
+
+  /* Lista de movimientos */
   html+='<div class="cobro-list">';
-  okRss.forEach(function(r,i){
-    var days=cobroDays(r.oldConsularDate,r.newConsularDate);
-    var sub=days*tariff;
-    html+='<label class="cobro-item" id="ci'+i+'">';
-    html+='<input type="checkbox" class="cobro-cb" data-idx="'+i+'" onchange="updateCobros()">';
-    html+='<span class="cobro-dates"><span class="cobro-old">'+fmtDs(r.oldConsularDate)+'</span>';
+  moves.forEach(function(m,i){
+    var sub=m.days*tariff;
+    var cls='cobro-item'+(m.actor==='external'?' cobro-ext':'')+(m.suspect?' cobro-sus':'');
+    html+='<label class="'+cls+'" id="ci'+i+'">';
+    if(m.actor==='external'){
+      html+='<span class="cobro-cb-off" title="'+m.note+'">\\u2014</span>';
+    }else{
+      html+='<input type="checkbox" class="cobro-cb" data-idx="'+i+'"'+(m.suspect?' data-suspect="1"':'')+' onchange="updateCobros()">';
+    }
+    html+='<span class="cobro-dates"><span class="cobro-old">'+fmtDs(m.from)+'</span>';
     html+='<span class="cobro-arrow"> \\u2192 </span>';
-    html+='<span class="cobro-new">'+fmtDs(r.newConsularDate)+'</span></span>';
-    html+='<span class="cobro-days">-'+days+'d</span>';
-    html+='<span class="cobro-sub">$'+fmtMoney(sub)+'</span>';
+    html+='<span class="cobro-new">'+fmtDs(m.to)+'</span>';
+    if(m.actor==='external')html+='<span class="cobro-badge cobro-badge-ext">manual</span>';
+    else if(m.suspect)html+='<span class="cobro-badge cobro-badge-sus">verificar</span>';
+    html+='</span>';
+    html+='<span class="cobro-days">'+(m.days<0?'+'+(-m.days):'-'+m.days)+'d</span>';
+    html+='<span class="cobro-sub">'+(m.actor==='external'?'\\u2014':'$'+fmtMoney(sub))+'</span>';
     html+='</label>';
   });
   html+='</div>';
@@ -4590,7 +4628,8 @@ function renderCobros(){
   }
 
   el.innerHTML=html;
-  window._cobroRss=okRss;
+  window._cobroRss=moves;
+  window._cobroBill=bill;
 }
 
 function saveCoboCfg(){
@@ -4606,15 +4645,15 @@ function updateCobros(){
   var nPersonas=(lastBot.applicantIds||[]).length||1;
   var tariff=cfg.base+(cfg.extra*(nPersonas-1));
   var checks=document.querySelectorAll('.cobro-cb');
-  var totalDays=0,totalMoney=0,selected=[];
+  var totalDays=0,totalMoney=0,selected=[],nSuspect=0;
   checks.forEach(function(cb){
     var idx=parseInt(cb.dataset.idx);
     var r=window._cobroRss[idx];
     var item=document.getElementById('ci'+idx);
     if(cb.checked){
       item.classList.add('checked');
-      var d=cobroDays(r.oldConsularDate,r.newConsularDate);
-      totalDays+=d;totalMoney+=d*tariff;
+      totalDays+=r.days;totalMoney+=r.days*tariff;
+      if(r.suspect)nSuspect++;
       selected.push(r);
     }else{
       item.classList.remove('checked');
@@ -4623,7 +4662,13 @@ function updateCobros(){
   document.getElementById('cobroTotal').textContent='$'+fmtMoney(totalMoney);
   var det=document.getElementById('cobroDetail');
   if(selected.length>0){
-    det.textContent=nPersonas+' persona'+(nPersonas>1?'s':'')+' \\u00d7 $'+fmtMoney(tariff)+'/d \\u00d7 '+totalDays+'d = $'+fmtMoney(totalMoney)+' '+cfg.currency;
+    var txt=nPersonas+' persona'+(nPersonas>1?'s':'')+' \\u00d7 $'+fmtMoney(tariff)+'/d \\u00d7 '+totalDays+'d = $'+fmtMoney(totalMoney)+' '+cfg.currency;
+    /* Dos frenos contra el sobrecobro: filas sin autoria probada, y el techo neto. */
+    var bill=window._cobroBill||{};
+    if(nSuspect>0)txt+=' \\u2014 \\u26a0 incluye '+nSuspect+' movimiento'+(nSuspect>1?'s':'')+' sin autoria probada';
+    if(typeof bill.billableDays==='number'&&totalDays>bill.billableDays)
+      txt+=' \\u2014 \\u26a0 '+totalDays+'d supera los '+bill.billableDays+'d cobrables';
+    det.textContent=txt;
   }else{det.textContent='';}
 
   var preview=document.getElementById('cobroPreview');
@@ -4640,8 +4685,8 @@ function updateCobros(){
 function generateCobroMsg(bot,selected,tariff,currency,nPersonas,totalDays,totalMoney){
   var ownerName='';
   if(bot.ownerEmail){var p=bot.ownerEmail.split('@')[0];ownerName=p.charAt(0).toUpperCase()+p.slice(1);}
-  var oldest=selected[0].oldConsularDate;
-  var newest=selected[selected.length-1].newConsularDate;
+  var oldest=selected[0].from;
+  var newest=selected[selected.length-1].to;
   var msg='Hola '+ownerName+' \\ud83d\\udc4b\\n\\n';
   msg+='Tu cita de visa se adelant\\u00f3:\\n\\n';
   msg+='\\ud83d\\udcc5 '+fmtDs(oldest)+' \\u2192 '+fmtDs(newest)+'\\n';

@@ -31,6 +31,7 @@ export interface CurrentAppointment {
   consularTime: string;       // HH:MM
   casDate: string | null;     // YYYY-MM-DD (null for embassies without CAS, e.g. Peru)
   casTime: string | null;     // HH:MM
+  applicantNames: string[];   // full names from the same groups page (may be empty)
 }
 
 export interface VisaClientConfig {
@@ -39,6 +40,17 @@ export interface VisaClientConfig {
   consularFacilityId: string;
   ascFacilityId: string;
   proxyProvider: ProxyProvider;
+  /**
+   * Proveedor para el POST de reschedule y para `refreshTokens()`.
+   *
+   * Por defecto `'direct'`, que es el comportamiento historico de toda la flota. Existe
+   * porque `doDirectFetch` estaba fijo en `'direct'`: cuando la IP directa del host queda
+   * TCP-bloqueada por el portal, los GET JSON siguen saliendo por el proxy y el POST falla,
+   * entonces el bot ve cupos y no puede tomarlos.
+   *
+   * Bright Data devuelve 402 en POST, entonces solo `'direct'` y `'webshare'` sirven aqui.
+   */
+  postProvider?: ProxyProvider;
   proxyUrls?: string[] | null;
   userId?: string | null;
   locale?: string;
@@ -55,6 +67,12 @@ export class VisaClient {
   private collectsBiometrics: boolean | null = null;  // from data-collects-biometrics attr
   private hasAscFields: boolean | null = null;         // whether ASC form fields exist in HTML
   private capturedPages = new Map<string, string>();
+  /**
+   * Clave para fijar la IP de webshare durante toda la vida de este cliente.
+   * Un cliente = un run de un bot, entonces todas las peticiones del camino
+   * critico salen por la misma IP: sin tuneles frios y con una sola huella.
+   */
+  private readonly stickyKey = `vc-${Math.random().toString(36).slice(2)}-${Date.now()}`;
   private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null, tcpSubcategory: null, poolExhausted: false, socketBytesRead: null };
 
   constructor(session: VisaSession, config: VisaClientConfig) {
@@ -133,7 +151,7 @@ export class VisaClient {
 
   private async doFetch(url: string, options: RequestInit = {}): Promise<Response> {
     try {
-      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls);
+      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
       this.lastProxyMeta = meta;
       this.updateCookieFromResponse(response);
       return response;
@@ -144,14 +162,27 @@ export class VisaClient {
     }
   }
 
-  /** Wraps doFetch with retry on 5xx errors (2 retries, 300ms/600ms backoff). */
-  private async fetchWithRetry(url: string, options: RequestInit, label: string): Promise<Response> {
-    const RETRIES = 2;
-    const BACKOFF = [300, 600];
+  /**
+   * `doFetch` con reintento ante 5xx.
+   *
+   * Dos perfiles, porque no todas las peticiones corren contra un reloj:
+   *   normal  2 reintentos con 300 y 600 ms. Para el polling, donde esperar sale
+   *           mas barato que perder el dato.
+   *   carrera 1 reintento con 50 ms. Para `times.json` cuando ya vimos un cupo:
+   *           el cupo dura segundos y 900 ms de sueño llegan tarde igual.
+   */
+  private async fetchWithRetry(
+    url: string,
+    options: RequestInit,
+    label: string,
+    perfil: 'normal' | 'carrera' = 'normal',
+  ): Promise<Response> {
+    const BACKOFF = perfil === 'carrera' ? [50] : [300, 600];
+    const RETRIES = BACKOFF.length;
     for (let attempt = 0; ; attempt++) {
       const resp = await this.doFetch(url, options);
       if (resp.status < 500 || attempt >= RETRIES) return resp;
-      // Consume body to release connection
+      // Se consume el cuerpo para liberar la conexion
       await resp.text().catch(() => {});
       await new Promise((r) => setTimeout(r, BACKOFF[attempt]!));
     }
@@ -159,7 +190,12 @@ export class VisaClient {
 
   /** Always uses direct fetch — Bright Data proxy returns 402 on POST to gov sites */
   private async doDirectFetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const { response, meta } = await proxyFetch(url, options, 'direct');
+    const provider = this.config.postProvider ?? 'direct';
+    const { response, meta } = await proxyFetch(
+      url, options, provider,
+      provider === 'direct' ? undefined : this.config.proxyUrls,
+      this.stickyKey,
+    );
     this.lastProxyMeta = meta;
     this.updateCookieFromResponse(response);
     return response;
@@ -209,8 +245,16 @@ export class VisaClient {
     if (this.texts.includeCommit) refreshParts.push(`commit=${this.texts.continueText}`);
     const url = `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment?${refreshParts.join('&')}`;
 
-    // Must use direct — Firecrawl strips form elements (no authenticity_token)
-    const resp = await this.doDirectFetch(url, {
+    // La restriccion real es NO usar Firecrawl, que borra los elementos del
+    // formulario y deja la pagina sin `authenticity_token`. Cualquier otra ruta
+    // sirve: esto es un GET. La regla "solo directo" de `doDirectFetch` existe
+    // para los POST, donde Bright Data devuelve 402.
+    //
+    // Antes esto salia solo por la ruta directa y sin respaldo. Cuando esa ruta
+    // se cuelga, agota el `headersTimeout` de 12 s del agente directo
+    // (`proxy-fetch.ts:573`) DENTRO del camino critico, justo cuando corre el
+    // reloj del cupo. Medido el 2026-08-27: 12.294 ms identicos en dos bots.
+    const opciones = {
       headers: {
         Cookie: `_yatri_session=${this.session.cookie}`,
         'User-Agent': USER_AGENT,
@@ -218,8 +262,21 @@ export class VisaClient {
         'Upgrade-Insecure-Requests': '1',
         ...BROWSER_HEADERS,
       },
-      redirect: 'manual',
-    });
+      redirect: 'manual' as const,
+    };
+    const puedeCaerAlProxy = this.config.proxyProvider !== 'direct'
+      && this.config.proxyProvider !== 'firecrawl';
+
+    let resp: Response;
+    try {
+      resp = await this.doDirectFetch(url, opciones);
+    } catch (err) {
+      if (!puedeCaerAlProxy) throw err;
+      const { response, meta } = await proxyFetch(url, opciones, this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
+      this.lastProxyMeta = meta;
+      this.updateCookieFromResponse(response);
+      resp = response;
+    }
 
     this.assertOk(resp, 'Appointment page');
 
@@ -259,7 +316,8 @@ export class VisaClient {
   async getCurrentAppointment(): Promise<CurrentAppointment | null> {
     if (!this.userId) return null;
 
-    const resp = await this.doDirectFetch(`${this.baseUrl}/groups/${this.userId}`, {
+    const url = `${this.baseUrl}/groups/${this.userId}`;
+    const options: RequestInit = {
       headers: {
         Cookie: `_yatri_session=${this.session.cookie}`,
         'User-Agent': USER_AGENT,
@@ -268,7 +326,23 @@ export class VisaClient {
         ...BROWSER_HEADERS,
       },
       redirect: 'manual',
-    });
+    };
+
+    // Direct first, then the bot's own provider. On the RPi the residential IP is
+    // blocked for this HTML page (ECONNREFUSED / connection_reset) even while the
+    // JSON polling endpoints work, which silently killed the appointment sync for
+    // every dev-polled bot. This is a GET, so any provider is fine (the direct-only
+    // rule in doDirectFetch exists for POSTs, where Bright Data returns 402).
+    let resp: Response;
+    try {
+      resp = await this.doDirectFetch(url, options);
+    } catch (err) {
+      if (this.config.proxyProvider === 'direct') throw err;
+      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
+      this.lastProxyMeta = meta;
+      this.updateCookieFromResponse(response);
+      resp = response;
+    }
 
     if (resp.status !== 200) return null;
 
@@ -284,6 +358,7 @@ export class VisaClient {
       consularTime: myGroup.currentConsularTime,
       casDate: myGroup.currentCasDate,
       casTime: myGroup.currentCasTime,
+      applicantNames: myGroup.applicantNames.filter(Boolean),
     };
   }
 
@@ -306,6 +381,7 @@ export class VisaClient {
       `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/times/${this.config.consularFacilityId}.json?date=${date}&appointments[expedite]=false`,
       { headers: this.ajaxHeaders() },
       'Consular times',
+      'carrera',   // ya vimos el cupo: aqui cada 100 ms cuenta
     );
     this.assertOk(resp, 'Consular times');
     return this.safeJson<TimeSlots>(resp, 'Consular times');
@@ -331,7 +407,7 @@ export class VisaClient {
       url += `&consulate_id=${this.config.consularFacilityId}&consulate_date=${consularDate}&consulate_time=${consularTime}`;
     }
     url += '&appointments[expedite]=false';
-    const resp = await this.fetchWithRetry(url, { headers: this.ajaxHeaders() }, 'CAS times');
+    const resp = await this.fetchWithRetry(url, { headers: this.ajaxHeaders() }, 'CAS times', 'carrera');
     this.assertOk(resp, 'CAS times');
     return this.safeJson<TimeSlots>(resp, 'CAS times');
   }

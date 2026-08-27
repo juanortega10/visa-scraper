@@ -29,7 +29,7 @@ vi.mock('../../db/client.js', () => ({
 }));
 
 vi.mock('../../db/schema.js', () => ({
-  bots: { _name: 'bots', id: 'bots.id', currentConsularDate: 'bots.currentConsularDate', rescheduleCount: 'bots.rescheduleCount' },
+  bots: { _name: 'bots', id: 'bots.id', currentConsularDate: 'bots.currentConsularDate', rescheduleCount: 'bots.rescheduleCount', portalRemainingReschedules: 'bots.portalRemainingReschedules' },
   sessions: { _name: 'sessions', botId: 'sessions.botId' },
   rescheduleLogs: { _name: 'rescheduleLogs' },
 }));
@@ -39,6 +39,7 @@ vi.mock('drizzle-orm', () => ({
   sql: (strings: TemplateStringsArray, ...vals: any[]) => `sql:${strings.join('')}`,
   or: (...args: any[]) => ({ _op: 'or', args }),
   lt: (...args: any[]) => ({ _op: 'lt', args }),
+  gt: (...args: any[]) => ({ _op: 'gt', args }),
   isNull: (...args: any[]) => ({ _op: 'isNull', args }),
   and: (...args: any[]) => ({ _op: 'and', args }),
 }));
