@@ -5,6 +5,8 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { bots } from '../db/schema.js';
 import { sendWhatsAppText } from '../services/whatsapp-send.js';
+import { sniperPageRouter } from './sniper-page.js';
+import { peruPageRouter } from './peru-page.js';
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 const COOKIE_SECRET = process.env.COOKIE_SECRET;
@@ -80,6 +82,10 @@ dashboardRouter.post('/api/cobro-wa', async (c) => {
 });
 
 dashboardRouter.get('/', (c) => c.html(renderLanding()));
+
+// Pagina del dual sniper. DEBE ir antes de /:botId, que captura cualquier string.
+dashboardRouter.route('/sniper', sniperPageRouter);
+dashboardRouter.route('/peru', peruPageRouter);
 
 dashboardRouter.get('/:botId', async (c) => {
   const raw = c.req.param('botId');
@@ -2431,6 +2437,8 @@ async function refresh(){
     var eh='<span style="color:var(--dim);font-size:8px;text-transform:uppercase;letter-spacing:.5px">restricciones: </span>';
     if(_minDays>0)eh+='<span style="background:rgba(96,165,250,.1);color:var(--accent);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">&#9654; no antes: '+fmtDs(minDateStr)+'</span>';
     if(bot.maxCasGapDays!=null)eh+='<span style="background:rgba(74,222,128,.1);color:var(--green);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">gap CAS &#8804; '+bot.maxCasGapDays+'d</span>';
+    var exWd=bot.excludedWeekdays||[];
+    if(exWd.length){var DOW=['dom','lun','mar','mie','jue','vie','sab'];eh+='<span style="background:rgba(248,113,113,.1);color:var(--red);padding:1px 6px;border-radius:3px;font-size:8px;margin-right:3px;white-space:nowrap">sin '+exWd.map(function(w){return DOW[w];}).join('/')+'</span>';}
     var excls=bot.excludedDateRanges||[];
     var actEx=excls.filter(function(e){return e.endDate>=today3;});
     for(var ei=0;ei<Math.min(actEx.length,3);ei++){

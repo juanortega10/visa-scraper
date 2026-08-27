@@ -300,8 +300,50 @@ export function pickPrimaryVisaCategory(rawLabels: string[]): string | null {
   return best;
 }
 
+/**
+ * Portal-emitted state of a group card, read from the container's class attribute:
+ *   <div class='application attend_appointment card success'>  → 'attend_appointment'
+ *   <div class='application appointment card secondary'>       → 'appointment'
+ *   <div class='alert application card needs_payment'>         → 'needs_payment'
+ *
+ * The class token is the reliable signal. The visible "Estado actual" text is not:
+ * on the same es-co page the portal renders "Cita Asistir" for one card and the
+ * untranslated "Appointment" for another, and it changes with the account locale.
+ */
+export interface GroupStatus {
+  /** State token from the card class (e.g. 'needs_payment'), or null if the page has no card markup. */
+  token: string | null;
+  /** Visible "Estado actual" text, for logs and support. Locale-dependent — never branch on it. */
+  text: string | null;
+}
+
+/** Card class tokens the portal reuses for layout/color. Never a state. */
+const CARD_LAYOUT_TOKENS = new Set([
+  'application', 'card', 'alert', 'success', 'secondary', 'primary', 'warning',
+  'info', 'row', 'column', 'columns', 'callout', 'expanded',
+]);
+
+/**
+ * States in which the portal cannot hold a consular appointment for the group, so
+ * the bot has nothing to poll or move. `needs_payment` = the visa fee (arancel) is
+ * unpaid: the card offers no consulate/ASC address and no appointment date.
+ *
+ * Deliberately a deny-list, not an allow-list: an unknown state stays usable, so a
+ * new portal state never silently drops a paying client's group.
+ */
+const NON_SCHEDULABLE_STATES = new Set(['needs_payment']);
+
+/** True when the group's portal state allows a consular appointment to exist. */
+export function isSchedulableGroup(group: { status: GroupStatus }): boolean {
+  const { token } = group.status;
+  if (!token) return true; // no card markup (older pages, stripped fixtures) — stay permissive
+  return !NON_SCHEDULABLE_STATES.has(token);
+}
+
 export interface GroupInfo {
   scheduleId: string;
+  /** Portal state of the card that owns this schedule. */
+  status: GroupStatus;
   applicantIds: string[];
   applicantNames: string[];
   /** Per-applicant raw visa-type labels in DOM order (parallel to applicantIds when complete). */
@@ -312,6 +354,37 @@ export interface GroupInfo {
   currentConsularTime: string | null;
   currentCasDate: string | null;
   currentCasTime: string | null;
+}
+
+/**
+ * Locate every application card in the page with its state token and visible label.
+ * Returned in document order with the offset where the card opens, so each schedule
+ * can be matched to the card that contains it.
+ */
+function extractCardStates(html: string): Array<{ start: number; status: GroupStatus }> {
+  const cards: Array<{ start: number; status: GroupStatus }> = [];
+  // Only cards that wrap an application. Support single and double quoted class attrs.
+  const cardRegex = /<div\b[^>]*\bclass=['"]([^'"]*\bapplication\b[^'"]*\bcard\b[^'"]*|[^'"]*\bcard\b[^'"]*\bapplication\b[^'"]*)['"]/g;
+  let m;
+  while ((m = cardRegex.exec(html)) !== null) {
+    const tokens = m[1]!.split(/\s+/).filter(Boolean);
+    const token = tokens.find((t) => !CARD_LAYOUT_TOKENS.has(t)) ?? null;
+    // The visible label sits in the card header: <h4 class='status'><small>…</small><br> TEXT
+    const header = html.slice(m.index, m.index + 600);
+    const textMatch = header.match(/<h4\b[^>]*\bclass=['"][^'"]*\bstatus\b[^'"]*['"][^>]*>[\s\S]*?<br\s*\/?>\s*([^<]+)/);
+    cards.push({ start: m.index, status: { token, text: textMatch?.[1]?.trim() || null } });
+  }
+  return cards;
+}
+
+/** State of the card that owns `offset` = the last card opened at or before it. */
+function statusForOffset(cards: Array<{ start: number; status: GroupStatus }>, offset: number): GroupStatus {
+  let found: GroupStatus = { token: null, text: null };
+  for (const c of cards) {
+    if (c.start > offset) break;
+    found = c.status;
+  }
+  return found;
 }
 
 /**
@@ -336,6 +409,8 @@ export function extractGroups(groupsHtml: string): GroupInfo[] {
   }
 
   if (boundaries.length === 0) return [];
+
+  const cards = extractCardStates(html);
 
   return boundaries.map(({ id, start }, i) => {
     const end = boundaries[i + 1]?.start ?? html.length;
@@ -370,6 +445,7 @@ export function extractGroups(groupsHtml: string): GroupInfo[] {
 
     return {
       scheduleId: id,
+      status: statusForOffset(cards, start),
       applicantIds,
       applicantNames,
       applicantVisaTypes,
@@ -399,6 +475,75 @@ export interface VisaClassFromEdit {
  *
  * Returns null if the select is not present or no option is marked selected.
  */
+
+// ── Tope de reprogramaciones del portal ──────────────────────────────────────
+
+/**
+ * Tope duro que impone el portal, leido de su propia pagina de advertencia.
+ *
+ * NO confundir con `bots.maxReschedules`, que es NUESTRO presupuesto: cuantos
+ * movimientos autorizamos para ese bot. Son dos numeros distintos y a proposito:
+ *
+ *   portalMax       lo fija el portal. Peru = 2. Al llegar, la cita se BLOQUEA.
+ *   maxReschedules  lo fijamos nosotros. Puede ser menor, para dejar reserva.
+ *
+ * El limite efectivo es el menor de los dos.
+ */
+export interface RescheduleLimit {
+  /** Maximo que permite el portal. `null` si la pagina no lo dice. */
+  max: number | null;
+  /** Cuantos le quedan segun el portal. `null` si la pagina no lo dice. */
+  remaining: number | null;
+}
+
+/**
+ * Lee el tope de la pagina de ADVERTENCIA (`/schedule/{id}/appointment` SIN el
+ * parametro `confirmed_limit_message=1`). Con ese parametro la advertencia se
+ * salta y sale el formulario, entonces ahi el numero NO aparece.
+ *
+ * Texto real de es-pe, medido el 2026-08-27:
+ *   "Hay un numero maximo de 2 cancelaciones/reprogramaciones permitidas por
+ *    este servicio. Le quedan 1 intentos antes de alcanzar el limite."
+ */
+export function parseRescheduleLimit(html: string): RescheduleLimit {
+  // El portal sirve la misma frase con acentos reales o con entidades HTML,
+  // segun la pagina. Se normalizan antes de buscar.
+  const ENTITIES: Record<string, string> = {
+    '&nbsp;': ' ', '&aacute;': 'a', '&eacute;': 'e', '&iacute;': 'i',
+    '&oacute;': 'o', '&uacute;': 'u', '&ntilde;': 'n', '&amp;': '&',
+  };
+  const t = html
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, (m) => ENTITIES[m.toLowerCase()] ?? ' ')
+    .replace(/\s+/g, ' ');
+  const max = t.match(/n[uú]mero m[aá]ximo de\s+(\d+)/i)
+    ?? t.match(/maximum of\s+(\d+)\s+(?:cancellation|reschedul)/i)
+    ?? t.match(/nombre maximum de\s+(\d+)/i)
+    ?? t.match(/maximum de\s+(\d+)/i);
+  const remaining = t.match(/[Ll]e quedan\s+(\d+)/i)
+    ?? t.match(/[Yy]ou have\s+(\d+)\s+(?:attempts?|reschedules?)\s+remaining/i)
+    ?? t.match(/(\d+)\s+tentatives?\s+restantes?/i)
+    ?? t.match(/(\d+)\s+(?:attempts?|intentos?)\s+(?:remaining|restantes?)/i);
+  return { max: max ? Number(max[1]) : null, remaining: remaining ? Number(remaining[1]) : null };
+}
+
+/**
+ * Cuantos movimientos quedan de verdad, cruzando las dos fuentes.
+ * Manda el menor. Si el portal no dijo nada, manda nuestro presupuesto.
+ */
+export function effectiveRescheduleBudget(args: {
+  portalRemaining: number | null | undefined;
+  ourMax: number | null | undefined;
+  ourCount: number;
+}): { left: number; capBy: 'portal' | 'nuestro' | 'sin_tope' } {
+  const ours = args.ourMax == null ? null : Math.max(0, args.ourMax - args.ourCount);
+  const portal = args.portalRemaining == null ? null : Math.max(0, args.portalRemaining);
+  if (ours == null && portal == null) return { left: Number.POSITIVE_INFINITY, capBy: 'sin_tope' };
+  if (ours == null) return { left: portal!, capBy: 'portal' };
+  if (portal == null) return { left: ours, capBy: 'nuestro' };
+  return portal <= ours ? { left: portal, capBy: 'portal' } : { left: ours, capBy: 'nuestro' };
+}
+
 export function extractVisaClassFromEditPage(editHtml: string): VisaClassFromEdit | null {
   // Locate the visa_class_id select block (not previous_visa_class_id — different field).
   // Pin via name="applicant[visa_class_id]" to avoid the previous-class field.
@@ -460,6 +605,36 @@ export class AppointmentFormMissingError extends Error {
   }
 }
 
+/**
+ * Picks the facility id out of a `<select>` body.
+ *
+ * Prefers the `<option selected>` — that is the facility of the appointment the
+ * account already holds, which is the city the bot must poll and reschedule
+ * within. Falls back to the first numeric option only when the portal renders no
+ * selection at all (an account with no appointment yet).
+ *
+ * Reading the first option instead of the selected one is what put bot 281
+ * (es-mx) on Ciudad Juarez (65, the alphabetically first city, permanently empty)
+ * while the real appointment lived in Mexico City (70), and what put bot 162
+ * (fr-ca) on Calgary (89, first) instead of Vancouver (95). Both dropdowns list
+ * cities alphabetically, so "first" and "selected" only coincide by accident —
+ * and they always coincide for es-co/es-pe, which have a single consulate. That
+ * is why the bug stayed invisible for 234 Colombian bots.
+ */
+function pickFacilityFromSelect(selectInner: string): string {
+  const optionRegex = /<option([^>]*)>/g;
+  let first = '';
+  let match;
+  while ((match = optionRegex.exec(selectInner)) !== null) {
+    const attrs = match[1]!;
+    const value = attrs.match(/value="(\d+)"/)?.[1];
+    if (!value) continue; // placeholder option (value="")
+    if (/\bselected\b/.test(attrs)) return value;
+    if (!first) first = value;
+  }
+  return first;
+}
+
 export function extractFacilityIds(
   apptHtml: string,
   apptPageOk: boolean,
@@ -467,12 +642,11 @@ export function extractFacilityIds(
 ): ExtractedFacilities {
   let consularFacilityId = '';
   if (apptPageOk) {
-    // Look for <select ... consulate_appointment_facility_id ...> then first <option value="NN">
+    // Look for <select ... consulate_appointment_facility_id ...> then the selected <option value="NN">
     // Use a tighter regex that stays within the <select>...</select> block
     const selectMatch = apptHtml.match(/<select[^>]+consulate_appointment_facility_id[^>]*>([\s\S]*?)<\/select>/);
     if (selectMatch) {
-      const optionMatch = selectMatch[1]!.match(/<option[^>]+value="(\d+)"/);
-      if (optionMatch?.[1]) consularFacilityId = optionMatch[1];
+      consularFacilityId = pickFacilityFromSelect(selectMatch[1]!);
     }
     // Guardrail: if we trust the live page (apptPageOk=true) and there's no
     // consular select at all, the form failed to render. Don't fall back to
@@ -488,15 +662,11 @@ export function extractFacilityIds(
 
   let ascFacilityId = '';
   if (apptPageOk) {
-    // Look for <select ... asc_appointment_facility_id ...> then first non-empty <option value="NN">
+    // Look for <select ... asc_appointment_facility_id ...> then the selected <option value="NN">
+    // (falls back to the first numeric option; placeholder value="" options are skipped)
     const selectMatch = apptHtml.match(/<select[^>]+asc_appointment_facility_id[^>]*>([\s\S]*?)<\/select>/);
     if (selectMatch) {
-      // Find all options, pick first with a numeric value (skip empty/placeholder options)
-      const optionRegex = /<option[^>]+value="(\d+)"/g;
-      let optMatch;
-      while ((optMatch = optionRegex.exec(selectMatch[1]!)) !== null) {
-        if (optMatch[1]) { ascFacilityId = optMatch[1]; break; }
-      }
+      ascFacilityId = pickFacilityFromSelect(selectMatch[1]!);
     }
   }
   if (!ascFacilityId) {

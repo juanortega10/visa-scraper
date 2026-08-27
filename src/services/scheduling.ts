@@ -90,6 +90,64 @@ function jitter(baseSeconds: number): string {
   return `${seconds}s`;
 }
 
+
+// ── Ventana de liberacion del portal ─────────────────────────────────────────
+
+/** Tramo del minuto donde el portal libera cupos, en segundos [inicio, fin). */
+export interface ReleaseWindow { startSec: number; endSec: number }
+
+/**
+ * Medido con `scripts/analyze-release-clock.ts` el 2026-08-27, contando SOLO
+ * fechas a menos de 6 meses y normalizando por cuantos polls caen en cada tramo.
+ *
+ *   es-pe  cercanas: s15-19 al 6,2% (5,15x la media), s20-24 al 3,2%.
+ *          Fuera de s15-24 la tasa cae a 0,1-0,5%.
+ *   es-co  cercanas: meseta s20-34, pico s25-29 al 23,8% (2,74x).
+ *
+ * Se agrega ~2 s de margen por delante, porque la deteccion llega despues de la
+ * liberacion real (el poll tarda en pedir y en responder).
+ */
+const RELEASE_WINDOWS: Record<string, ReleaseWindow> = {
+  'es-pe': { startSec: 13, endSec: 26 },
+  'es-co': { startSec: 18, endSec: 36 },
+};
+
+export function getReleaseWindow(locale?: string): ReleaseWindow | null {
+  return RELEASE_WINDOWS[locale ?? ''] ?? null;
+}
+
+/**
+ * Corre el proximo poll para que caiga DENTRO de la ventana de liberacion.
+ *
+ * Si el poll natural ya cae dentro, no toca nada. Si cae fuera, salta al inicio
+ * de la proxima ventana. El efecto es concentrar los polls donde de verdad
+ * aparecen cupos, en vez de repartirlos parejo por todo el minuto.
+ *
+ * Perder el tramo muerto cuesta poco: la duracion mediana de un cupo es ~2 min,
+ * entonces una fecha que aparece en s40 sigue ahi en la ventana siguiente.
+ *
+ * Devuelve segundos de espera. Nunca menos de 1 s.
+ */
+export function alignToReleaseWindow(args: {
+  locale?: string;
+  baseSeconds: number;
+  nowMs: number;
+}): { seconds: number; aligned: boolean } {
+  const w = getReleaseWindow(args.locale);
+  const base = Math.max(1, args.baseSeconds);
+  if (!w) return { seconds: base, aligned: false };
+
+  const naturalMs = args.nowMs + base * 1000;
+  const sec = Math.floor(naturalMs / 1000) % 60;
+  if (sec >= w.startSec && sec < w.endSec) return { seconds: base, aligned: false };
+
+  const minuteStart = Math.floor(naturalMs / 60_000) * 60_000;
+  let targetMs = minuteStart + w.startSec * 1000;
+  if (targetMs < naturalMs) targetMs += 60_000;
+  const seconds = Math.max(1, (targetMs - args.nowMs) / 1000);
+  return { seconds, aligned: true };
+}
+
 /**
  * Account-level ban backoff — SINGLE SOURCE OF TRUTH.
  *
@@ -115,6 +173,29 @@ function jitter(baseSeconds: number): string {
 export function accountBanBackoffMs(count: number): number {
   const step = Math.min(Math.max(count, 1), 5) - 1; // 0..4
   return 30 * 60_000 * 2 ** step; // 30m,60m,120m,240m,480m
+}
+
+
+/** Fila reciente de `poll_logs`, reducida a lo que necesita el contador de rachas. */
+export interface RecentBlockRow {
+  status: string;
+  blockCls: string | null;
+}
+
+/**
+ * Cuenta los bloqueos de cuenta SEGUIDOS al frente de la ventana de `poll_logs`.
+ *
+ * Corta la racha cualquier fila que no sea un `tcp_blocked` de tipo `account_ban`.
+ * Eso incluye una fila sana (`ok`/`filtered_out`), que trae `blockClassification`
+ * en null. La version anterior usaba `blockCls !== null && blockCls !== 'account_ban'`,
+ * entonces las filas sanas no cortaban nada: dos bloqueos con polls buenos en medio
+ * contaban como cinco y el backoff saltaba de un golpe al tope de 480m.
+ */
+export function countSustainedAccountBans(rows: RecentBlockRow[]): number {
+  const firstBreak = rows.findIndex(
+    (r) => !(r.status === 'tcp_blocked' && r.blockCls === 'account_ban'),
+  );
+  return firstBreak === -1 ? rows.length : firstBreak;
 }
 
 /** Trigger.dev delay string form of {@link accountBanBackoffMs}. */

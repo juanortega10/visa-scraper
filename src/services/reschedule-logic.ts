@@ -1,7 +1,7 @@
 import { logger } from '@trigger.dev/sdk/v3';
 import { db } from '../db/client.js';
 import { bots, sessions, rescheduleLogs } from '../db/schema.js';
-import { eq, sql, or, lt, isNull, and } from 'drizzle-orm';
+import { eq, sql, or, lt, gt, isNull, and } from 'drizzle-orm';
 import { encrypt } from './encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js';
 import { filterDates, filterTimes, isAtLeastNDaysEarlier, isDateExcluded, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
@@ -24,6 +24,7 @@ export interface RescheduleBot {
   skipCas?: boolean;
   speculativeTimeFallback?: boolean;
   minDaysFromToday?: number | null;
+  excludedWeekdays?: number[] | null;
 }
 
 // Historical times seen at Lima facility 115 (es-pe). Used as fallback when
@@ -56,6 +57,8 @@ export interface RescheduleParams {
   pending: Promise<unknown>[];
   loginCredentials?: { email: string; password: string; scheduleId: string; applicantIds: string[]; locale: string };
   maxReschedules?: number | null;
+  /** Saldo que reporta el PORTAL. Distinto de `maxReschedules`, que es nuestro presupuesto. */
+  portalRemaining?: number | null;
   runId?: string;
   sessionAgeMs?: number;
 }
@@ -90,10 +93,16 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     preFetchedDays,
     casCacheJson,
     dryRun,
-    maxAttempts = 5,
+    // Bajado de 5 a 3 el 2026-08-27. Evidencia en `reschedule_logs` (905 exitos):
+    // hasta 3 candidatas se conserva el 98,3% de los exitos; de la 4 en adelante
+    // solo salen 15 de 905 (1,7%) y cada intento cuesta 2-3 s. Ademas un run largo
+    // empuja el proximo poll fuera de tiempo (`getPollingDelay` resta lo transcurrido),
+    // o sea el bot queda ciego justo cuando aparecen cupos.
+    maxAttempts = 3,
     pending,
     loginCredentials,
     maxReschedules,
+    portalRemaining,
     runId,
     sessionAgeMs,
   } = params;
@@ -127,6 +136,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   const sniperMode = isSniperActive(bot.sniperMode, bot.targetDateAfter, bot.targetDateBefore);
   const inSniperWindow = (d: string | null | undefined): boolean =>
     isWithinWindow(d, bot.targetDateAfter, bot.targetDateBefore);
+  // The sniper override (take ANY in-window date, even a later one) applies ONLY while the current
+  // appointment is still OUTSIDE the window. Once it is inside, the strictly-earlier rule returns:
+  // the bot only improves, it never trades an in-window date for a later in-window one.
+  const sniperFreeMove = sniperMode && !inSniperWindow(bot.currentConsularDate);
+
+  /** Date bounds that apply to the CAS date too, not only to the consular date. */
+  const casDateWithinBounds = (d: string): boolean =>
+    (!bot.targetDateAfter || d >= bot.targetDateAfter)
+    && (!bot.targetDateBefore || d < bot.targetDateBefore);
 
 
   if (dryRun) {
@@ -364,15 +382,35 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       logger.info('claimSlot: skipped (initial booking)', { botId });
       return true;
     }
+    // DOS topes, distintos a proposito:
+    //   portal_remaining_reschedules  lo dice el portal. Duro. Al agotarlo la cita
+    //                                 se BLOQUEA y no hay vuelta atras.
+    //   max_reschedules               NUESTRO presupuesto. Puede ser menor.
+    // Manda el mas estricto. El del portal lo llena `scripts/sync-portal-limits.ts`.
+    // Un solo UPDATE: sube el contador y baja el saldo del portal a la vez. Atomico,
+    // y sin viaje extra a la base de datos en el camino critico.
     const rows = await db.update(bots)
-      .set({ rescheduleCount: sql`${bots.rescheduleCount} + 1` })
+      .set({
+        rescheduleCount: sql`${bots.rescheduleCount} + 1`,
+        portalRemainingReschedules: sql`GREATEST(0, COALESCE(${bots.portalRemainingReschedules}, 1) - 1)`,
+      })
       .where(and(
         eq(bots.id, botId),
         or(isNull(bots.maxReschedules), lt(bots.rescheduleCount, bots.maxReschedules)),
+        or(isNull(bots.portalRemainingReschedules), gt(bots.portalRemainingReschedules, 0)),
       ))
       .returning({ rescheduleCount: bots.rescheduleCount });
-    if (maxReschedules != null && rows.length === 0) {
-      logger.warn('claimSlot: limit reached (atomic)', { botId, maxReschedules });
+    // Solo se bloquea cuando existe un tope de verdad. Sin topes, un UPDATE que no
+    // devuelve filas se ignora, igual que antes de este cambio.
+    const hayTope = maxReschedules != null || portalRemaining != null;
+    if (hayTope && rows.length === 0) {
+      const porElPortal = portalRemaining != null && portalRemaining <= 0;
+      logger.warn('claimSlot: limit reached (atomic)', {
+        botId,
+        capBy: porElPortal ? 'portal' : 'nuestro presupuesto',
+        maxReschedules,
+        portalRemaining,
+      });
       return false;
     }
     lastClaimWasReal = true;
@@ -418,12 +456,12 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       }
     }
 
-    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter);
+    const filteredDays = filterDates(consularDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter, bot.excludedWeekdays);
     const candidates = filteredDays
       // SNIPER (before securing): accept any in-window date even if not earlier than current —
       // filteredDays is already bounded to [targetDateAfter, targetDateBefore). After securing,
       // require strictly earlier than the secured date so the improve loop only goes earlier.
-      .filter((d) => (sniperMode && !securedResult) ? true : (effectiveCurrentDate ? isAtLeastNDaysEarlier(d.date, effectiveCurrentDate, 1) : true))
+      .filter((d) => (sniperFreeMove && !securedResult) ? true : (effectiveCurrentDate ? isAtLeastNDaysEarlier(d.date, effectiveCurrentDate, 1) : true))
       .filter((d) => !exhaustedDates.has(d.date))
       .filter((d) => (transientFailCount.get(d.date) ?? 0) < 2);
 
@@ -700,6 +738,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
           if (isDateExcluded(e.date, dateExclusions)) return false;
           if (e.date < minDate) return false;
+          if (!casDateWithinBounds(e.date)) return false;
           const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
           return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
         })
@@ -738,6 +777,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               if (e.forConsularDate && e.forConsularDate !== candidate.date) return false;
               if (isDateExcluded(e.date, dateExclusions)) return false;
               if (e.date < minDate) return false;
+              if (!casDateWithinBounds(e.date)) return false;
               const daysBefore = (consularMs - new Date(e.date).getTime()) / 864e5;
               return daysBefore >= 1 && daysBefore <= CAS_WINDOW_DAYS;
             })
@@ -769,7 +809,11 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       // Process results sequentially (best time first)
       let postAttempted = false;
       for (const { time: consularTime, casDays } of casResults) {
-        const filteredCasDays = filterDates(casDays, dateExclusions, undefined, minDate);
+        // The CAS date obeys the SAME bounds as the consular date (exclusions, minDate and the
+        // [targetDateAfter, targetDateBefore) window). If no CAS day fits inside the bounds, this
+        // consular time fails with 'no_cas_days' and the loop moves on — the bot never books a
+        // CAS outside the owner's limits just to reach an in-bounds consular date.
+        const filteredCasDays = filterDates(casDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter, bot.excludedWeekdays);
         logger.info('CAS days', { botId, consularTime, total: casDays.length, afterFilter: filteredCasDays.length, first: filteredCasDays[0]?.date });
         if (filteredCasDays.length === 0) {
           failedAttempts.push({ date: candidate.date, consularTime, failReason: 'no_cas_days', durationMs: Date.now() - attemptStart });
@@ -1041,9 +1085,11 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             }
 
             const isImprovement = verifyAppt.consularDate && prevConsularDate
-              ? (sniperMode
-                  // SNIPER: a verified in-window date counts as success unless we'd already
-                  // secured an earlier one (then it must be strictly earlier to not regress).
+              ? (sniperFreeMove
+                  // SNIPER (appointment still outside the window): a verified in-window date counts
+                  // as success unless we'd already secured an earlier one (then it must be strictly
+                  // earlier to not regress). Once the appointment is in-window, sniperFreeMove is
+                  // false and the strictly-earlier rule applies.
                   ? (inSniperWindow(verifyAppt.consularDate) && (!securedResult || isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1)))
                   : isAtLeastNDaysEarlier(verifyAppt.consularDate, prevConsularDate, 1))
               : false;

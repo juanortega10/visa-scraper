@@ -114,12 +114,27 @@ export const bots = pgTable(
     targetDateBefore: date('target_date_before'),                       // hard cutoff: only reschedule to dates < this (YYYY-MM-DD exclusive)
     targetDateAfter: date('target_date_after'),                         // sniper window lower bound (YYYY-MM-DD inclusive); only meaningful with sniperMode
     sniperMode: boolean('sniper_mode').notNull().default(false),        // true = accept ANY date in [targetDateAfter, targetDateBefore) even if NOT earlier than current (overrides strictly-earlier protection). Requires both window bounds set.
-    maxReschedules: integer('max_reschedules'),                         // null = unlimited, e.g. Peru = 2
-    rescheduleCount: integer('reschedule_count').notNull().default(0),  // incremented on each successful reschedule
+    // NUESTRO presupuesto: cuantos movimientos autorizamos para este bot.
+    // Puede ser MENOR que el tope del portal a proposito, para dejar reserva.
+    maxReschedules: integer('max_reschedules'),                         // null = sin tope nuestro
+    rescheduleCount: integer('reschedule_count').notNull().default(0),  // sube en cada reagendamiento exitoso
+    // TOPE DEL PORTAL, leido de su pagina de advertencia. Es duro e irreversible:
+    // al agotarlo la cita se bloquea. No confundir con maxReschedules.
+    // Lo llena `scripts/sync-portal-limits.ts` con `parseRescheduleLimit()`.
+    portalMaxReschedules: integer('portal_max_reschedules'),
+    portalRemainingReschedules: integer('portal_remaining_reschedules'),
+    portalLimitCheckedAt: timestamp('portal_limit_checked_at'),
+    // Alinea la FASE del poll a la ventana de liberacion del portal
+    // (`alignToReleaseWindow` en scheduling.ts). Opt-in por bot: concentra los
+    // polls donde de verdad aparecen cupos y baja el total de peticiones.
+    phaseAligned: boolean('phase_aligned').notNull().default(false),
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
     speculativeTimeFallback: boolean('speculative_time_fallback').notNull().default(false), // true = try historical times when getConsularTimes returns empty (no-CAS only)
     minDaysFromToday: integer('min_days_from_today'),                          // null = global default (3); 0 = disabled
+    // Dias de la semana que el bot NUNCA agenda (consular y CAS). 0 = domingo … 6 = sabado.
+    // null o [] = sin restriccion. Ejemplo: [6] = nunca agenda sabados.
+    excludedWeekdays: jsonb('excluded_weekdays').$type<number[] | null>(),
     pollIntervalSeconds: integer('poll_interval_seconds'),                  // null = locale default; raw delay override (advanced)
     targetPollsPerMin: integer('target_polls_per_min'),                     // null = use pollIntervalSeconds/locale default; auto-computes delay accounting for overhead
     consecutiveErrors: integer('consecutive_errors').notNull().default(0),
@@ -607,8 +622,30 @@ export type AuthLog = typeof authLogs.$inferSelect;
 export type NotificationLog = typeof notificationLogs.$inferSelect;
 export type BookableEvent = typeof bookableEvents.$inferSelect;
 export type DateSighting = typeof dateSightings.$inferSelect;
+/**
+ * Snapshots del dual sniper. Una fila por ciclo de escaneo. Alimenta la pagina
+ * /dashboard/sniper sin volver a consultar al portal (evitar polls extra = evitar bans).
+ * Se poda sola: el escritor borra las filas con mas de SNIPER_SCAN_RETENTION_DAYS.
+ */
+export const sniperScans = pgTable(
+  'sniper_scans',
+  {
+    id: serial('id').primaryKey(),
+    scanKey: varchar('scan_key', { length: 40 }).notNull(),   // identifica el sniper, ej. 'victoria-alvarez'
+    scannedAt: timestamp('scanned_at').notNull().defaultNow(),
+    windowStart: date('window_start').notNull(),
+    windowEnd: date('window_end').notNull(),
+    phase: varchar('phase', { length: 20 }).notNull(),
+    /** { groups: [...], days: [{date, parentsTimes, childrenTimes}], pairs: [{date,p,c,gapMin}], best } */
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+  },
+  (table) => [index('sniper_scans_key_at_idx').on(table.scanKey, table.scannedAt)],
+);
+
 export type BanEpisode = typeof banEpisodes.$inferSelect;
 export type Agency = typeof agencies.$inferSelect;
 export type NewAgency = typeof agencies.$inferInsert;
 export type BotCredentialAttempt = typeof botCredentialAttempts.$inferSelect;
 export type NewBotCredentialAttempt = typeof botCredentialAttempts.$inferInsert;
+export type SniperScan = typeof sniperScans.$inferSelect;
+export type NewSniperScan = typeof sniperScans.$inferInsert;
