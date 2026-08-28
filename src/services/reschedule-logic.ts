@@ -61,6 +61,13 @@ export interface RescheduleParams {
   portalRemaining?: number | null;
   runId?: string;
   sessionAgeMs?: number;
+  /**
+   * Lectura ya lanzada de `bots.current_consular_date` para la guarda de carrera.
+   * El llamador la dispara en paralelo con las otras consultas del camino critico.
+   * La guarda NO cambia: se espera aqui, antes de elegir candidata y antes del POST.
+   * Sin este parametro la consulta se hace aqui mismo, igual que antes.
+   */
+  fechaFrescaPromesa?: PromiseLike<Array<{ currentConsularDate: string | null }>>;
 }
 
 export interface RescheduleResult {
@@ -105,6 +112,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     portalRemaining,
     runId,
     sessionAgeMs,
+    fechaFrescaPromesa,
   } = params;
   const totalStart = Date.now();
   const failedAttempts: RescheduleAttempt[] = [];
@@ -211,10 +219,10 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   // RACE CONDITION GUARD: Re-read ONLY currentConsularDate from DB (minimal query).
   // Another worker may have already rescheduled to a better date.
   const candidateDate = preFetchedDays?.[0]?.date;
-  const [freshData] = await db
+  const [freshData] = await (fechaFrescaPromesa ?? db
     .select({ currentConsularDate: bots.currentConsularDate })
     .from(bots)
-    .where(eq(bots.id, botId));
+    .where(eq(bots.id, botId)));
 
   if (!freshData) {
     logger.warn('Bot not found on re-read', { botId });

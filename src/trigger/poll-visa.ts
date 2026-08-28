@@ -6,7 +6,7 @@ import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
-import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, countSustainedAccountBans, alignToReleaseWindow } from '../services/scheduling.js';
+import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -237,6 +237,32 @@ export const pollVisaTask = task({
         // Abort this run (cron) rather than cancelling the backoff, regardless of activeRunIdField.
         // (activeRunIdField may lag if the DB update failed silently after the previous self-trigger.)
         if (otherRun.status === 'DELAYED') {
+          // Antes de abortar: ¿ese retraso todavia tiene sentido? Un run DELAYED viejo
+          // hace abortar TODOS los runs del cron y el bot deja de pollear por horas,
+          // aunque siga `active`. Se compara el silencio real contra el backoff que si
+          // esta justificado. Un ban de cuenta nunca se acorta.
+          let despertar = false;
+          try {
+            const ultimos = await db.select({
+              status: pollLogs.status,
+              createdAt: pollLogs.createdAt,
+              blockCls: sql<string | null>`${pollLogs.connectionInfo}->>'blockClassification'`,
+            }).from(pollLogs).where(eq(pollLogs.botId, botId)).orderBy(desc(pollLogs.id)).limit(5);
+            const msSinPoll = ultimos[0] ? Date.now() - ultimos[0].createdAt.getTime() : Number.MAX_SAFE_INTEGER;
+            const bansSeguidos = countSustainedAccountBans(ultimos);
+            despertar = debeDespertar({ msSinPoll, bansSeguidos });
+            if (despertar) {
+              console.warn(`[chain] bot ${botId}: DESPIERTA · cancela DELAYED ${otherRun.id} tras ${Math.round(msSinPoll / 60_000)} min sin pollear`);
+              logger.warn('CADENA DORMIDA — cancelling stale DELAYED run and polling now', {
+                botId, chainId, runId: ctx.run.id, delayedRunId: otherRun.id,
+                minSinPoll: Math.round(msSinPoll / 60_000), bansSeguidos,
+              });
+              await runs.cancel(otherRun.id).catch(() => {});
+            }
+          } catch (e) {
+            logger.warn('No se pudo evaluar la cadena dormida, se aborta como antes', { botId, error: String(e) });
+          }
+          if (despertar) continue;
           console.warn(`[chain] bot ${botId}: ABORTA por run DELAYED · ${otherRun.id}`);
           logger.warn('DEDUP FALLBACK — found DELAYED run, aborting this run', {
             botId, chainId, runId: ctx.run.id, delayedRunId: otherRun.id, activeRunId: activeRunIdField,
@@ -905,10 +931,34 @@ export const pollVisaTask = task({
         } else if (earliest && isActionableDate(earliest, bot.currentConsularDate, sniperFreeMove())) {
           const isInitialBooking = bot.currentConsularDate === null;
           const RESCHEDULE_DEDUP_MS = 3 * 60 * 1000;
-          const [recentReschedule] = await db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
-            .from(rescheduleLogs)
-            .where(and(eq(rescheduleLogs.botId, botId), eq(rescheduleLogs.success, true), gte(rescheduleLogs.createdAt, new Date(Date.now() - RESCHEDULE_DEDUP_MS))))
-            .orderBy(desc(rescheduleLogs.createdAt)).limit(1);
+
+          // TRES consultas independientes del camino critico, lanzadas a la vez.
+          // Ninguna necesita el resultado de otra:
+          //   A  dedup          ¿la otra cadena ya reagendo hace menos de 3 min?
+          //   B  cache de CAS   solo si la cuenta usa CAS. Peru no la usa.
+          //   C  guarda de carrera  ¿otro worker ya dejo una cita mejor?
+          // En serie sumaban ~170 ms mientras corre el reloj del cupo. La C se PASA a
+          // `executeReschedule`, que la espera antes del POST: se adelanta el viaje a
+          // la base de datos, la guarda sigue igual de dura.
+          const usaCas = !!bot.ascFacilityId && !bot.skipCas;
+          const dedupPromesa = Promise.resolve(
+            db.select({ id: rescheduleLogs.id, newConsularDate: rescheduleLogs.newConsularDate })
+              .from(rescheduleLogs)
+              .where(and(eq(rescheduleLogs.botId, botId), eq(rescheduleLogs.success, true), gte(rescheduleLogs.createdAt, new Date(Date.now() - RESCHEDULE_DEDUP_MS))))
+              .orderBy(desc(rescheduleLogs.createdAt)).limit(1),
+          );
+          const cachePromesa: Promise<Array<{ casCacheJson: unknown }>> = usaCas
+            ? Promise.resolve(db.select({ casCacheJson: bots.casCacheJson }).from(bots).where(eq(bots.id, botId)))
+            : Promise.resolve([]);
+          const fechaFrescaPromesa = Promise.resolve(
+            db.select({ currentConsularDate: bots.currentConsularDate }).from(bots).where(eq(bots.id, botId)),
+          );
+          // Si el dedup corta el flujo, las otras dos quedan sin esperar. Sin este
+          // manejador vacio, un rechazo tumbaria el proceso entero.
+          cachePromesa.catch(() => {});
+          fechaFrescaPromesa.catch(() => {});
+
+          const [recentReschedule] = await dedupPromesa;
           if (recentReschedule) {
             logger.info('Inline reschedule SKIPPED — other chain already rescheduled (dedup)', {
               botId, chainId, recentRescheduleId: recentReschedule.id, newDate: recentReschedule.newConsularDate,
@@ -950,10 +1000,8 @@ export const pollVisaTask = task({
           // `reschedule-logic.ts:236` y el cache nunca se lee. Ese SELECT costaba
           // ~85 ms dentro del camino critico, justo cuando corre el reloj del cupo.
           // (El comentario viejo decia 50-150 KB; medido son 212-1.228 bytes.)
-          const usaCas = !!bot.ascFacilityId && !bot.skipCas;
-          const [cacheRow] = usaCas
-            ? await db.select({ casCacheJson: bots.casCacheJson }).from(bots).where(eq(bots.id, botId))
-            : [undefined];
+          // La consulta ya salio arriba, en paralelo con el dedup.
+          const [cacheRow] = await cachePromesa;
           const cacheData = cacheRow?.casCacheJson as CasCacheData | null;
 
           // Filter out consular dates blocked due to repeated no_cas_days failures
@@ -1064,6 +1112,7 @@ export const pollVisaTask = task({
             portalRemaining: bot.portalRemainingReschedules,
             runId: ctx.run.id,
             sessionAgeMs,
+            fechaFrescaPromesa,
           });
           timings.reschedule = Date.now() - rescheduleStart;
           rescheduleResultObj = result;

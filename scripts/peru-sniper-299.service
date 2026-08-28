@@ -1,0 +1,31 @@
+[Unit]
+Description=Sniper de Peru — bot 299 (Luiggi), 1 peticion por minuto en el segundo 14 UTC
+Documentation=file:///home/agetrox/visa-scraper/scripts/peru-sniper-299.ts
+After=network-online.target visa-trigger.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=agetrox
+WorkingDirectory=/home/agetrox/visa-scraper
+EnvironmentFile=/home/agetrox/visa-scraper/.env
+ExecStart=/usr/bin/npx tsx --env-file=.env scripts/peru-sniper-299.ts --commit
+
+# El proceso termina solo cuando agenda o cuando se queda sin cupo. Ahi el reinicio
+# no sirve de nada, entonces `Restart=on-failure` en vez de `always`: una salida con
+# codigo 0 es "trabajo terminado" y el servicio queda quieto.
+Restart=on-failure
+RestartSec=20
+
+# Limites: el RPi comparte CPU con visa-trigger.
+MemoryMax=512M
+CPUWeight=40
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=peru-sniper-299
+
+[Install]
+WantedBy=multi-user.target

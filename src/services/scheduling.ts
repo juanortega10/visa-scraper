@@ -213,3 +213,40 @@ export function calculatePriority(activatedAt: Date | null): number {
   const daysActive = (Date.now() - activatedAt.getTime()) / (1000 * 60 * 60 * 24);
   return Math.min(Math.floor(daysActive * 60), 3600);
 }
+
+
+// ── Cadena dormida ───────────────────────────────────────────────────────────
+
+/**
+ * Retraso mas largo que puede pedir `poll-visa` SIN un bloqueo de cuenta.
+ * El peor caso es el backoff TCP directo de 30 min (`poll-visa.ts:1197-1204`).
+ * Se agregan 5 min de margen para el jitter y el arranque del run.
+ */
+export const TOPE_SIN_BAN_MS = 35 * 60_000;
+
+/**
+ * ¿Hay que cancelar un run DELAYED y pollear ya?
+ *
+ * Problema que resuelve: un run DELAYED viejo hace abortar cada run del cron
+ * (`poll-visa.ts`, DEDUP FALLBACK). El bot figura `active`, `updated_at` se mueve,
+ * y no pollea durante horas. Paso 4 veces en una noche con los bots 285, 269, 223
+ * y 299. Ver [[cadena-dormida-delayed-run]].
+ *
+ * La regla respeta los backoff legitimos:
+ *   - con bloqueo de cuenta, el retraso justificado es `accountBanBackoffMs`, y se
+ *     espera 1,5 veces eso antes de tocar nada. Nunca se acorta un ban.
+ *   - sin bloqueo, ningun retraso legitimo pasa de 35 min.
+ *
+ * `msSinPoll` es la edad de la fila mas nueva de `poll_logs` del bot. Con el
+ * ahorro de escrituras esa fila puede tener hasta 5 min de mas (el heartbeat),
+ * y ese sesgo va del lado seguro: retrasa el despertar, no lo adelanta.
+ */
+export function debeDespertar(args: {
+  msSinPoll: number;
+  bansSeguidos: number;
+}): boolean {
+  if (args.bansSeguidos > 0) {
+    return args.msSinPoll > accountBanBackoffMs(args.bansSeguidos) * 1.5;
+  }
+  return args.msSinPoll > TOPE_SIN_BAN_MS;
+}
