@@ -31,7 +31,7 @@
  */
 import { eq, and, or, sql, lt, gt, isNull } from 'drizzle-orm';
 import { db } from '../src/db/client.js';
-import { bots, rescheduleLogs } from '../src/db/schema.js';
+import { bots, rescheduleLogs, sniperScans } from '../src/db/schema.js';
 import { decrypt } from '../src/services/encryption.js';
 import { loginWithFallback } from '../src/services/login.js';
 import { VisaClient } from '../src/services/visa-client.js';
@@ -61,6 +61,11 @@ const QUEMADA_MS = 20 * 60_000;
 const ERRORES_PARA_PAUSA = 5;
 const PAUSA_MS = 15 * 60_000;
 
+/** Clave del sniper en `sniper_scans`. La pagina /dashboard/peru la lee. */
+const SCAN_KEY = 'peru-299';
+/** Cada cuanto se escribe un latido aunque nada cambie. */
+const LATIDO_MS = 5 * 60_000;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const hoyUtc = () => new Date().toISOString().slice(0, 10);
 const log = (...p: unknown[]) => console.log(`[${new Date().toISOString().slice(11, 23)}Z]`, ...p);
@@ -77,6 +82,41 @@ interface Sesion {
 
 let sesion: Sesion | null = null;
 const quemadas = new Map<string, number>();
+/** Estado del ultimo escaneo escrito. Sirve para el patron cambio mas latido. */
+let ultimoEscaneo: { masTemprana: string; enMs: number } | null = null;
+
+/**
+ * Deja constancia de cada vuelta en `sniper_scans`, para que
+ * `/dashboard/peru?bot=299` muestre si el sniper vive y que ofrece el portal.
+ *
+ * Escribe solo cuando la fecha mas temprana CAMBIA, o cada 5 min como latido.
+ * A 2 vueltas por minuto, escribir todo serian 2.880 filas por dia. Con esta
+ * regla quedan ~290, y la pagina sigue viendo lo mismo.
+ */
+async function registrarEscaneo(args: {
+  masTemprana: string; dias: number; msDias: number; fase: string;
+  ventanaFin: string | null; edadTokenS: number | null;
+}): Promise<void> {
+  const cambio = ultimoEscaneo?.masTemprana !== args.masTemprana;
+  const viejo = !ultimoEscaneo || Date.now() - ultimoEscaneo.enMs > LATIDO_MS;
+  if (!cambio && !viejo) return;
+  try {
+    await db.insert(sniperScans).values({
+      scanKey: SCAN_KEY,
+      windowStart: hoyUtc(),
+      windowEnd: args.ventanaFin ?? hoyUtc(),
+      phase: args.fase,
+      payload: {
+        masTemprana: args.masTemprana, dias: args.dias, msDias: args.msDias,
+        edadTokenS: args.edadTokenS, segundosTick: [...SEGUNDOS_TICK],
+        ventanaSeg: [VENTANA_PE.inicioSeg, VENTANA_PE.finSeg - 1],
+      },
+    });
+    ultimoEscaneo = { masTemprana: args.masTemprana, enMs: Date.now() };
+  } catch (e) {
+    log(`  [escaneo] no se pudo registrar: ${(e as Error).message}`);
+  }
+}
 
 /** Fila del bot, leida en vivo. Nunca se cachea: el cupo puede cambiar por fuera. */
 async function leerBot(): Promise<FilaBot> {
@@ -227,6 +267,11 @@ async function vuelta(): Promise<Resultado> {
     // el portal se acerca a la meta, y para notar un filtro que descarta de mas.
     const masTemprana = (dias as Array<{ date: string }>).map((d) => d.date).sort()[0] ?? '(ninguna)';
     log(`  dias ${dias.length} · ${msDias} ms · nada util · mas temprana ${masTemprana} (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
+    await registrarEscaneo({
+      masTemprana, dias: dias.length, msDias, fase: 'buscando',
+      ventanaFin: row.targetDateBefore ?? null,
+      edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
+    });
     return { agendado: false };
   }
   if (Date.now() < quemadaHasta) {
@@ -235,6 +280,12 @@ async function vuelta(): Promise<Resultado> {
   }
 
   log(`  DETECCION ${fecha} · dias ${dias.length} · ${msDias} ms · ventana ${enVentana(Date.now()) ? 'SI' : 'NO'}`);
+  ultimoEscaneo = null;   // una deteccion siempre se escribe
+  await registrarEscaneo({
+    masTemprana: fecha, dias: dias.length, msDias, fase: 'deteccion',
+    ventanaFin: row.targetDateBefore ?? null,
+    edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
+  });
 
   // 2 · la cita actual sale del PORTAL, no de la base de datos. La regla critica se
   //     verifica contra lo que el portal dice hoy.
@@ -317,6 +368,11 @@ async function vuelta(): Promise<Resultado> {
       updatedAt: new Date(),
     }).where(eq(bots.id, BOT_ID));
     log(`  *** AGENDADO ${real.consularDate} ${real.consularTime} ***`);
+    ultimoEscaneo = null;
+    await registrarEscaneo({
+      masTemprana: real.consularDate, dias: dias.length, msDias, fase: 'agendado',
+      ventanaFin: row.targetDateBefore ?? null, edadTokenS,
+    });
     return { agendado: true };
   }
 

@@ -10,8 +10,12 @@
  * Lee `poll_logs`, `reschedule_logs` y `bots`. Nunca toca el portal: abrir esta
  * pagina no suma polls ni riesgo de bloqueo.
  *
- * Orden por valor: estado y cuota → el reloj → cada oportunidad perdida → cuando
- * aparecen → salud.
+ * Orden por valor: estado y cuota → el sniper → el reloj → cada oportunidad
+ * perdida → cuando aparecen → salud.
+ *
+ * El sniper (`scripts/peru-sniper-299.ts`) es un proceso de systemd en el RPi, sin
+ * run de Trigger.dev. Su unica senal de vida es la fila que deja en `sniper_scans`
+ * con la clave `peru-299`, con la regla cambio mas latido de 5 min.
  *
  * Usa los tokens del dashboard (JetBrains Mono, fondo #0C0C0E, acento #A78BFA).
  */
@@ -128,6 +132,29 @@ peruPageRouter.get('/', async (c) => {
     FROM poll_logs WHERE bot_id = ${botId} AND earliest_date IS NOT NULL AND created_at > ${since}
     GROUP BY h ORDER BY h`)).rows as any[];
 
+  // ── Sniper ───────────────────────────────────────────────────────────
+  // El sniper es un proceso aparte en el RPi (`scripts/peru-sniper-299.ts`). No
+  // tiene run de Trigger.dev, entonces su unica senal de vida es la fila que deja
+  // en `sniper_scans` con la regla cambio mas latido de 5 min.
+  const scanRows = (await db.execute(sql`
+    SELECT phase, payload,
+           to_char(scanned_at,'MM-DD HH24:MI:SS') AS visto,
+           round(extract(epoch FROM (now() AT TIME ZONE 'UTC') - scanned_at)) AS hace_s
+    FROM sniper_scans WHERE scan_key = 'peru-299'
+    ORDER BY scanned_at DESC LIMIT 8`)).rows as any[];
+  const scan = scanRows[0];
+  const scanPay = (scan?.payload ?? {}) as Record<string, unknown>;
+  const scanAge = scan ? Number(scan.hace_s) : null;
+  // El latido se escribe cada 5 min. Con 12 min sin fila, el proceso esta caido.
+  const sniperVivo = scanAge != null && scanAge < 12 * 60;
+
+  // Disparos que salieron del sniper, separados de los de la cadena normal.
+  const sniperShots = (await db.execute(sql`
+    SELECT count(*) AS n, count(*) FILTER (WHERE success) AS ok
+    FROM reschedule_logs
+    WHERE bot_id = ${botId} AND detail->>'source' = 'peru-sniper-299'
+      AND created_at > ${since}`)).rows[0] as any;
+
   // ── Salud ────────────────────────────────────────────────────────────
   const health = (await db.execute(sql`
     SELECT status, count(*) AS n, to_char(max(created_at),'MM-DD HH24:MI') AS ultimo
@@ -155,6 +182,10 @@ peruPageRouter.get('/', async (c) => {
     : idle > 15
     ? `<div class="blocker">La cadena lleva <b>${idle} min</b> sin correr. El bot no esta vigilando.
        <span class="blocker-long">Revisalo con <code>npx tsx --env-file=.env scripts/set-bot-active.ts ${botId}</code></span></div>`
+    : !sniperVivo
+    ? `<div class="blocker">El sniper del RPi no da senal${scanAge != null ? ` hace ${Math.round(scanAge / 60)} min` : ''}.
+       La cadena normal sigue, y se pierde la fase del minuto.
+       <span class="blocker-long">Revisalo con <code>ssh rpi "systemctl status peru-sniper-299"</code></span></div>`
     : quotaLeft === 0
       ? `<div class="blocker">Sin movimientos disponibles (tope: ${capBy}). Este bot ya no puede reagendar.</div>`
       : quotaLeft === 1
@@ -236,6 +267,52 @@ peruPageRouter.get('/', async (c) => {
   </table></div>
   <p class="foot muted">manda: <b>${esc(capBy)}</b> · para releer el portal:
      <code>npx tsx --env-file=.env scripts/sync-portal-limits.ts --bots ${botId} --commit</code></p>
+</section>
+
+<section class="block">
+  <h2>Sniper · el proceso que dispara</h2>
+  <p class="sub">Corre aparte en el RPi, fuera del cron. El cron decide el momento cada 2 min.
+     Este proceso elige el segundo exacto, con el token ya pedido de antemano.</p>
+  <div class="scroll"><table>
+    <tr><th>que</th><th>valor</th><th>por que</th></tr>
+    <tr>
+      <td>estado</td>
+      <td class="${sniperVivo ? 'tone-good' : 'tone-stop'}">${sniperVivo ? `vivo, visto hace ${scanAge}s` : scan ? `sin senal hace ${Math.round((scanAge ?? 0) / 60)} min` : 'nunca escribio'}</td>
+      <td class="muted">deja un latido en <code>sniper_scans</code> cada 5 min</td>
+    </tr>
+    <tr>
+      <td>fase del minuto</td>
+      <td>segundos ${esc((scanPay.segundosTick as number[] ?? [14, 18]).join(' y '))} UTC</td>
+      <td class="muted">dos disparos rodean el borde de liberacion de es-pe</td>
+    </tr>
+    <tr>
+      <td>ventana medida</td>
+      <td>s${esc((scanPay.ventanaSeg as number[] ?? [15, 24])[0])}-${esc((scanPay.ventanaSeg as number[] ?? [15, 24])[1])}</td>
+      <td class="muted">ahi salen las fechas a menos de 6 meses, 5,15x la media</td>
+    </tr>
+    <tr>
+      <td>edad del token</td>
+      <td>${scanPay.edadTokenS != null ? `${esc(scanPay.edadTokenS)}s` : '-'}</td>
+      <td class="muted">se refresca a los 10 min, vence a los 45</td>
+    </tr>
+    <tr>
+      <td>lo mas temprano que ofrece el portal</td>
+      <td>${esc(scanPay.masTemprana ?? '-')}</td>
+      <td class="muted">de ${esc(scanPay.dias ?? '-')} dias, en ${fmtMs(scanPay.msDias as number)}</td>
+    </tr>
+    <tr>
+      <td>disparos del sniper</td>
+      <td class="${Number(sniperShots?.ok ?? 0) > 0 ? 'tone-good' : ''}">${sniperShots?.n ?? 0} intentos · ${sniperShots?.ok ?? 0} tomados</td>
+      <td class="muted">reclama el cupo con un UPDATE atomico, igual que la cadena</td>
+    </tr>
+  </table></div>
+  ${scanRows.length > 1 ? `<div class="scroll"><table>
+    <tr><th>visto</th><th>fase</th><th>mas temprana</th><th>dias</th></tr>
+    ${scanRows.map((r: any) => `<tr><td class="muted">${esc(r.visto)}</td><td>${esc(r.phase)}</td>
+      <td>${esc((r.payload ?? {}).masTemprana ?? '-')}</td><td>${esc((r.payload ?? {}).dias ?? '-')}</td></tr>`).join('')}
+  </table></div>` : ''}
+  <p class="foot muted">estado real del servicio:
+     <code>ssh rpi "systemctl status peru-sniper-299"</code></p>
 </section>
 
 <section class="block">
