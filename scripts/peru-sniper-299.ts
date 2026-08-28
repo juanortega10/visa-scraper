@@ -37,7 +37,7 @@ import { loginWithFallback } from '../src/services/login.js';
 import { VisaClient } from '../src/services/visa-client.js';
 import {
   elegirFecha, verificarDisparo, cupoEfectivo, veredictoToken, POLITICA_TOKEN,
-  msHastaSegundo, enVentana, VENTANA_PE,
+  msHastaProximoTick, enVentana, VENTANA_PE,
   type SniperPeruConfig, type EstadoToken,
 } from '../src/services/peru-sniper-core.js';
 
@@ -45,8 +45,14 @@ const BOT_ID = Number(process.env.SNIPER_BOT_ID ?? 299);
 const COMMIT = process.argv.includes('--commit');
 const UNA_VUELTA = process.argv.includes('--una-vuelta');
 
-/** Segundo del minuto UTC en que arranca el disparo. La respuesta cae en s15-24. */
-const SEGUNDO_TICK = 14;
+/**
+ * Segundos del minuto UTC en que se dispara. DOS por minuto, a proposito.
+ *
+ * El borde de liberacion cae en el segundo 14-15 UTC (ver [[release-clock-second-14]]).
+ * Con `days.json` en 235-1.100 ms, un solo disparo en s14 puede llegar justo ANTES
+ * de la liberacion y perder el cupo por un minuto entero. El de s18 lo recoge.
+ */
+const SEGUNDOS_TICK = [14, 18] as const;
 /** Edad maxima de la sesion antes de re-login preventivo. El TTL duro del portal es ~1h28m. */
 const SESION_MAX_MS = 44 * 60_000;
 /** Una fecha que fallo el POST no se reintenta durante este tiempo. */
@@ -64,6 +70,8 @@ type FilaBot = typeof bots.$inferSelect;
 interface Sesion {
   client: VisaClient;
   creadaMs: number;
+  /** Identidad de esta sesion. Cambia solo con un login nuevo. */
+  id: string;
   token: EstadoToken | null;
 }
 
@@ -113,7 +121,7 @@ async function abrirSesion(row: FilaBot): Promise<Sesion> {
     },
   );
   log(`  [sesion] login por ${via}, cookie ${login.cookie.length} bytes`);
-  const s: Sesion = { client, creadaMs: Date.now(), token: null };
+  const s: Sesion = { client, creadaMs: Date.now(), id: `ses-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, token: null };
   await precalentar(s);
   return s;
 }
@@ -130,7 +138,7 @@ async function precalentar(s: Sesion): Promise<boolean> {
     await s.client.refreshTokens();
     const ses = s.client.getSession();
     if (!ses.authenticityToken) { log('  [token] la pagina no trae authenticity_token'); s.token = null; return false; }
-    s.token = { emitidoMs: Date.now(), cookie: ses.cookie, token: ses.authenticityToken };
+    s.token = { emitidoMs: Date.now(), sesionId: s.id, token: ses.authenticityToken };
     return true;
   } catch (e) {
     log(`  [token] refresco fallo: ${(e as Error).message}`);
@@ -147,13 +155,12 @@ async function sesionLista(row: FilaBot): Promise<Sesion> {
   }
   if (!sesion) sesion = await abrirSesion(row);
 
-  const ses = sesion.client.getSession();
-  const v = veredictoToken(sesion.token, ses.cookie, Date.now(), POLITICA_TOKEN);
+  const v = veredictoToken(sesion.token, sesion.id, Date.now(), POLITICA_TOKEN);
   if (v === 'refrescar') {
     log('  [token] paso la cadencia de 10 min. Refresco por rutina.');
     await precalentar(sesion);
   } else if (v === 'vencido') {
-    log('  [token] vencido o atado a otra cookie. Refresco obligatorio.');
+    log('  [token] vencido o de otra sesion. Refresco obligatorio.');
     if (!(await precalentar(sesion))) {
       log('  [token] sin token tras el refresco. Re-login completo.');
       sesion = await abrirSesion(row);
@@ -216,7 +223,10 @@ async function vuelta(): Promise<Resultado> {
   const quemadaHasta = fecha ? quemadas.get(fecha) ?? 0 : 0;
 
   if (!fecha) {
-    log(`  dias ${dias.length} · ${msDias} ms · nada util (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
+    // Se muestra la mas temprana que el portal ofrece. Sirve para ver de lejos si
+    // el portal se acerca a la meta, y para notar un filtro que descarta de mas.
+    const masTemprana = (dias as Array<{ date: string }>).map((d) => d.date).sort()[0] ?? '(ninguna)';
+    log(`  dias ${dias.length} · ${msDias} ms · nada util · mas temprana ${masTemprana} (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
     return { agendado: false };
   }
   if (Date.now() < quemadaHasta) {
@@ -252,8 +262,7 @@ async function vuelta(): Promise<Resultado> {
   }
 
   // 5 · el token debe estar vivo AHORA, no cuando se precalento
-  const ses = s.client.getSession();
-  if (veredictoToken(s.token, ses.cookie, Date.now(), POLITICA_TOKEN) === 'vencido') {
+  if (veredictoToken(s.token, s.id, Date.now(), POLITICA_TOKEN) === 'vencido') {
     log('  ABORTA: el token vencio justo antes del POST. Se refresca para la proxima.');
     await precalentar(s);
     return { agendado: false };
@@ -325,12 +334,16 @@ async function main() {
   log(`  modo: ${COMMIT ? '*** COMMIT (REAL) ***' : 'DRY-RUN'}${UNA_VUELTA ? ' · una vuelta' : ''}`);
   log(`  cita ${row.currentConsularDate} ${row.currentConsularTime} · meta antes de ${row.targetDateBefore}`);
   log(`  cupo ${cupo.quedan} (tope ${cupo.topeDe}) · nuestro ${row.rescheduleCount}/${row.maxReschedules} · portal ${row.portalRemainingReschedules}`);
-  log(`  fase: 1 peticion por minuto en el segundo ${SEGUNDO_TICK} UTC · ventana s${VENTANA_PE.inicioSeg}-${VENTANA_PE.finSeg - 1}`);
+  log(`  fase: ${SEGUNDOS_TICK.length} peticiones por minuto, segundos ${SEGUNDOS_TICK.join(' y ')} UTC · ventana s${VENTANA_PE.inicioSeg}-${VENTANA_PE.finSeg - 1}`);
   log(`  token: refresco cada ${POLITICA_TOKEN.cadenciaMs / 60000} min, techo ${POLITICA_TOKEN.techoMs / 60000} min`);
+
+  // La sesion se abre ANTES del bucle. El login tarda ~17 s y desalinearia la
+  // primera vuelta: la peticion caeria en el segundo 25, fuera de la ventana.
+  try { await sesionLista(row); } catch (e) { log(`  [sesion] arranque fallo: ${(e as Error).message}`); }
 
   let errores = 0;
   for (;;) {
-    await sleep(msHastaSegundo(Date.now(), SEGUNDO_TICK));
+    await sleep(msHastaProximoTick(Date.now(), SEGUNDOS_TICK));
     try {
       const r = await vuelta();
       errores = 0;

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   cupoEfectivo, sumarDias, elegirFecha, verificarDisparo,
-  veredictoToken, POLITICA_TOKEN, msHastaSegundo, enVentana, VENTANA_PE,
+  veredictoToken, POLITICA_TOKEN, msHastaSegundo, msHastaProximoTick, enVentana, VENTANA_PE,
   type SniperPeruConfig,
 } from '../peru-sniper-core.js';
 
@@ -158,33 +158,38 @@ describe('verificarDisparo', () => {
 
 describe('veredictoToken', () => {
   const T0 = Date.parse('2026-08-28T12:00:00Z');
-  const estado = { emitidoMs: T0, cookie: 'ck1', token: 'abc' };
+  const estado = { emitidoMs: T0, sesionId: 'ses1', token: 'abc' };
 
   it('recien emitido esta ok', () => {
-    expect(veredictoToken(estado, 'ck1', T0 + 60_000)).toBe('ok');
+    expect(veredictoToken(estado, 'ses1', T0 + 60_000)).toBe('ok');
+  });
+
+  it('la cookie rotada NO lo invalida: solo cuenta la sesion', () => {
+    // El portal rota `_yatri_session` en cada respuesta y la original sigue valida.
+    expect(veredictoToken(estado, 'ses1', T0 + 45_000)).toBe('ok');
   });
 
   it('a los 10 min pide refresco y todavia sirve', () => {
-    expect(veredictoToken(estado, 'ck1', T0 + POLITICA_TOKEN.cadenciaMs)).toBe('refrescar');
-    expect(veredictoToken(estado, 'ck1', T0 + 44 * 60_000)).toBe('refrescar');
+    expect(veredictoToken(estado, 'ses1', T0 + POLITICA_TOKEN.cadenciaMs)).toBe('refrescar');
+    expect(veredictoToken(estado, 'ses1', T0 + 44 * 60_000)).toBe('refrescar');
   });
 
   it('a los 45 min queda vencido', () => {
-    expect(veredictoToken(estado, 'ck1', T0 + POLITICA_TOKEN.techoMs)).toBe('vencido');
-    expect(veredictoToken(estado, 'ck1', T0 + 60 * 60_000)).toBe('vencido');
+    expect(veredictoToken(estado, 'ses1', T0 + POLITICA_TOKEN.techoMs)).toBe('vencido');
+    expect(veredictoToken(estado, 'ses1', T0 + 60 * 60_000)).toBe('vencido');
   });
 
-  it('una cookie distinta lo mata aunque sea nuevo', () => {
-    expect(veredictoToken(estado, 'ck2', T0 + 1000)).toBe('vencido');
+  it('un login nuevo lo mata aunque sea reciente', () => {
+    expect(veredictoToken(estado, 'ses2', T0 + 1000)).toBe('vencido');
   });
 
   it('sin estado o sin token queda vencido', () => {
-    expect(veredictoToken(null, 'ck1', T0)).toBe('vencido');
-    expect(veredictoToken({ ...estado, token: '' }, 'ck1', T0)).toBe('vencido');
+    expect(veredictoToken(null, 'ses1', T0)).toBe('vencido');
+    expect(veredictoToken({ ...estado, token: '' }, 'ses1', T0)).toBe('vencido');
   });
 
   it('un reloj que retrocede queda vencido, nunca ok', () => {
-    expect(veredictoToken(estado, 'ck1', T0 - 5_000)).toBe('vencido');
+    expect(veredictoToken(estado, 'ses1', T0 - 5_000)).toBe('vencido');
   });
 });
 
@@ -214,5 +219,36 @@ describe('fase del minuto', () => {
     expect(enVentana(min + 24_999)).toBe(true);
     expect(enVentana(min + 25_000)).toBe(false);
     expect(VENTANA_PE).toEqual({ inicioSeg: 15, finSeg: 25 });
+  });
+});
+
+describe('msHastaProximoTick', () => {
+  const min = Date.parse('2026-08-28T12:34:00Z');
+  const ticks = [14, 18] as const;
+
+  it('toma el proximo de los dos segundos', () => {
+    expect(msHastaProximoTick(min + 5_000, ticks)).toBe(9_000);
+    expect(msHastaProximoTick(min + 15_000, ticks)).toBe(3_000);
+  });
+
+  it('pasados los dos, salta al s14 del minuto siguiente', () => {
+    expect(msHastaProximoTick(min + 20_000, ticks)).toBe(54_000);
+  });
+
+  it('nunca devuelve 0 ni negativo', () => {
+    for (let s = 0; s < 60; s++) {
+      expect(msHastaProximoTick(min + s * 1000, ticks)).toBeGreaterThan(0);
+    }
+  });
+
+  it('los dos disparos rodean el borde de liberacion del segundo 15', () => {
+    // El primero pregunta justo antes, el segundo justo despues.
+    expect(ticks[0]).toBeLessThan(VENTANA_PE.inicioSeg);
+    expect(ticks[1]).toBeGreaterThan(VENTANA_PE.inicioSeg);
+    expect(ticks[1]).toBeLessThan(VENTANA_PE.finSeg);
+  });
+
+  it('sin segundos configurados espera un minuto', () => {
+    expect(msHastaProximoTick(min, [])).toBe(60_000);
   });
 });

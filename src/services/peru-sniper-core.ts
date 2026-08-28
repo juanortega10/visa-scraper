@@ -147,8 +147,16 @@ export function verificarDisparo(
 export interface EstadoToken {
   /** Momento en que el portal emitio el `authenticity_token`. */
   emitidoMs: number;
-  /** Cookie `_yatri_session` que lo emitio. Un re-login la rota y mata el token. */
-  cookie: string;
+  /**
+   * Identidad de la SESION que lo emitio, no la cookie.
+   *
+   * El `authenticity_token` esta atado a la sesion de Rails. Un login nuevo la
+   * cambia y mata el token viejo. La cookie `_yatri_session` NO sirve como clave:
+   * el portal la rota en cada respuesta y la original sigue valida (CLAUDE.md).
+   * Medido el 2026-08-28: atarlo a la cookie daba el token por vencido cada 45 s
+   * y forzaba un refresco por vuelta, justo lo que el precalentamiento evita.
+   */
+  sesionId: string;
   token: string;
 }
 
@@ -173,18 +181,17 @@ export type VeredictoToken = 'ok' | 'refrescar' | 'vencido';
  *   `refrescar` paso la cadencia. Sirve todavia, y conviene renovarlo ya.
  *   `ok`        nuevo.
  *
- * La cookie entra en la cuenta porque el token esta atado a ella: `poll-visa.ts`
- * hace re-login y rota la cookie, y ahi el token viejo deja de valer aunque sea
- * reciente.
+ * La sesion entra en la cuenta porque el token esta atado a ella: un re-login
+ * emite una sesion nueva, y ahi el token viejo deja de valer aunque sea reciente.
  */
 export function veredictoToken(
   estado: EstadoToken | null,
-  cookieActual: string,
+  sesionActual: string,
   ahoraMs: number,
   pol: PoliticaToken = POLITICA_TOKEN,
 ): VeredictoToken {
   if (!estado || !estado.token) return 'vencido';
-  if (estado.cookie !== cookieActual) return 'vencido';
+  if (estado.sesionId !== sesionActual) return 'vencido';
   const edad = ahoraMs - estado.emitidoMs;
   if (edad < 0) return 'vencido';
   if (edad >= pol.techoMs) return 'vencido';
@@ -206,6 +213,17 @@ export function msHastaSegundo(ahoraMs: number, objetivoSeg: number): number {
   const objetivoMs = objetivoSeg * 1000;
   const falta = objetivoMs - dentroDelMinuto;
   return falta > 0 ? falta : falta + 60_000;
+}
+
+/**
+ * Milisegundos hasta el proximo disparo, con varios segundos objetivo por minuto.
+ * Dos disparos por minuto abrazan el borde de liberacion: uno cae justo antes y
+ * otro justo despues, entonces un cupo liberado en el borde no espera un minuto
+ * entero. Devuelve siempre un valor mayor que 0.
+ */
+export function msHastaProximoTick(ahoraMs: number, segundos: readonly number[]): number {
+  if (segundos.length === 0) return 60_000;
+  return Math.min(...segundos.map((s) => msHastaSegundo(ahoraMs, s)));
 }
 
 /** True si ese instante cae dentro de la ventana de liberacion de es-pe. */
