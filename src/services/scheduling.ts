@@ -175,12 +175,60 @@ export function accountBanBackoffMs(count: number): number {
   return 30 * 60_000 * 2 ** step; // 30m,60m,120m,240m,480m
 }
 
+/**
+ * Bloqueo de la RUTA del schedule (nginx 444 sobre `/schedule/{id}/...`) — FUENTE UNICA.
+ *
+ * `probeScheduleBlock()` confirma que el dominio responde, entonces el bloqueo vive en
+ * la ruta del schedule y rotar la IP no sirve. Antes el bot se auto-pausaba en el segundo
+ * poll seguido (`poll-visa.ts`, quitado el 2026-08-30): el bot quedaba mudo hasta que una
+ * persona lo reactivaba a mano. Los bots 281 y 298 pasaron 2 y 3 dias sin pollear sin que
+ * nadie se enterara.
+ *
+ * Ahora el bot nunca se pausa. La compensacion es una curva mas larga que la de cuenta:
+ * 240m → 480m → 720m (tope 12h). Al tope el bot sondea 2 veces al dia y se recupera solo
+ * con el primer poll `ok`. El bloqueo del bot 298 duro del 2026-08-28 al 2026-08-29,
+ * entonces 12h de tope deja como maximo medio dia de retraso en la recuperacion.
+ *
+ * La usan `poll-visa.ts` (elige el delay del self-trigger) y `ensure-chain.ts` (decide si
+ * puede revivir una cadena muerta). Cualquier cambio de escalon va SOLO aqui.
+ */
+export function scheduleBlockedBackoffMs(count: number): number {
+  const tiers = [240, 480, 720]; // minutos
+  const idx = Math.min(Math.max(count, 1), tiers.length) - 1;
+  return tiers[idx]! * 60_000;
+}
+
+/** Trigger.dev delay string form of {@link scheduleBlockedBackoffMs}. */
+export function scheduleBlockedBackoffDelay(count: number): string {
+  return `${Math.round(scheduleBlockedBackoffMs(count) / 60_000)}m`;
+}
+
+/**
+ * Backoff que le toca a una fila de bloqueo segun su clasificacion.
+ * `schedule_blocked` pesa mas que `account_ban`, entonces los dos lectores
+ * (poll-visa y ensure-chain) deciden con la misma regla.
+ */
+export function blockBackoffMs(blockCls: string | null, count: number): number {
+  return blockCls === 'schedule_blocked'
+    ? scheduleBlockedBackoffMs(count)
+    : accountBanBackoffMs(count);
+}
+
 
 /** Fila reciente de `poll_logs`, reducida a lo que necesita el contador de rachas. */
 export interface RecentBlockRow {
   status: string;
   blockCls: string | null;
 }
+
+/**
+ * Clasificaciones que mantienen viva la racha de bloqueos.
+ *
+ * `schedule_blocked` entra desde el 2026-08-30: la sonda de `probeScheduleBlock()` reescribe
+ * la fila de `poll_logs`, y sin esta lista la racha se cortaba en cada refinamiento, el
+ * contador volvia a 0 y el backoff nunca escalaba.
+ */
+export const SUSTAINED_BLOCK_CLASSES = ['account_ban', 'schedule_blocked'];
 
 /**
  * Cuenta los bloqueos de cuenta SEGUIDOS al frente de la ventana de `poll_logs`.
@@ -193,7 +241,7 @@ export interface RecentBlockRow {
  */
 export function countSustainedAccountBans(rows: RecentBlockRow[]): number {
   const firstBreak = rows.findIndex(
-    (r) => !(r.status === 'tcp_blocked' && r.blockCls === 'account_ban'),
+    (r) => !(r.status === 'tcp_blocked' && SUSTAINED_BLOCK_CLASSES.includes(r.blockCls ?? '')),
   );
   return firstBreak === -1 ? rows.length : firstBreak;
 }
@@ -233,8 +281,9 @@ export const TOPE_SIN_BAN_MS = 35 * 60_000;
  * y 299. Ver [[cadena-dormida-delayed-run]].
  *
  * La regla respeta los backoff legitimos:
- *   - con bloqueo de cuenta, el retraso justificado es `accountBanBackoffMs`, y se
- *     espera 1,5 veces eso antes de tocar nada. Nunca se acorta un ban.
+ *   - con bloqueo sostenido, el retraso justificado sale de `blockBackoffMs` segun la
+ *     clasificacion (`account_ban` 30m→480m, `schedule_blocked` 240m→720m), y se espera
+ *     1,5 veces eso antes de tocar nada. Nunca se acorta un bloqueo.
  *   - sin bloqueo, ningun retraso legitimo pasa de 35 min.
  *
  * `msSinPoll` es la edad de la fila mas nueva de `poll_logs` del bot. Con el
@@ -244,9 +293,11 @@ export const TOPE_SIN_BAN_MS = 35 * 60_000;
 export function debeDespertar(args: {
   msSinPoll: number;
   bansSeguidos: number;
+  /** Clasificacion de la fila de bloqueo mas nueva. `schedule_blocked` pide la curva larga. */
+  blockCls?: string | null;
 }): boolean {
   if (args.bansSeguidos > 0) {
-    return args.msSinPoll > accountBanBackoffMs(args.bansSeguidos) * 1.5;
+    return args.msSinPoll > blockBackoffMs(args.blockCls ?? null, args.bansSeguidos) * 1.5;
   }
   return args.msSinPoll > TOPE_SIN_BAN_MS;
 }
