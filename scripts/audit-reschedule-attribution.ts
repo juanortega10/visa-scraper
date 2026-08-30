@@ -41,13 +41,18 @@ const asJson = args.includes('--json');
 type BotAudit = AttributionSummary & { botId: number };
 
 async function auditBot(botId: number): Promise<BotAudit | null> {
-  const rows = await db
-    .select()
-    .from(rescheduleLogs)
-    .where(eq(rescheduleLogs.botId, botId))
-    .orderBy(asc(rescheduleLogs.createdAt), asc(rescheduleLogs.id));
+  // La cita real cierra la cadena. Sin ella, una fila de exito que nunca ocurrio se
+  // cobra completa: el bot 7 cobraba 464 dias con la cita quieta en 2027-07-30.
+  const [rows, [fila]] = await Promise.all([
+    db.select()
+      .from(rescheduleLogs)
+      .where(eq(rescheduleLogs.botId, botId))
+      .orderBy(asc(rescheduleLogs.createdAt), asc(rescheduleLogs.id)),
+    db.select({ currentConsularDate: bots.currentConsularDate })
+      .from(bots).where(eq(bots.id, botId)),
+  ]);
 
-  const summary = auditReschedules(rows);
+  const summary = auditReschedules(rows, { citaActual: fila?.currentConsularDate ?? null });
   if (summary.moves.length === 0) return null;
   return { botId, ...summary };
 }

@@ -214,3 +214,83 @@ describe('auditReschedules — production chains', () => {
     expect(s.billableDays).toBe(228);
   });
 });
+
+/**
+ * La cadena tiene que CERRAR contra la cita real del bot.
+ *
+ * Sin este cierre, una fila `success=true` que nunca ocurrio se cobra completa,
+ * porque con una sola fila no hay cadena que se rompa. Caso real: bot 7 el
+ * 2026-04-17, 464 dias cobrables con la cita quieta en 2027-07-30 durante 277
+ * intentos entre 2026-02-24 y 2026-08-25.
+ */
+describe('auditReschedules — la cadena cierra contra la cita real', () => {
+  it('ADVERSARIAL: el caso del bot 7 no cobra nada', () => {
+    const s = auditReschedules(
+      [row({ old: '2027-07-30', neu: '2026-04-22', error: '[best_available] attempt 1, #1/1 (speculative)' })],
+      { citaActual: '2027-07-30' },   // la cita NUNCA se movio
+    );
+    expect(s.botDays).toBe(464);          // el log sigue diciendo lo que dice
+    expect(s.billableDays).toBe(0);       // y no se cobra nada
+    expect(s.netDays).toBe(0);            // el avance real es cero
+    expect(s.moves.some((m) => m.kind === 'chain_open')).toBe(true);
+  });
+
+  it('sin citaActual conserva el comportamiento anterior', () => {
+    const s = auditReschedules(
+      [row({ old: '2027-07-30', neu: '2026-04-22' })],
+    );
+    expect(s.billableDays).toBe(464);
+    expect(s.moves.some((m) => m.kind === 'chain_open')).toBe(false);
+  });
+
+  it('una cadena que SI cierra cobra normal', () => {
+    const s = auditReschedules(
+      [row({ old: '2027-04-20', neu: '2026-11-24' })],
+      { citaActual: '2026-11-24' },
+    );
+    expect(s.billableDays).toBe(147);
+    expect(s.moves.some((m) => m.kind === 'chain_open')).toBe(false);
+  });
+
+  it('el dueno mueve la cita al futuro DESPUES: no se cobra el ida y vuelta', () => {
+    const s = auditReschedules(
+      [row({ old: '2027-03-15', neu: '2026-09-08' })],
+      { citaActual: '2027-03-15' },
+    );
+    expect(s.botDays).toBe(188);
+    expect(s.billableDays).toBe(0);
+    expect(s.netDays).toBe(0);
+  });
+
+  it('el dueno mueve la cita PARCIALMENTE hacia atras: se cobra lo que quedo', () => {
+    // bot: 2027-01-01 -> 2026-06-01 (214d). Despues alguien la deja en 2026-08-01.
+    const s = auditReschedules(
+      [row({ old: '2027-01-01', neu: '2026-06-01' })],
+      { citaActual: '2026-08-01' },
+    );
+    expect(s.botDays).toBe(214);
+    expect(s.netDays).toBe(153);          // avance real que le queda al cliente
+    expect(s.billableDays).toBe(153);     // el techo lo recorta
+  });
+
+  it('mantiene la invariante botDays + externalDays === netDays', () => {
+    for (const cita of ['2027-07-30', '2026-04-22', '2026-08-01', '2028-01-01']) {
+      const s = auditReschedules(
+        [row({ old: '2027-07-30', neu: '2026-04-22' })],
+        { citaActual: cita },
+      );
+      expect(s.botDays + s.externalDays).toBe(s.netDays);
+    }
+  });
+
+  it('el tramo de cierre nunca sale como cobrable', () => {
+    const s = auditReschedules(
+      [row({ old: '2027-07-30', neu: '2026-04-22' })],
+      { citaActual: '2025-01-01' },   // cita mucho mas temprana, sin log que la explique
+    );
+    const cierre = s.moves.find((m) => m.kind === 'chain_open');
+    expect(cierre).toBeDefined();
+    expect(cierre!.billable).toBe(false);
+    expect(cierre!.actor).toBe('external');
+  });
+});

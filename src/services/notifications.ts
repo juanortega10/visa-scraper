@@ -96,29 +96,83 @@ export async function sendAgencyBatchSummaryEmail(
   await sendEmail(0, 'agency_batch_summary', to, subject, html);
 }
 
+/**
+ * Firma canónica para la función `send-cobro` de Kapso.
+ *
+ * Kapso BORRA todos los headers personalizados antes de invocar el worker, así que `X-Signature`
+ * nunca llega y el HMAC por header no puede funcionar. La firma viaja dentro del cuerpo, en
+ * `signature`. Se firma esta cadena y no el JSON completo porque el orden de las llaves al
+ * re-serializar no es estable entre runtimes: bastaría eso para tumbar la firma sin que haya
+ * ningún problema de seguridad. Los campos son los que determinan cuánto se cobra.
+ *
+ * El verificador vive en `visa_frontend/kapso-functions/send-cobro.js` y arma la misma cadena.
+ * Si cambias uno, cambia el otro.
+ */
+export function firmaCanonicaCobro(
+  secret: string,
+  event: string,
+  timestamp: string,
+  data: { phone?: unknown; oldConsularDate?: unknown; newConsularDate?: unknown },
+): string {
+  const canon = [
+    event ?? '',
+    timestamp ?? '',
+    data.phone ?? '',
+    data.oldConsularDate ?? '',
+    data.newConsularDate ?? '',
+  ].join('|');
+  return createHmac('sha256', secret).update(canon).digest('hex');
+}
+
 async function sendWebhook(
   botId: number,
   event: string,
   url: string,
   payload: Record<string, unknown>,
+  opts: { kapsoFunction?: boolean } = {},
 ): Promise<void> {
-  const body = JSON.stringify(payload);
   const secret = process.env.WEBHOOK_SECRET;
   if (!secret) throw new Error('WEBHOOK_SECRET env var required for webhook signing');
-  const signature = createHmac('sha256', secret)
-    .update(body)
-    .digest('hex');
+
+  // Las funciones de Kapso necesitan la llave de plataforma en `X-API-Key`: sin ella el gateway
+  // responde 404 "Function not found" y el worker ni siquiera corre. Ese 404 mudo se comió los
+  // 80 webhooks de cobro entre el 5 y el 12 de agosto de 2026.
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  let sendPayload = payload;
+
+  if (opts.kapsoFunction) {
+    const apiKey = process.env.KAPSO_API_KEY;
+    if (!apiKey) throw new Error('KAPSO_API_KEY env var required to invoke a Kapso function');
+    headers['X-API-Key'] = apiKey;
+    sendPayload = {
+      ...payload,
+      signature: firmaCanonicaCobro(
+        secret,
+        String(payload.event ?? ''),
+        String(payload.timestamp ?? ''),
+        (payload.data ?? {}) as Record<string, unknown>,
+      ),
+    };
+  } else {
+    // Webhooks de cliente (bot.webhook_url): siguen con la firma por header de siempre.
+    headers['X-Signature'] = createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+  }
+
+  const body = JSON.stringify(sendPayload);
 
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Signature': signature,
-      },
+      headers,
       body,
       signal: AbortSignal.timeout(10_000),
     });
+    // Un 401 o un 404 NO es un envío correcto. Marcarlo como `sent` fue lo que dejó el fallo
+    // invisible una semana entera: `notification_logs` decía 80 enviados y no llegó ninguno.
+    if (!res.ok) {
+      const detalle = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${detalle.slice(0, 200)}`);
+    }
     console.log(`[notify] webhook sent bot=${botId} event=${event} url=${url} status=${res.status}`);
     await logNotification(botId, event, 'webhook', url, 'sent');
   } catch (e) {
@@ -695,6 +749,33 @@ ${card(kvTable(kvRows))}
     return { subject, html };
   }
 
+  // Sniper dual (bots 140+141). Un solo formato para todos los eventos `sniper_*`.
+  if (event.startsWith('sniper_')) {
+    const TITLES: Record<string, { t: string; color: string; badge: string; bg: string }> = {
+      sniper_ready:         { t: 'Cupo listo para agendar', color: C_TEAL,   badge: 'AHORA',    bg: C_TEAL_BG },
+      sniper_done:          { t: 'Las dos citas quedaron',  color: C_TEAL,   badge: 'LOGRADO',  bg: C_TEAL_BG },
+      sniper_split:         { t: 'Un grupo se movio y el otro no', color: C_RED, badge: 'ACCION', bg: '#fee2e2' },
+      sniper_cas_found:     { t: 'Aparecio CAS',            color: C_TEAL,   badge: 'CAMBIO',   bg: C_TEAL_BG },
+      sniper_window_change: { t: 'Cambio la disponibilidad', color: C_ORANGE, badge: 'CAMBIO',   bg: '#fff7ed' },
+      sniper_deadline:      { t: 'El sniper se detuvo',     color: C_ORANGE, badge: 'FIN',      bg: '#fff7ed' },
+      sniper_down:          { t: 'El sniper dejo de responder', color: C_RED, badge: 'ACCION',  bg: '#fee2e2' },
+    };
+    const meta = TITLES[event] ?? { t: event, color: C_MID, badge: 'INFO', bg: C_BG };
+    const rows = Object.entries(data)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => `<tr>
+        <td style="${F_BODY};font-size:13px;color:${C_DIM};padding:4px 12px 4px 0;white-space:nowrap;vertical-align:top">${esc(k)}</td>
+        <td style="${F_BODY};font-size:14px;color:${C_DARK};padding:4px 0;font-weight:600">${esc(typeof v === 'object' ? JSON.stringify(v) : String(v))}</td>
+      </tr>`).join('');
+    const subject = `Sniper Alvarez/Perez: ${meta.t}`;
+    const html = _wrap(`
+<h2 style="${F_SYNE};font-size:24px;font-weight:800;color:${C_DARK};margin:0 0 12px"><span style="color:${meta.color}">${esc(meta.t)}</span></h2>
+<p style="${F_BODY};font-size:15px;color:${C_MID};margin:0 0 16px">${badge(meta.badge, meta.bg, meta.color)} &nbsp;Bots 140 y 141, familia Alvarez / Perez.</p>
+${card(`<table style="border-collapse:collapse;width:100%">${rows}</table>`)}
+<p style="${F_BODY};font-size:14px;color:${C_MID};margin-top:20px">Detalle completo en <a href="https://visa.homiapp.xyz/dashboard/sniper" style="color:${C_TEAL};font-weight:600">el panel del sniper</a>.</p>`);
+    return { subject, html };
+  }
+
   // Generic fallback
   const subject = `Visa bot: ${event}`;
   const html = _wrap(`
@@ -704,7 +785,16 @@ ${card(`<pre style="${F_BODY};font-size:13px;color:${C_MID};white-space:pre-wrap
 }
 
 // Events sent to notificationEmail (dev/admin) — operational noise excluded
-const NOTIFICATION_EMAIL_EVENTS = new Set(['reschedule_success', 'bot_paused']);
+// Los eventos `sniper_*` solo los emite `scripts/dual-sniper-victoria.ts`. Ningun bot de la
+// flota los produce, entonces agregarlos aqui no genera correo para los otros 231 bots.
+const NOTIFICATION_EMAIL_EVENTS = new Set([
+  'reschedule_success', 'bot_paused',
+  // Solo lo accionable. `sniper_window_change` quedo FUERA a proposito: los dias del
+  // tramo prioritario aparecen y desaparecen en menos de 1 minuto, entonces avisar de eso
+  // es ruido. Ese cambio se ve en el log y en /dashboard/sniper.
+  'sniper_ready', 'sniper_done', 'sniper_split', 'sniper_cas_found',
+  'sniper_deadline', 'sniper_down',
+]);
 
 // Always receives reschedule_success regardless of bot owner
 const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
@@ -756,8 +846,14 @@ export async function notifyUser(
     promises.push(sendEmail(bot.id, event, bot.notificationEmail, subject, html));
   }
 
-  // Owner only gets reschedule_success — no operational spam
-  if (bot.ownerEmail && event === 'reschedule_success') {
+  // Owner only gets reschedule_success — no operational spam. Skip when it is
+  // the same inbox as notificationEmail, otherwise the agency gets the identical
+  // reschedule email twice.
+  const ownerIsDuplicate =
+    !!bot.ownerEmail && !!bot.notificationEmail &&
+    bot.ownerEmail.trim().toLowerCase() === bot.notificationEmail.trim().toLowerCase() &&
+    NOTIFICATION_EMAIL_EVENTS.has(event);
+  if (bot.ownerEmail && event === 'reschedule_success' && !ownerIsDuplicate) {
     const { subject, html } = buildEmail(event, data, buildOpts(bot.ownerEmail));
     promises.push(sendEmail(bot.id, event, bot.ownerEmail, subject, html));
   }
@@ -790,7 +886,7 @@ export async function notifyUser(
     };
     // Best-effort: que un fallo del CRM nunca tumbe la notificación al cliente.
     promises.push(
-      sendWebhook(bot.id, 'cobro_' + event, COBRO_WEBHOOK_URL, cobroPayload).catch((e) => {
+      sendWebhook(bot.id, 'cobro_' + event, COBRO_WEBHOOK_URL, cobroPayload, { kapsoFunction: true }).catch((e) => {
         console.error(`[notify] cobro webhook failed bot=${bot.id} error=${e instanceof Error ? e.message : String(e)}`);
       }),
     );

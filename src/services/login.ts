@@ -11,6 +11,7 @@ import {
   extractGroups,
   extractScheduleApplicantPairs,
   hasKnownFacilities,
+  isSchedulableGroup,
   AppointmentFormMissingError,
 } from './html-parsers.js';
 export type { GroupInfo as GroupResult } from './html-parsers.js';
@@ -43,6 +44,22 @@ export class AccountLockedError extends Error {
     super(message);
     this.name = 'AccountLockedError';
     this.lockedUntil = lockedUntil;
+  }
+}
+
+/**
+ * Every group on the account is in a portal state that cannot hold a consular
+ * appointment — in practice the visa fee (arancel) is unpaid. There is nothing for the
+ * bot to poll or move until the client pays and the portal schedules a first interview.
+ */
+export class NoSchedulableGroupError extends Error {
+  /** Portal state tokens found, e.g. ['needs_payment'] — for the support message. */
+  states: string[];
+
+  constructor(states: string[]) {
+    super(`No schedulable group on this account (portal states: ${states.join(', ') || 'unknown'})`);
+    this.name = 'NoSchedulableGroupError';
+    this.states = states;
   }
 }
 
@@ -327,11 +344,20 @@ export async function discoverAccount(
   const groupsHtml = await accountResp.text();
 
   // Extract all groups and schedule→applicant pairings from gear dropdown links
-  const groups = extractGroups(groupsHtml);
+  const allGroups = extractGroups(groupsHtml);
   const pairs = extractScheduleApplicantPairs(groupsHtml);
 
+  // Drop groups the portal cannot give an appointment to (unpaid visa fee). They carry
+  // no consular date, so offering them downstream only creates a bot with nothing to poll.
+  const groups = allGroups.filter(isSchedulableGroup);
+  if (allGroups.length > 0 && groups.length === 0) {
+    throw new NoSchedulableGroupError(
+      [...new Set(allGroups.map(g => g.status.token).filter((t): t is string => t != null))],
+    );
+  }
+
   // Primary group: prefer first with a future consular date (filters out CAS-only groups
-  // and past appointments). Fall back to first group overall.
+  // and past appointments). Fall back to first schedulable group.
   const today = new Date().toISOString().slice(0, 10);
   const primaryGroup = groups.find(g => g.currentConsularDate != null && g.currentConsularDate > today)
     ?? groups[0];

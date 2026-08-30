@@ -7,7 +7,7 @@ import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
 import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
-import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
+import { executeReschedule, MAX_EDAD_TOKEN_MS, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
 import { performLogin, InvalidCredentialsError, AccountLockedError, type LoginCredentials } from '../services/login.js';
@@ -140,7 +140,7 @@ export const pollVisaTask = task({
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore, targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
-      maxReschedules: bots.maxReschedules, portalRemainingReschedules: bots.portalRemainingReschedules, phaseAligned: bots.phaseAligned, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, minDaysFromToday: bots.minDaysFromToday, excludedWeekdays: bots.excludedWeekdays,
+      maxReschedules: bots.maxReschedules, portalRemainingReschedules: bots.portalRemainingReschedules, phaseAligned: bots.phaseAligned, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, speculativeTimes: bots.speculativeTimes, minDaysFromToday: bots.minDaysFromToday, excludedWeekdays: bots.excludedWeekdays,
       pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
       skippedPollsSinceLog: bots.skippedPollsSinceLog,
       proxyUrls: bots.proxyUrls,
@@ -305,6 +305,7 @@ export const pollVisaTask = task({
         yatriCookie: sessions.yatriCookie,
         csrfToken: sessions.csrfToken,
         authenticityToken: sessions.authenticityToken,
+        tokensRefreshedAt: sessions.tokensRefreshedAt,
         createdAt: sessions.createdAt,
         lastUsedAt: sessions.lastUsedAt,
       }).from(sessions).where(eq(sessions.botId, botId)),
@@ -419,11 +420,15 @@ export const pollVisaTask = task({
         if (loginResult.hasTokens) {
           newSessionData.csrfToken = loginResult.csrfToken;
           newSessionData.authenticityToken = loginResult.authenticityToken;
+          // Token nuevo: el sello arranca de cero. El `authenticity_token` esta atado
+          // a la sesion de Rails, entonces un login nuevo invalida el anterior.
+          newSessionData.tokensRefreshedAt = new Date();
         } else {
           // CRITICAL: old tokens are session-bound (authenticity_token) — invalid with new cookie.
           // Set to null to force refreshTokens() on next poll cycle.
           newSessionData.csrfToken = null;
           newSessionData.authenticityToken = null;
+          newSessionData.tokensRefreshedAt = null;
           logger.warn('Clearing stale tokens in DB (appointment page failed, old tokens invalid with new cookie)', { botId });
         }
         await db.update(sessions).set(newSessionData).where(eq(sessions.botId, botId));
@@ -433,10 +438,12 @@ export const pollVisaTask = task({
         if (loginResult.hasTokens) {
           session.csrfToken = loginResult.csrfToken;
           session.authenticityToken = loginResult.authenticityToken;
+          session.tokensRefreshedAt = new Date();
         } else {
           // Clear in-memory too — forces refreshTokens() later in this run
           session.csrfToken = null as unknown as string;
           session.authenticityToken = null as unknown as string;
+          session.tokensRefreshedAt = null;
         }
         session.createdAt = new Date();
 
@@ -496,6 +503,9 @@ export const pollVisaTask = task({
         proxyUrls: effectiveProxyUrls,
         userId: bot.userId,
         locale: bot.locale,
+        // Frescura heredada del run anterior. Permite que `ensureTokens()` se salte
+        // la pagina del appointment cuando el token ya venia precalentado.
+        tokensRefreshedAt: session.tokensRefreshedAt,
       },
     );
 
@@ -1279,6 +1289,33 @@ export const pollVisaTask = task({
           );
         }
 
+        // ── PRECALENTADO DEL TOKEN ──────────────────────────────────────────
+        // Se corre AQUI a proposito: el poll ya decidio y ya no hay cupo en juego.
+        // El `authenticity_token` vive con la sesion de Rails, entonces pedirlo con
+        // calma ahora vale igual que pedirlo con el cupo a la vista, y ahi costaba
+        // entre 4 y 14 segundos del camino critico (bot 299, 2026-08-27).
+        //
+        // Solo aplica a cuentas SIN CAS. Con CAS, `reschedule-logic` necesita
+        // `getHasAscFields()` de la lectura del momento y no se salta el refresco,
+        // entonces precalentar solo sumaria una peticion sin ahorrar nada.
+        //
+        // La cadencia es la mitad de `MAX_EDAD_TOKEN_MS`, para que el token todavia
+        // este dentro de la ventana cuando el poll siguiente lo quiera usar.
+        const usaCasEsteBot = !!bot.ascFacilityId && !bot.skipCas;
+        if (!dryRun && !usaCasEsteBot && !reschedulePersistedSession
+            && client.getTokensAgeMs() > MAX_EDAD_TOKEN_MS / 2) {
+          const t0Token = Date.now();
+          try {
+            const pedido = await client.ensureTokens(MAX_EDAD_TOKEN_MS / 2);
+            if (pedido) {
+              logger.info('Token precalentado fuera del camino critico', { botId, ms: Date.now() - t0Token });
+            }
+          } catch (e) {
+            // Nunca tumba el poll: el token se vuelve a intentar en el siguiente.
+            logger.warn('Precalentado del token fallo', { botId, ms: Date.now() - t0Token, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+
         // Persist updated session (fire-and-forget, skip if reschedule already did it or dry run)
         if (!dryRun && !reschedulePersistedSession) {
           const updatedSession = client.getSession();
@@ -1288,6 +1325,7 @@ export const pollVisaTask = task({
                 yatriCookie: encrypt(updatedSession.cookie),
                 csrfToken: updatedSession.csrfToken,
                 authenticityToken: updatedSession.authenticityToken,
+                tokensRefreshedAt: client.getTokensRefreshedAt(),
                 lastUsedAt: new Date(),
               })
               .where(eq(sessions.botId, botId))

@@ -5,7 +5,7 @@ import type { CasCacheData } from '../db/schema.js';
 import { eq, and, desc, asc, gte, sql, isNotNull, isNull, count } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
-import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
+import { pureFetchLogin, InvalidCredentialsError, AccountLockedError, NoSchedulableGroupError, discoverAccount } from '../services/login.js';
 import type { DiscoverResult } from '../services/login.js';
 import { setDiscoveryToken, consumeDiscoveryToken } from '../services/discovery-tokens.js';
 import { getEffectiveWebshareUrls } from '../services/proxy-fetch.js';
@@ -16,7 +16,7 @@ import { clerkAuth } from '../middleware/clerk-auth.js';
 import { createClerkClient } from '@clerk/backend';
 
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-import { isValidLocale, VALID_LOCALES, resolveLocale } from '../utils/constants.js';
+import { isValidLocale, VALID_LOCALES, resolveLocale, suggestEmailDomain } from '../utils/constants.js';
 import { runs } from '@trigger.dev/sdk/v3';
 
 export const botsRouter = new Hono();
@@ -118,6 +118,85 @@ function validateCreateBot(body: Record<string, unknown>): string | null {
   }
 
   return validateExclusions(body);
+}
+
+/**
+ * Fill in `body.visaPassword` from the encrypted copy stored on the credential
+ * attempt, for the one case where the browser legitimately cannot send it: the
+ * agency table rehydrates rows from GET /agencies/me after a reload, which
+ * returns the email but never the secret (see agencias-flow.tsx `rehydrateRows`).
+ *
+ * Mutates `body` in place. Authorization is strict, because this turns an
+ * attempt id into "create a bot with somebody else's credentials":
+ *   - the caller must be authenticated with Clerk, and
+ *   - must own the attempt (directly for B2C, or through its agency for B2B), and
+ *   - the email in the body must match the attempt's stored email.
+ * Anything short of that leaves the body untouched, so validateCreateBot still
+ * rejects the empty password.
+ */
+async function recoverAttemptPassword(
+  body: Record<string, unknown>,
+  clerkUserId: string | undefined,
+): Promise<{ error: string | null; status: 401 | 403 | 404 | 409 }> {
+  const ok = { error: null, status: 409 } as const;
+
+  // Only kick in for a genuinely missing password — never override a real one.
+  if (typeof body.visaPassword === 'string' && body.visaPassword.length > 0) return ok;
+  if (body.credentialAttemptId == null) return ok;
+
+  const attemptId = typeof body.credentialAttemptId === 'number'
+    ? body.credentialAttemptId
+    : parseInt(String(body.credentialAttemptId), 10);
+  if (isNaN(attemptId)) return ok;
+
+  if (!clerkUserId) {
+    return { error: 'authentication required to reuse a stored credential attempt', status: 401 };
+  }
+
+  const [attempt] = await db
+    .select({
+      visaEmail: botCredentialAttempts.visaEmail,
+      visaPassword: botCredentialAttempts.visaPassword,
+      agencyId: botCredentialAttempts.agencyId,
+      clerkUserId: botCredentialAttempts.clerkUserId,
+    })
+    .from(botCredentialAttempts)
+    .where(eq(botCredentialAttempts.id, attemptId));
+
+  if (!attempt) return { error: 'credential_attempt_not_found', status: 404 };
+
+  // Ownership: B2B goes through the agency, B2C is the attempt's own clerk user.
+  let owner: string | null = attempt.clerkUserId ?? null;
+  if (attempt.agencyId != null) {
+    const [agencyRow] = await db
+      .select({ clerkUserId: agencies.clerkUserId })
+      .from(agencies)
+      .where(eq(agencies.id, attempt.agencyId));
+    owner = agencyRow?.clerkUserId ?? null;
+  }
+  if (!owner || owner !== clerkUserId) return { error: 'forbidden', status: 403 };
+
+  let storedEmail: string;
+  let storedPassword: string;
+  try {
+    storedEmail = decrypt(attempt.visaEmail);
+    storedPassword = decrypt(attempt.visaPassword);
+  } catch {
+    console.warn(`[create-bot] attempt #${attemptId} credentials failed to decrypt`);
+    return { error: 'stored_credentials_unreadable', status: 409 };
+  }
+
+  // The body's email decides which account is being activated. Refuse to pair it
+  // with a password that belongs to a different account.
+  const bodyEmail = typeof body.visaEmail === 'string' ? body.visaEmail.trim().toLowerCase() : '';
+  if (bodyEmail && bodyEmail !== storedEmail.trim().toLowerCase()) {
+    return { error: 'credential_attempt_email_mismatch', status: 409 };
+  }
+  if (!bodyEmail) body.visaEmail = storedEmail;
+
+  body.visaPassword = storedPassword;
+  console.log(`[create-bot] recovered stored password for attempt #${attemptId} (${storedEmail})`);
+  return ok;
 }
 
 function validateUpdateBot(body: Record<string, unknown>): string | null {
@@ -493,6 +572,13 @@ botsRouter.get('/recent-events', async (c) => {
 botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   const body = await c.req.json();
 
+  // The password never survives a page reload in the browser: the agency table
+  // rehydrates rows from GET /agencies/me, which returns the email but not the
+  // secret. Recover it from the encrypted copy we already hold for the attempt,
+  // so "reload then activate" stops failing with `visaPassword is required`.
+  const passwordRecovery = await recoverAttemptPassword(body, c.get('clerkUser')?.clerkUserId);
+  if (passwordRecovery.error) return c.json({ error: passwordRecovery.error }, passwordRecovery.status);
+
   const validationError = validateCreateBot(body);
   if (validationError) return c.json({ error: validationError }, 400);
 
@@ -777,6 +863,16 @@ botsRouter.post('/validate-credentials', async (c) => {
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
     return c.json({ error: 'email must be a valid email address' }, 400);
   }
+  // A typo'd domain can only fail the login, and every failed login counts toward the
+  // portal's account lockout. Stop it here instead of spending the attempt.
+  const suggestedDomain = suggestEmailDomain(email);
+  if (suggestedDomain) {
+    return c.json({
+      error: 'email_domain_typo',
+      suggestedEmail: `${email.split('@')[0]}@${suggestedDomain}`,
+      message: `Revisa el correo: ¿querías escribir @${suggestedDomain}?`,
+    }, 400);
+  }
   if (!password || typeof password !== 'string') {
     return c.json({ error: 'password is required' }, 400);
   }
@@ -802,6 +898,15 @@ botsRouter.post('/validate-credentials', async (c) => {
       console.log(`[validate-credentials] INVALID email=${email}`);
       logAuth({ email, action: 'validate', locale, result: 'invalid', ip: getClientIp(c) });
       return c.json({ valid: false, message: 'invalid_credentials' });
+    }
+    if (e instanceof AccountLockedError) {
+      console.log(`[validate-credentials] LOCKED email=${email} until=${e.lockedUntil?.toISOString() ?? 'unknown'}`);
+      logAuth({ email, action: 'validate', locale, result: 'invalid', errorMessage: e.message, ip: getClientIp(c) });
+      return c.json({
+        valid: false,
+        message: 'account_locked',
+        lockedUntil: e.lockedUntil?.toISOString() ?? null,
+      }, 423);
     }
     console.log(`[validate-credentials] ERROR email=${email} err=${e instanceof Error ? e.message : e}`);
     logAuth({ email, action: 'validate', locale, result: 'error', errorMessage: e instanceof Error ? e.message : String(e), ip: getClientIp(c) });
@@ -855,7 +960,9 @@ export async function discoverWithFallback(
     const result = await discoverAccount(email, password, locale);
     return { result, via: 'direct:ok' };
   } catch (e) {
-    if (e instanceof InvalidCredentialsError) throw e;
+    // Both are verdicts from the portal, not connectivity failures. Another IP gets the
+    // same answer, and each extra login attempt extends an existing lockout.
+    if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError || e instanceof NoSchedulableGroupError) throw e;
     const { label, detail } = classifyFetchError(e);
     attempts.push(`direct[${label}]`);
     console.warn(`[discover] Direct failed [${label}]: ${detail}`);
@@ -891,7 +998,7 @@ export async function discoverWithFallback(
       console.log(`[discover] ✓ ws:${ip} succeeded`);
       return { result, via: attempts.join(' → ') };
     } catch (e2) {
-      if (e2 instanceof InvalidCredentialsError) throw e2;
+      if (e2 instanceof InvalidCredentialsError || e2 instanceof AccountLockedError || e2 instanceof NoSchedulableGroupError) throw e2;
       const { label, detail } = classifyFetchError(e2);
       attempts.push(`ws:${ip}[${label}]`);
       console.warn(`[discover] ✗ ws:${ip} [${label}]: ${detail}`);
@@ -913,6 +1020,16 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
 
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
     return c.json({ error: 'email must be a valid email address' }, 400);
+  }
+  // A typo'd domain can only fail the login, and every failed login counts toward the
+  // portal's account lockout. Stop it here instead of spending the attempt.
+  const suggestedDomain = suggestEmailDomain(email);
+  if (suggestedDomain) {
+    return c.json({
+      error: 'email_domain_typo',
+      suggestedEmail: `${email.split('@')[0]}@${suggestedDomain}`,
+      message: `Revisa el correo: ¿querías escribir @${suggestedDomain}?`,
+    }, 400);
   }
   if (!password || typeof password !== 'string') {
     return c.json({ error: 'password is required' }, 400);
@@ -956,6 +1073,28 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
       console.log(`[discover-account] INVALID email=${email}`);
       logAuth({ email, action: 'discover', locale, result: 'invalid', password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
       return c.json({ error: 'invalid_credentials' }, 401);
+    }
+    if (e instanceof NoSchedulableGroupError) {
+      // The credentials work. The account simply has no group that can hold an
+      // appointment — the visa fee is unpaid. Nothing to poll, so do not create a bot.
+      console.log(`[discover-account] NO_SCHEDULABLE_GROUP email=${email} states=${e.states.join(',')}`);
+      logAuth({ email, action: 'discover', locale, result: 'error', errorMessage: e.message, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+      return c.json({
+        error: 'visa_fee_unpaid',
+        portalStates: e.states,
+        message: 'La cuenta no tiene ninguna cita programable. Paga el arancel de visa en el portal y vuelve a intentar.',
+      }, 422);
+    }
+    if (e instanceof AccountLockedError) {
+      // The portal locked the account after repeated failed logins. Retrying extends
+      // the lock, so this must not surface as a transient 503 discovery_failed.
+      console.log(`[discover-account] LOCKED email=${email} until=${e.lockedUntil?.toISOString() ?? 'unknown'}`);
+      logAuth({ email, action: 'discover', locale, result: 'invalid', errorMessage: e.message, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+      return c.json({
+        error: 'account_locked',
+        lockedUntil: e.lockedUntil?.toISOString() ?? null,
+        message: e.message,
+      }, 423);
     }
     const errMsg = e instanceof Error ? e.message : String(e);
     const cause = e instanceof Error && e.cause ? String(e.cause) : undefined;
@@ -1066,6 +1205,7 @@ botsRouter.get('/:id', async (c) => {
     targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     maxCasGapDays: bots.maxCasGapDays,
+    excludedWeekdays: bots.excludedWeekdays,
     minDaysFromToday: bots.minDaysFromToday,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     skipCas: bots.skipCas,
@@ -1130,6 +1270,7 @@ botsRouter.get('/:id', async (c) => {
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
     maxCasGapDays: bot.maxCasGapDays ?? null,
+    excludedWeekdays: bot.excludedWeekdays ?? null,
     minDaysFromToday: bot.minDaysFromToday ?? null,
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
@@ -1201,6 +1342,18 @@ botsRouter.put('/:id', async (c) => {
   if (body.sniperMode !== undefined) updates.sniperMode = !!body.sniperMode;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
   if (body.maxCasGapDays !== undefined) updates.maxCasGapDays = body.maxCasGapDays != null ? parseInt(body.maxCasGapDays as string, 10) : null;
+  if (body.excludedWeekdays !== undefined) {
+    // 0 = domingo … 6 = sabado. null o [] = sin restriccion.
+    const raw = body.excludedWeekdays;
+    if (raw == null) updates.excludedWeekdays = null;
+    else {
+      const list = (Array.isArray(raw) ? raw : [raw]).map((v: unknown) => parseInt(String(v), 10));
+      if (list.some(n => !Number.isInteger(n) || n < 0 || n > 6)) {
+        return c.json({ error: 'excludedWeekdays must be integers 0-6 (0=Sunday, 6=Saturday)' }, 400);
+      }
+      updates.excludedWeekdays = [...new Set(list)].sort();
+    }
+  }
   if (body.minDaysFromToday !== undefined) updates.minDaysFromToday = body.minDaysFromToday != null ? parseInt(body.minDaysFromToday as string, 10) : null;
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;

@@ -10,6 +10,8 @@ import {
   addDays,
   isSniperActive,
   isWithinWindow,
+  weekdayOf,
+  isWeekdayExcluded,
 } from '../../utils/date-helpers.js';
 
 describe('isDateExcluded', () => {
@@ -125,6 +127,38 @@ describe('filterDates', () => {
   it('keeps all dates when targetDateAfter is undefined', () => {
     const dates = [{ date: '2026-05-01' }, { date: '2026-08-01' }];
     expect(filterDates(dates, [], undefined, undefined, undefined)).toEqual(dates);
+  });
+
+  it('drops Saturdays when excludedWeekdays = [6]', () => {
+    // 2026-08-22 y 2026-08-29 son sabados; 2026-08-24 es lunes.
+    const dates = [{ date: '2026-08-22' }, { date: '2026-08-24' }, { date: '2026-08-29' }];
+    expect(filterDates(dates, [], undefined, undefined, undefined, [6])).toEqual([{ date: '2026-08-24' }]);
+  });
+
+  it('keeps every date when excludedWeekdays is null or empty', () => {
+    const dates = [{ date: '2026-08-22' }, { date: '2026-08-24' }];
+    expect(filterDates(dates, [], undefined, undefined, undefined, null)).toEqual(dates);
+    expect(filterDates(dates, [], undefined, undefined, undefined, [])).toEqual(dates);
+  });
+});
+
+describe('weekdayOf / isWeekdayExcluded', () => {
+  it('reads the weekday in UTC, without timezone shift', () => {
+    expect(weekdayOf('2026-08-22')).toBe(6); // sabado
+    expect(weekdayOf('2026-08-23')).toBe(0); // domingo
+    expect(weekdayOf('2026-08-24')).toBe(1); // lunes
+  });
+
+  it('returns false with no list', () => {
+    expect(isWeekdayExcluded('2026-08-22', null)).toBe(false);
+    expect(isWeekdayExcluded('2026-08-22', undefined)).toBe(false);
+    expect(isWeekdayExcluded('2026-08-22', [])).toBe(false);
+  });
+
+  it('returns true only for the listed weekdays', () => {
+    expect(isWeekdayExcluded('2026-08-22', [6])).toBe(true);
+    expect(isWeekdayExcluded('2026-08-24', [6])).toBe(false);
+    expect(isWeekdayExcluded('2026-08-23', [0, 6])).toBe(true);
   });
 });
 

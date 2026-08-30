@@ -37,3 +37,6 @@ scripts/output/
 
 # WhatsApp exports
 /WhatsApp*
+
+# Exportes con datos de clientes. No van a git.
+*.xlsx

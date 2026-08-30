@@ -131,6 +131,17 @@ export const bots = pgTable(
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
     speculativeTimeFallback: boolean('speculative_time_fallback').notNull().default(false), // true = try historical times when getConsularTimes returns empty (no-CAS only)
+    /**
+     * Horas a adivinar para ESTE bot, en orden de prioridad. `null` usa la constante
+     * global `SPECULATIVE_TIMES` de `reschedule-logic.ts`.
+     *
+     * Existe porque la constante global `['10:15','10:00','07:30']` no tiene respaldo
+     * medido: las 354 apariciones de ese trio en `reschedule_logs` eran la propia
+     * constante rebotando, no lecturas del portal. Las horas dependen del schedule.
+     * Medido el 2026-08-30: es-co reparte 19 valores con `07:15` a la cabeza (15,9%),
+     * y el schedule 75610929 del bot 299 devolvio `09:30` en cada lectura del ensayo.
+     */
+    speculativeTimes: text('speculative_times').array(),
     minDaysFromToday: integer('min_days_from_today'),                          // null = global default (3); 0 = disabled
     // Dias de la semana que el bot NUNCA agenda (consular y CAS). 0 = domingo … 6 = sabado.
     // null o [] = sin restriccion. Ejemplo: [6] = nunca agenda sabados.
@@ -214,6 +225,15 @@ export const sessions = pgTable(
     yatriCookie: text('yatri_cookie').notNull(),       // encrypted
     csrfToken: text('csrf_token'),
     authenticityToken: text('authenticity_token'),
+    /**
+     * Cuando el portal emitio el `authenticity_token` de esta fila.
+     *
+     * Existe para PRECALENTAR el token: `refreshTokens()` se puede correr fuera del
+     * camino critico y el run siguiente hereda la frescura. Sin este sello, cada
+     * reagendamiento pedia la pagina del appointment en el peor momento posible,
+     * con el cupo a la vista. Ver `VisaClient.ensureTokens()`.
+     */
+    tokensRefreshedAt: timestamp('tokens_refreshed_at'),
     lastUsedAt: timestamp('last_used_at').notNull().defaultNow(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },

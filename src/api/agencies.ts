@@ -371,6 +371,12 @@ agenciesRouter.patch(
     }
     if (res.error === 'corrupt_credentials') return c.json({ error: 'corrupt_credentials' }, 500);
     if (res.error === 'invalid_country') return c.json({ error: 'invalid country on attempt' }, 400);
+    if (res.error === 'account_locked') {
+      return c.json({ status: 'failed', error: 'account_locked', message: res.message }, 423);
+    }
+    if (res.error === 'visa_fee_unpaid') {
+      return c.json({ status: 'failed', error: 'visa_fee_unpaid', message: res.message }, 422);
+    }
     const isInvalid = res.error === 'invalid_credentials';
     return c.json(
       { status: 'failed', error: isInvalid ? 'invalid_credentials' : 'discovery_failed', message: res.message },
