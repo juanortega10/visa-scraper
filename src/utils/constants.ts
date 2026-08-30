@@ -125,3 +125,37 @@ export function resolveLocale(countryCode: string): string | null {
 
 /** Minimum days from today a candidate reschedule date must be. Global rule: never book within 3 days. */
 export const MIN_DAYS_FROM_TODAY = 3;
+
+/** Max total discovery attempts per bot_credential_attempts row (D26: 1 + 3 retries).
+ * A row at this count is never picked up again by the agency reconciler, so permanent
+ * failures (bad password, locked account, corrupt creds) set retryCount straight to it. */
+export const MAX_TOTAL_ATTEMPTS = 4;
+
+/** Common typos of the big mail domains. A login with one of these can only fail, and a
+ * failed login against ais.usvisa-info.com counts toward the portal's account lockout —
+ * so reject it before spending the attempt. Maps typo -> intended domain. */
+const EMAIL_DOMAIN_TYPOS: Record<string, string> = {
+  'gmail.con': 'gmail.com',
+  'gmail.cmo': 'gmail.com',
+  'gmail.co': 'gmail.com',
+  'gmail.comm': 'gmail.com',
+  'gmial.com': 'gmail.com',
+  'gmai.com': 'gmail.com',
+  'gamil.com': 'gmail.com',
+  'hotmail.con': 'hotmail.com',
+  'hotmail.cmo': 'hotmail.com',
+  'hotmial.com': 'hotmail.com',
+  'hotmai.com': 'hotmail.com',
+  'outlook.con': 'outlook.com',
+  'outlok.com': 'outlook.com',
+  'yahoo.con': 'yahoo.com',
+  'yaho.com': 'yahoo.com',
+  'icloud.con': 'icloud.com',
+};
+
+/** Returns the intended domain when the email has a known typo, else null. */
+export function suggestEmailDomain(email: string): string | null {
+  const domain = email.split('@')[1]?.toLowerCase();
+  if (!domain) return null;
+  return EMAIL_DOMAIN_TYPOS[domain] ?? null;
+}

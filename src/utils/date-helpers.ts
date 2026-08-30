@@ -26,15 +26,29 @@ export function isTimeExcluded(
   });
 }
 
+/** Dia de la semana de un YYYY-MM-DD. 0 = domingo … 6 = sabado. Usa UTC para evitar el corrimiento por zona horaria. */
+export function weekdayOf(date: string): number {
+  const [y, m, d] = date.split('-').map(Number);
+  return new Date(Date.UTC(y!, m! - 1, d!)).getUTCDay();
+}
+
+/** True si el dia de la semana de `date` esta en la lista de dias bloqueados del bot. */
+export function isWeekdayExcluded(date: string, excludedWeekdays?: number[] | null): boolean {
+  if (!excludedWeekdays || excludedWeekdays.length === 0) return false;
+  return excludedWeekdays.includes(weekdayOf(date));
+}
+
 export function filterDates(
   dates: Array<{ date: string }>,
   excludedDates: DateRange[],
   targetDateBefore?: string | null,
   minDate?: string | null,
   targetDateAfter?: string | null,
+  excludedWeekdays?: number[] | null,
 ): Array<{ date: string }> {
   return dates.filter((d) => {
     if (isDateExcluded(d.date, excludedDates)) return false;
+    if (isWeekdayExcluded(d.date, excludedWeekdays)) return false;
     if (targetDateBefore && d.date >= targetDateBefore) return false;
     if (targetDateAfter && d.date < targetDateAfter) return false; // sniper window lower bound (inclusive)
     if (minDate && d.date < minDate) return false;

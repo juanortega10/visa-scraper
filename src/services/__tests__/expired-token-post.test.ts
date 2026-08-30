@@ -110,14 +110,24 @@ function makeClient(over: Record<string, any> = {}) {
     getCollectsBiometrics: vi.fn().mockReturnValue(false),
     updateSession: vi.fn(),
     refreshTokens: vi.fn().mockResolvedValue(undefined),
+    // Edad del token precalentado. Infinity = desconocida, o sea siempre se refresca:
+    // es el comportamiento historico que estos casos ya cubren.
+    getTokensAgeMs: vi.fn().mockReturnValue(Number.POSITIVE_INFINITY),
+    getTokensRefreshedAt: vi.fn().mockReturnValue(null),
+    ensureTokens: vi.fn().mockResolvedValue(true),
     ...over,
   } as any;
 }
 
-/** claimSlot escribe DOS columnas. releaseSlot escribe una sola, con GREATEST. */
-const claims = () => setCalls.filter((s) => 'rescheduleCount' in s && 'portalRemainingReschedules' in s);
-const releases = () => setCalls.filter((s) => 'rescheduleCount' in s && !('portalRemainingReschedules' in s)
-  && String(s.rescheduleCount).includes('GREATEST'));
+/**
+ * claimSlot y releaseSlot escriben las MISMAS dos columnas: el cupo se devuelve
+ * completo, contador y saldo del portal. Se distinguen por la operacion sobre
+ * rescheduleCount: claim suma, release resta con GREATEST(... - 1, 0).
+ */
+const escribeCupo = (s: Record<string, unknown>) =>
+  'rescheduleCount' in s && 'portalRemainingReschedules' in s;
+const claims = () => setCalls.filter((s) => escribeCupo(s) && !String(s.rescheduleCount).includes('GREATEST'));
+const releases = () => setCalls.filter((s) => escribeCupo(s) && String(s.rescheduleCount).includes('GREATEST'));
 const logsExito = () => insertValues.filter((v) => v.success === true);
 
 /** Corre y devuelve el error si lo hay. Agotados los intentos, `executeReschedule` RELANZA. */
@@ -177,6 +187,20 @@ describe('token vencido en el POST', () => {
     expect(claims()).toHaveLength(2);
     expect(releases()).toHaveLength(2);
     expect(claims().length - releases().length).toBe(0);
+
+    // El saldo del portal tambien se devuelve. Antes releaseSlot solo bajaba el
+    // contador, entonces un intento fallido quemaba el cupo del portal para
+    // siempre. Bots 298, 300, 301 y 302 quedaron bloqueados asi.
+    for (const rel of releases()) {
+      expect(String(rel.portalRemainingReschedules)).toContain('+ 1');
+    }
+    // Y claimSlot no puede inventar un tope donde el portal no puso ninguno:
+    // con saldo NULL el resultado sigue NULL, nunca 0.
+    for (const cl of claims()) {
+      const expr = String(cl.portalRemainingReschedules);
+      expect(expr).toContain('IS NULL');
+      expect(expr).not.toContain('COALESCE');
+    }
   });
 
   it('pide sesion nueva y reintenta UNA vez con maxAttempts=2', async () => {
