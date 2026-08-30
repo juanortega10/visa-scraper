@@ -4,7 +4,7 @@ import { bots, pollLogs } from '../db/schema.js';
 import { eq, inArray, and, desc, sql } from 'drizzle-orm';
 import { notifyUserTask } from './notify-user.js';
 import { visaPollingPerBotQueue } from './queues.js';
-import { calculatePriority, accountBanBackoffMs } from '../services/scheduling.js';
+import { calculatePriority, blockBackoffMs, SUSTAINED_BLOCK_CLASSES } from '../services/scheduling.js';
 
 type RunAction = 'executing' | 'pulled_forward' | 'resurrected' | 'cron_ok';
 
@@ -29,8 +29,9 @@ async function getRunStatus(runId: string | null): Promise<string | null> {
  * ~10 min cadence instead of the intended long backoff).
  *
  * Returns `banned` + how long the intended backoff is, computed the SAME way as
- * poll-visa (last 5 poll_logs, consecutive account_ban count → tier) using the
- * shared `accountBanBackoffMs` helper so the two can never drift.
+ * poll-visa (last 5 poll_logs, consecutive block count → tier) using the shared
+ * `blockBackoffMs` helper so the two can never drift. Cubre las dos clases sostenidas:
+ * `account_ban` (30m→480m) y `schedule_blocked` (240m→720m).
  */
 async function getBanBackoff(
   botId: number,
@@ -47,15 +48,20 @@ async function getBanBackoff(
     .limit(5);
 
   const last = recent[0];
-  if (!last || last.status !== 'tcp_blocked' || last.blockCls !== 'account_ban') {
+  if (!last || last.status !== 'tcp_blocked' || !SUSTAINED_BLOCK_CLASSES.includes(last.blockCls ?? '')) {
     return { banned: false, lastPollAgeMs: 0, backoffMs: 0 };
   }
 
-  // Consecutive account_ban rows (mirrors poll-visa.ts backoff-counter recompute).
-  const firstNonBan = recent.findIndex((r) => r.blockCls !== null && r.blockCls !== 'account_ban');
+  // Filas de bloqueo seguidas (mismo recuento que el de poll-visa.ts).
+  // `schedule_blocked` cuenta igual que `account_ban`: es la misma racha, con curva mas larga.
+  const firstNonBan = recent.findIndex((r) => !SUSTAINED_BLOCK_CLASSES.includes(r.blockCls ?? ''));
   const count = firstNonBan === -1 ? recent.length : firstNonBan;
 
-  return { banned: true, lastPollAgeMs: Date.now() - last.createdAt.getTime(), backoffMs: accountBanBackoffMs(count) };
+  return {
+    banned: true,
+    lastPollAgeMs: Date.now() - last.createdAt.getTime(),
+    backoffMs: blockBackoffMs(last.blockCls, count),
+  };
 }
 
 /**

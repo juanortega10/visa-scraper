@@ -6,7 +6,7 @@ import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
-import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
+import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
 import { executeReschedule, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -250,7 +250,7 @@ export const pollVisaTask = task({
             }).from(pollLogs).where(eq(pollLogs.botId, botId)).orderBy(desc(pollLogs.id)).limit(5);
             const msSinPoll = ultimos[0] ? Date.now() - ultimos[0].createdAt.getTime() : Number.MAX_SAFE_INTEGER;
             const bansSeguidos = countSustainedAccountBans(ultimos);
-            despertar = debeDespertar({ msSinPoll, bansSeguidos });
+            despertar = debeDespertar({ msSinPoll, bansSeguidos, blockCls: ultimos[0]?.blockCls ?? null });
             if (despertar) {
               console.warn(`[chain] bot ${botId}: DESPIERTA · cancela DELAYED ${otherRun.id} tras ${Math.round(msSinPoll / 60_000)} min sin pollear`);
               logger.warn('CADENA DORMIDA — cancelling stale DELAYED run and polling now', {
@@ -1599,6 +1599,22 @@ export const pollVisaTask = task({
             scheduleId: bot.scheduleId,
             locale: bot.locale,
           });
+          // La fila de `poll_logs` ya salio marcada `account_ban`: se escribe antes de la sonda.
+          // Corregirla en la DB es lo que deja ver el veredicto real a `ensure-chain` (elige el
+          // backoff largo), al dashboard y al contador de rachas. Se esperan los INSERT pendientes
+          // primero para no actualizar una fila que todavia no existe.
+          pending.push(
+            Promise.allSettled([...pending])
+              .then(() => db.execute(sql`
+                UPDATE poll_logs
+                SET connection_info = jsonb_set(coalesce(connection_info, '{}'::jsonb), '{blockClassification}', '"schedule_blocked"')
+                WHERE id = (SELECT id FROM poll_logs WHERE bot_id = ${botId} ORDER BY id DESC LIMIT 1)
+                  AND status = 'tcp_blocked'
+                  AND run_id = ${ctx.run.id}
+              `))
+              .then(() => undefined)
+              .catch((e) => logger.error('schedule_blocked reclassify failed', { botId, error: String(e) })),
+          );
         }
       }
 
@@ -1666,14 +1682,12 @@ export const pollVisaTask = task({
           );
         }
 
-        // Auto-pause if schedule_blocked confirmed on 2+ consecutive polls — the block is permanent,
-        // no point keeping the bot in an infinite retry loop.
-        if (blockClsNow === 'schedule_blocked' && sustainedAccountBanCount >= 1) {
-          logger.warn('Auto-pausing bot: schedule path permanently blocked by server', { botId, scheduleId: bot.scheduleId, sustainedAccountBanCount });
-          pending.push(
-            db.update(bots).set({ status: 'paused' }).where(eq(bots.id, botId))
-              .catch((e) => logger.error('schedule_blocked auto-pause failed', { error: String(e) })),
-          );
+        // NO auto-pause. Un bloqueo de la ruta del schedule ya NO pausa el bot (quitado el
+        // 2026-08-30): el bot quedaba mudo hasta una reactivacion manual y nadie se enteraba
+        // (bots 281 y 298, 2 y 3 dias sin pollear). La compensacion es la curva mas larga de
+        // `scheduleBlockedBackoffDelay()`: 240m -> 480m -> 720m, y el bot se recupera solo.
+        if (blockClsNow === 'schedule_blocked') {
+          logger.warn('Schedule path blocked by server — long backoff, bot stays active', { botId, scheduleId: bot.scheduleId, sustainedAccountBanCount });
         }
       }
 
@@ -1779,10 +1793,11 @@ export const pollVisaTask = task({
       let delay: string;
       const blockCls = capturedConnInfo?.blockClassification;
       if (tcpBlockNotified && blockCls === 'schedule_blocked') {
-        // Schedule URL is permanently nginx-444'd. Retrying frequently is pointless —
-        // use a long delay so the bot doesn't burn resources. Auto-pause handles the
-        // sustained case (see above); this covers the first occurrence.
-        delay = '240m';
+        // La ruta del schedule esta bloqueada (nginx 444). Reintentar seguido no sirve.
+        // Curva propia, mas larga que la de cuenta: 240m -> 480m -> 720m (tope 12h).
+        // Reemplaza a la auto-pausa que se quito el 2026-08-30. Fuente unica en scheduling.ts,
+        // compartida con la compuerta de ensure-chain.
+        delay = scheduleBlockedBackoffDelay(sustainedAccountBanCount);
       } else if (tcpBlockNotified && blockCls === 'account_ban') {
         // Account-level ban — provider-agnostic aggressive backoff. Rotating the
         // webshare pool does nothing (ban is on the account, not the IP), so webshare

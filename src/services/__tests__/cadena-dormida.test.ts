@@ -53,3 +53,16 @@ describe('debeDespertar con bloqueo de cuenta', () => {
     expect(debeDespertar({ msSinPoll: 13 * 60 * MIN, bansSeguidos: 5 })).toBe(true);
   });
 });
+
+describe('debeDespertar con bloqueo de la ruta del schedule', () => {
+  it('respeta la curva larga: 720m de backoff no se despierta a las 3h', () => {
+    const backoff = 720 * MIN;
+    expect(debeDespertar({ msSinPoll: 3 * 60 * MIN, bansSeguidos: 3, blockCls: 'schedule_blocked' })).toBe(false);
+    expect(debeDespertar({ msSinPoll: backoff * 1.4, bansSeguidos: 3, blockCls: 'schedule_blocked' })).toBe(false);
+    expect(debeDespertar({ msSinPoll: backoff * 1.5 + 1, bansSeguidos: 3, blockCls: 'schedule_blocked' })).toBe(true);
+  });
+
+  it('sin la clasificacion usa la curva de cuenta, como antes', () => {
+    expect(debeDespertar({ msSinPoll: accountBanBackoffMs(3) * 1.5 + 1, bansSeguidos: 3 })).toBe(true);
+  });
+});

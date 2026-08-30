@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { accountBanBackoffMs, accountBanBackoffDelay, countSustainedAccountBans } from '../scheduling.js';
+import { accountBanBackoffMs, accountBanBackoffDelay, countSustainedAccountBans, scheduleBlockedBackoffMs, scheduleBlockedBackoffDelay, blockBackoffMs } from '../scheduling.js';
 
 const MIN = 60_000;
 
@@ -78,5 +78,64 @@ describe('countSustainedAccountBans — una fila sana corta la racha', () => {
   it('ventana vacia da 0', () => {
     expect(countSustainedAccountBans([])).toBe(0);
     expect(countSustainedAccountBans([ok])).toBe(0);
+  });
+});
+
+describe('scheduleBlockedBackoffMs — curva del bloqueo de la ruta del schedule', () => {
+  it('escala 240m → 480m → 720m', () => {
+    expect(scheduleBlockedBackoffMs(0)).toBe(240 * MIN);
+    expect(scheduleBlockedBackoffMs(1)).toBe(240 * MIN);
+    expect(scheduleBlockedBackoffMs(2)).toBe(480 * MIN);
+    expect(scheduleBlockedBackoffMs(3)).toBe(720 * MIN);
+  });
+
+  it('topa en 720m (12h) y nunca pausa el bot', () => {
+    expect(scheduleBlockedBackoffMs(5)).toBe(720 * MIN);
+    expect(scheduleBlockedBackoffMs(999)).toBe(720 * MIN);
+  });
+
+  it('siempre espera mas que la curva de bloqueo de cuenta', () => {
+    for (let c = 0; c <= 6; c++) {
+      expect(scheduleBlockedBackoffMs(c)).toBeGreaterThan(accountBanBackoffMs(c));
+    }
+  });
+
+  it('scheduleBlockedBackoffDelay arma el string de Trigger.dev', () => {
+    expect(scheduleBlockedBackoffDelay(1)).toBe('240m');
+    expect(scheduleBlockedBackoffDelay(2)).toBe('480m');
+    expect(scheduleBlockedBackoffDelay(3)).toBe('720m');
+  });
+});
+
+describe('blockBackoffMs — un solo lector para poll-visa y ensure-chain', () => {
+  it('elige la curva por clasificacion', () => {
+    expect(blockBackoffMs('account_ban', 3)).toBe(accountBanBackoffMs(3));
+    expect(blockBackoffMs('schedule_blocked', 3)).toBe(scheduleBlockedBackoffMs(3));
+  });
+
+  it('sin clasificacion cae en la curva de cuenta', () => {
+    expect(blockBackoffMs(null, 2)).toBe(accountBanBackoffMs(2));
+  });
+});
+
+describe('countSustainedAccountBans — schedule_blocked mantiene la racha', () => {
+  const ban = { status: 'tcp_blocked', blockCls: 'account_ban' };
+  const sched = { status: 'tcp_blocked', blockCls: 'schedule_blocked' };
+  const sano = { status: 'filtered_out', blockCls: null };
+
+  it('cuenta las filas schedule_blocked igual que las de cuenta', () => {
+    expect(countSustainedAccountBans([sched, sched, sano, sano, sano])).toBe(2);
+    expect(countSustainedAccountBans([sched, ban, sched, sano, sano])).toBe(3);
+  });
+
+  it('sin esto la sonda cortaba la racha y el backoff nunca escalaba', () => {
+    // La sonda reescribe la fila mas nueva a schedule_blocked. Con la regla vieja
+    // (solo account_ban) el contador volvia a 0 y el bot reintentaba a los 240m para siempre.
+    expect(countSustainedAccountBans([sched, ban, ban, ban, ban])).toBe(5);
+    expect(scheduleBlockedBackoffDelay(5)).toBe('720m');
+  });
+
+  it('una fila sana sigue cortando la racha', () => {
+    expect(countSustainedAccountBans([sano, sched, sched, sched, sched])).toBe(0);
   });
 });
