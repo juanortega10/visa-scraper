@@ -182,3 +182,33 @@ describe('Bogota TZ window arithmetic (Pitfall 6)', () => {
     expect(CROSS_POLL_BLOCK_MS).toBe(6 * 60 * 60 * 1000);
   });
 });
+
+describe('recordFailure con tuning propio (sniper)', () => {
+  const T0 = new Date('2026-08-24T12:00:00Z').getTime();
+  const SNIPER = { threshold: 3, blockMs: 5 * 60_000, windowMs: 30 * 60_000 };
+
+  it('bloquea al llegar al umbral corto', () => {
+    let e = recordFailure(undefined, 'casNoDays', T0, SNIPER);
+    expect(e.blockedUntil).toBeUndefined();
+    e = recordFailure(e, 'casNoDays', T0 + 30_000, SNIPER);
+    expect(e.blockedUntil).toBeUndefined();
+    e = recordFailure(e, 'casNoDays', T0 + 60_000, SNIPER);
+    expect(e.totalCount).toBe(3);
+    expect(new Date(e.blockedUntil!).getTime()).toBe(T0 + 60_000 + 5 * 60_000);
+  });
+
+  it('el bloqueo corto expira a los 5 minutos', () => {
+    let e = recordFailure(undefined, 'casNoDays', T0, SNIPER);
+    e = recordFailure(e, 'casNoDays', T0 + 1000, SNIPER);
+    e = recordFailure(e, 'casNoDays', T0 + 2000, SNIPER);
+    expect(isBlocked(e, T0 + 4 * 60_000)).toBe(true);
+    expect(isBlocked(e, T0 + 6 * 60_000)).toBe(false);
+  });
+
+  it('sin tuning conserva el comportamiento de la flota', () => {
+    let e = recordFailure(undefined, 'casNoDays', T0);
+    for (let i = 1; i < 5; i += 1) e = recordFailure(e, 'casNoDays', T0 + i * 1000);
+    expect(e.totalCount).toBe(5);
+    expect(new Date(e.blockedUntil!).getTime()).toBe(T0 + 4000 + 6 * 60 * 60 * 1000);
+  });
+});

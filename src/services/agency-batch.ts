@@ -1,7 +1,8 @@
 import { and, eq, lt, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { agencies, botCredentialAttempts } from '../db/schema.js';
-import { runDiscoveryForAttempt } from './agency-discovery.js';
+import { runDiscoveryForAttempt, isTerminalDiscoverError } from './agency-discovery.js';
+import { MAX_TOTAL_ATTEMPTS } from '../utils/constants.js';
 import { createBotFromAttempt } from './agency-bot-creation.js';
 import { sendAgencyBatchSummaryEmail } from './notifications.js';
 
@@ -9,7 +10,6 @@ type AttemptRow = typeof botCredentialAttempts.$inferSelect;
 type AgencyRow = typeof agencies.$inferSelect;
 
 const CONCURRENCY = 3; // anti-ban: concurrent portal logins per agency
-const MAX_TOTAL_ATTEMPTS = 4; // D26
 const RETRY_AFTER_MIN = 15;
 
 export type BatchCounts = { total: number; activated: number; invalidCreds: number; portalDown: number; maxBots: number; other: number };
@@ -18,9 +18,9 @@ type Outcome = 'created' | 'invalid_creds' | 'portal_down' | 'max_bots' | 'other
 async function processAttempt(attempt: AttemptRow, agency: AgencyRow | undefined): Promise<Outcome> {
   const res = await runDiscoveryForAttempt(attempt);
   if (res.status !== 'ready') {
-    return res.error === 'invalid_credentials' || res.error === 'corrupt_credentials' || res.error === 'invalid_country'
-      ? 'invalid_creds'
-      : 'portal_down';
+    // Terminal = the portal gave a verdict (bad creds, locked account) or the row itself
+    // is unusable. Only genuinely transient failures count as 'portal_down' and retry.
+    return isTerminalDiscoverError(res.error) ? 'invalid_creds' : 'portal_down';
   }
   if (!agency) return 'other';
   const [fresh] = await db.select().from(botCredentialAttempts).where(eq(botCredentialAttempts.id, attempt.id));

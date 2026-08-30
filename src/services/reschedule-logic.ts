@@ -3,7 +3,7 @@ import { db } from '../db/client.js';
 import { bots, sessions, rescheduleLogs } from '../db/schema.js';
 import { eq, sql, or, lt, gt, isNull, and } from 'drizzle-orm';
 import { encrypt } from './encryption.js';
-import { VisaClient, SessionExpiredError, type DaySlot } from './visa-client.js';
+import { VisaClient, SessionExpiredError, type DaySlot, type CurrentAppointment } from './visa-client.js';
 import { filterDates, filterTimes, isAtLeastNDaysEarlier, isDateExcluded, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
 import { notifyUserTask } from '../trigger/notify-user.js';
 import type { DateRange, TimeRange } from '../utils/date-helpers.js';
@@ -23,13 +23,73 @@ export interface RescheduleBot {
   maxCasGapDays?: number | null;
   skipCas?: boolean;
   speculativeTimeFallback?: boolean;
+  /** Horas a adivinar para este bot, en orden. Vacio o null usa `SPECULATIVE_TIMES`. */
+  speculativeTimes?: string[] | null;
   minDaysFromToday?: number | null;
   excludedWeekdays?: number[] | null;
 }
 
 // Historical times seen at Lima facility 115 (es-pe). Used as fallback when
 // getConsularTimes returns empty for phantom dates. Order: most recent first.
+/**
+ * Edad maxima del `authenticity_token` precalentado para saltarse el refresco.
+ *
+ * El techo duro de la sesion es 45 min (`peru-sniper-core.ts:POLITICA_TOKEN`), y el
+ * re-login preventivo corre a los 44 min. Con 12 min queda margen de sobra: el token
+ * usado nunca pasa de un cuarto de la vida de la sesion.
+ */
+export const MAX_EDAD_TOKEN_MS = 12 * 60_000;
+
+/**
+ * Horas a adivinar cuando `times.json` vuelve vacio, si el bot tiene el fallback.
+ *
+ * OJO con la evidencia: este trio NO esta medido. Las 354 apariciones de
+ * `07:30 / 10:00 / 10:15` en `reschedule_logs.detail.timesFound` para es-pe son ESTA
+ * MISMA constante, que el fallback inyecta y el log guarda. No son lecturas del portal.
+ *
+ * Lo que si esta medido (2026-08-30, bots sin fallback, 5.372 horas reales):
+ *   es-co reparte 19 valores, con `07:15` a la cabeza (15,9%). `10:15` sale 1,2%.
+ *   es-pe tiene 6 lecturas reales: 08:00, 09:15, 09:30.
+ *
+ * Como las horas dependen del schedule, cada bot puede traer las suyas en
+ * `bots.speculative_times`. Esta constante es solo el respaldo.
+ */
 const SPECULATIVE_TIMES = ['10:15', '10:00', '07:30'];
+
+/**
+ * Lee la cita del portal y EXIGE respuesta. Un `null` se convierte en excepcion.
+ *
+ * BUG QUE ARREGLA (encontrado el 2026-08-30): `getCurrentAppointment()` devuelve
+ * `null` SIN lanzar en tres casos: sin `userId`, con HTTP distinto de 200, o si no
+ * encuentra el grupo. La verificacion posterior al POST decia
+ * `if (verifyAppt && verifyAppt.consularDate !== candidate.date)`. Con `null` esa
+ * condicion no entra, y `verified` se quedaba en `true`: una lectura fallida se
+ * anotaba como verificacion exitosa.
+ *
+ * Caso real. Bot 7, 2026-04-17 18:25: se registro `success=true` moviendo a
+ * 2026-04-22 10:15. La cita nunca se movio de 2027-07-30 07:30, en las 277 filas de
+ * intento entre 2026-02-24 y 2026-08-25. Al dia siguiente el bot volvio a intentar la
+ * MISMA fecha 2026-04-22, que es la prueba de que nunca se movio. El contador de
+ * reagendamientos bajo igual.
+ *
+ * Lanzar deja que el `catch` que ya existe haga lo correcto: marcar el intento como
+ * no verificado y, si fue especulativo, devolver el cupo con `releaseSlot()`.
+ */
+async function leerCitaVerificada(client: VisaClient): Promise<CurrentAppointment> {
+  // Un reintento INMEDIATO. La mayoria de los `null` son transitorios (HTTP != 200) y
+  // esta lectura decide si se anota un reagendamiento, entonces una segunda peticion
+  // sale barata al lado de un exito fantasma.
+  //
+  // Sin espera entre los dos intentos a proposito: una pausa con `setTimeout` cuelga
+  // cualquier test que use `vi.useFakeTimers()` (rompio 15 el 2026-08-30), y el
+  // beneficio de esperar 400 ms nunca se midio.
+  for (let intento = 0; intento < 2; intento++) {
+    const appt = await client.getCurrentAppointment();
+    if (appt) return appt;
+  }
+  throw new Error('getCurrentAppointment devolvio null dos veces (sin userId, HTTP != 200, o grupo no encontrado)');
+}
+
 
 export interface RescheduleAttempt {
   date: string;
@@ -272,23 +332,72 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   // reliably set the server-side session state (applicant selection). Without this state,
   // the POST returns 302 → sign_in even though GETs work fine.
   // refreshTokens() uses redirect: 'manual' and properly primes the session.
-  try {
-    logger.info('Pre-reschedule refreshTokens (priming server-side state)', { botId });
-    await client.refreshTokens();
-    logger.info('Pre-reschedule refreshTokens OK', { botId });
-
-    // Auto-detect: if appointment page has no ASC fields, this account doesn't need CAS
-    // (e.g. visa renewal / interview waiver). Override needsCas regardless of bot config.
-    if (needsCas && client.getHasAscFields() === false) {
-      logger.info('Auto-detected no ASC fields in appointment HTML — overriding needsCas to false', { botId, collectsBiometrics: client.getCollectsBiometrics() });
-      needsCas = false;
-    }
-  } catch (refreshErr) {
-    if (refreshErr instanceof SessionExpiredError) throw refreshErr;
-    logger.warn('Pre-reschedule refreshTokens failed (will attempt POST anyway)', {
-      botId, error: refreshErr instanceof Error ? refreshErr.message : String(refreshErr),
+  //
+  // LO QUE CAMBIO (2026-08-30): esta llamada ya NO bloquea antes de `times.json`.
+  //
+  //  1. Si el token viene precalentado y fresco, no se pide nada: 0 ms y 0 peticiones.
+  //     El precalentamiento lo hace `poll-visa` fuera del camino critico.
+  //  2. Si hace falta pedirlo, sale EN PARALELO con `times.json` y se espera recien
+  //     cuando su resultado importa. El costo pasa de una suma a un maximo.
+  //
+  // Medido en el bot 299 el 2026-08-27: 13.832 ms de esta llamada mas 3.354 ms de
+  // `times.json`, en serie, con un cupo que vivio 15 segundos.
+  //
+  // El salto por frescura NO aplica cuando la cuenta usa CAS: ahi `getHasAscFields()`
+  // solo se conoce despues de leer la pagina, y sin ese dato una cuenta de renovacion
+  // se iria por la rama de CAS y fallaria siempre con `no_cas_days`.
+  const tokenFresco = !needsCas && client.getTokensAgeMs() <= MAX_EDAD_TOKEN_MS;
+  let errorTokens: unknown = null;
+  const tokensListos: Promise<void> = tokenFresco
+    ? Promise.resolve()
+    : (async () => {
+        logger.info('Pre-reschedule refreshTokens (priming server-side state)', { botId });
+        await client.refreshTokens();
+        logger.info('Pre-reschedule refreshTokens OK', { botId });
+      })().catch((e: unknown) => { errorTokens = e; });
+  if (tokenFresco) {
+    logger.info('refreshTokens OMITIDO: token precalentado y fresco', {
+      botId, edadS: Math.round(client.getTokensAgeMs() / 1000),
     });
   }
+
+  /**
+   * Espera el refresco lanzado arriba y aplica sus efectos. Se llama una sola vez,
+   * apenas `times.json` responde, y es idempotente en las vueltas siguientes.
+   */
+  let tokensAplicados = false;
+  const esperarTokens = async (): Promise<void> => {
+    if (tokensAplicados) return;
+    tokensAplicados = true;
+    // El try cubre el refresco Y la deteccion de campos ASC, igual que antes de
+    // partir esto en dos. Solo `SessionExpiredError` sube; todo lo demas es una
+    // advertencia y el POST se intenta igual.
+    try {
+      await tokensListos;
+      if (errorTokens) throw errorTokens;
+      // Auto-detect: if appointment page has no ASC fields, this account doesn't need CAS
+      // (e.g. visa renewal / interview waiver). Override needsCas regardless of bot config.
+      if (needsCas && client.getHasAscFields() === false) {
+        logger.info('Auto-detected no ASC fields in appointment HTML — overriding needsCas to false', { botId, collectsBiometrics: client.getCollectsBiometrics() });
+        needsCas = false;
+      }
+    } catch (refreshErr) {
+      if (refreshErr instanceof SessionExpiredError) throw refreshErr;
+      logger.warn('Pre-reschedule refreshTokens failed (will attempt POST anyway)', {
+        botId, error: refreshErr instanceof Error ? refreshErr.message : String(refreshErr),
+      });
+    }
+  };
+
+  /**
+   * Motivo por el que NO se pudo verificar el ultimo POST contra el portal.
+   *
+   * `null` = la cita se leyo y confirmo. Con texto, el exito se anota igual (perder un
+   * reagendamiento confirmado es peor) y la fila de `reschedule_logs` queda marcada
+   * `[NO VERIFICADO: ...]`, entonces `scripts/audit-reschedule-attribution.ts` la puede
+   * separar de un movimiento probado.
+   */
+  let sinVerificar: string | null = null;
 
   const exhaustedDates = new Set<string>();
   const falsePositiveDates = new Set<string>(); // Persisted to blockedConsularDates by caller
@@ -541,15 +650,21 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
     try {
       const consularTimesData = await client.getConsularTimes(candidate.date);
+      // El refresco de tokens salio en paralelo con esta peticion. Aqui se cobra el
+      // maximo de las dos, no la suma, y se aplica el override de `needsCas`.
+      await esperarTokens();
       const consularTimes = filterTimes(candidate.date, consularTimesData.available_times?.filter((t): t is string => !!t) ?? [], timeExclusions)
         .reverse(); // Try later times first — less competed than early morning slots
       logger.info('Consular times (reversed)', { botId, date: candidate.date, available: consularTimesData.available_times, afterFilter: consularTimes });
       let isSpeculative = false;
       if (consularTimes.length === 0 && !needsCas && bot.speculativeTimeFallback) {
-        consularTimes.push(...SPECULATIVE_TIMES);
+        // Las horas del bot mandan sobre la constante global: dependen del schedule.
+        const tiempos = bot.speculativeTimes?.length ? bot.speculativeTimes : SPECULATIVE_TIMES;
+        consularTimes.push(...tiempos);
         isSpeculative = true;
         logger.warn('No consular times -- using speculative fallback', {
-          botId, date: candidate.date, speculativeTimes: SPECULATIVE_TIMES,
+          botId, date: candidate.date, speculativeTimes: tiempos,
+          origen: bot.speculativeTimes?.length ? 'bot' : 'constante_global',
         });
       }
       if (consularTimes.length === 0) {
@@ -623,8 +738,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           // This prevents false positives (slot taken by another user, redirect still goes to /instructions)
           let verified = true;
           try {
-            const verifyAppt = await client.getCurrentAppointment();
-            if (verifyAppt && verifyAppt.consularDate !== candidate.date) {
+            const verifyAppt = await leerCitaVerificada(client);
+            if (verifyAppt.consularDate !== candidate.date) {
               logger.error('FALSE POSITIVE (no CAS): POST succeeded but appointment unchanged', {
                 botId, expected: candidate.date, actual: verifyAppt.consularDate,
                 consularTime, prevDate: prevConsularDate,
@@ -670,10 +785,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               failedAttempts.push(fa);
               exhaustedDates.add(candidate.date);
             } else {
-              // Real time slot: assuming success is safer than losing a confirmed reschedule
+              // Hora real de `times.json`: dar por bueno el POST sigue siendo mas seguro
+              // que perder un reagendamiento confirmado. Lo que cambia es que el exito
+              // queda MARCADO como no verificado, entonces
+              // `scripts/audit-reschedule-attribution.ts` lo puede separar en vez de
+              // contarlo como un movimiento probado del bot.
               logger.warn('Post-reschedule verification failed (no CAS), assuming success', {
                 botId, date: candidate.date, consularTime, error: verifyErrMsg,
               });
+              sinVerificar = verifyErrMsg;
             }
           }
 
@@ -682,7 +802,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           }
 
           const isInitialBooking = prevConsularDate === null;
-          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isSpeculative ? ' (speculative)' : ''}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}`;
+          const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isSpeculative ? ' (speculative)' : ''}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}${sinVerificar ? ` [NO VERIFICADO: ${sinVerificar}]` : ''}`;
           pending.push(
             db.insert(rescheduleLogs).values({
               botId,
@@ -918,8 +1038,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         // POST redirect chain indicated success — verify synchronously before committing
         let verified = true;
         try {
-          const verifyAppt = await client.getCurrentAppointment();
-          if (verifyAppt && verifyAppt.consularDate !== candidate.date) {
+          const verifyAppt = await leerCitaVerificada(client);
+          if (verifyAppt.consularDate !== candidate.date) {
             logger.error('FALSE POSITIVE (CAS): POST succeeded but appointment unchanged', {
               botId, expected: candidate.date, actual: verifyAppt.consularDate,
               consularTime, casDate, casTime, prevDate: prevConsularDate,
@@ -943,10 +1063,13 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             falsePositiveDates.add(candidate.date);
           }
         } catch (verifyErr) {
+          // Ver la nota de la rama sin CAS: se da por bueno y queda MARCADO como no
+          // verificado, para que la auditoria de atribucion lo pueda separar.
+          const msg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
           logger.warn('Post-reschedule verification failed (CAS), assuming success', {
-            botId, date: candidate.date, consularTime, casDate, casTime,
-            error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+            botId, date: candidate.date, consularTime, casDate, casTime, error: msg,
           });
+          sinVerificar = msg;
         }
 
         if (!verified) {
@@ -954,7 +1077,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         }
 
         const isInitialBooking = prevConsularDate === null;
-        const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}`;
+        const strategyNote = `[${selectionStrategy}] attempt ${attempt}, #${candidateIdx + 1}/${candidates.length}${isInitialBooking ? ' [INITIAL_BOOKING]' : ''}${sinVerificar ? ` [NO VERIFICADO: ${sinVerificar}]` : ''}`;
         pending.push(
           db.insert(rescheduleLogs).values({
             botId,

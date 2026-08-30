@@ -706,7 +706,13 @@ logsRouter.get('/bots/:id/billing', async (c) => {
     .where(eq(rescheduleLogs.botId, botId))
     .orderBy(asc(rescheduleLogs.createdAt));
 
-  return c.json(auditReschedules(rows));
+  // La cita real cierra la cadena. Ver `AttributionOptions.citaActual`.
+  const [fila] = await db
+    .select({ currentConsularDate: bots.currentConsularDate })
+    .from(bots)
+    .where(eq(bots.id, botId));
+
+  return c.json(auditReschedules(rows, { citaActual: fila?.currentConsularDate ?? null }));
 });
 
 // ── Ban Status ────────────────────────────────────────────

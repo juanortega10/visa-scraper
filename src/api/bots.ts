@@ -5,7 +5,7 @@ import type { CasCacheData } from '../db/schema.js';
 import { eq, and, desc, asc, gte, sql, isNotNull, isNull, count } from 'drizzle-orm';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { logAuth } from '../utils/auth-logger.js';
-import { pureFetchLogin, InvalidCredentialsError, discoverAccount } from '../services/login.js';
+import { pureFetchLogin, InvalidCredentialsError, AccountLockedError, NoSchedulableGroupError, discoverAccount } from '../services/login.js';
 import type { DiscoverResult } from '../services/login.js';
 import { setDiscoveryToken, consumeDiscoveryToken } from '../services/discovery-tokens.js';
 import { getEffectiveWebshareUrls } from '../services/proxy-fetch.js';
@@ -16,7 +16,7 @@ import { clerkAuth } from '../middleware/clerk-auth.js';
 import { createClerkClient } from '@clerk/backend';
 
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-import { isValidLocale, VALID_LOCALES, resolveLocale } from '../utils/constants.js';
+import { isValidLocale, VALID_LOCALES, resolveLocale, suggestEmailDomain } from '../utils/constants.js';
 import { runs } from '@trigger.dev/sdk/v3';
 
 export const botsRouter = new Hono();
@@ -863,6 +863,16 @@ botsRouter.post('/validate-credentials', async (c) => {
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
     return c.json({ error: 'email must be a valid email address' }, 400);
   }
+  // A typo'd domain can only fail the login, and every failed login counts toward the
+  // portal's account lockout. Stop it here instead of spending the attempt.
+  const suggestedDomain = suggestEmailDomain(email);
+  if (suggestedDomain) {
+    return c.json({
+      error: 'email_domain_typo',
+      suggestedEmail: `${email.split('@')[0]}@${suggestedDomain}`,
+      message: `Revisa el correo: ¿querías escribir @${suggestedDomain}?`,
+    }, 400);
+  }
   if (!password || typeof password !== 'string') {
     return c.json({ error: 'password is required' }, 400);
   }
@@ -888,6 +898,15 @@ botsRouter.post('/validate-credentials', async (c) => {
       console.log(`[validate-credentials] INVALID email=${email}`);
       logAuth({ email, action: 'validate', locale, result: 'invalid', ip: getClientIp(c) });
       return c.json({ valid: false, message: 'invalid_credentials' });
+    }
+    if (e instanceof AccountLockedError) {
+      console.log(`[validate-credentials] LOCKED email=${email} until=${e.lockedUntil?.toISOString() ?? 'unknown'}`);
+      logAuth({ email, action: 'validate', locale, result: 'invalid', errorMessage: e.message, ip: getClientIp(c) });
+      return c.json({
+        valid: false,
+        message: 'account_locked',
+        lockedUntil: e.lockedUntil?.toISOString() ?? null,
+      }, 423);
     }
     console.log(`[validate-credentials] ERROR email=${email} err=${e instanceof Error ? e.message : e}`);
     logAuth({ email, action: 'validate', locale, result: 'error', errorMessage: e instanceof Error ? e.message : String(e), ip: getClientIp(c) });
@@ -941,7 +960,9 @@ export async function discoverWithFallback(
     const result = await discoverAccount(email, password, locale);
     return { result, via: 'direct:ok' };
   } catch (e) {
-    if (e instanceof InvalidCredentialsError) throw e;
+    // Both are verdicts from the portal, not connectivity failures. Another IP gets the
+    // same answer, and each extra login attempt extends an existing lockout.
+    if (e instanceof InvalidCredentialsError || e instanceof AccountLockedError || e instanceof NoSchedulableGroupError) throw e;
     const { label, detail } = classifyFetchError(e);
     attempts.push(`direct[${label}]`);
     console.warn(`[discover] Direct failed [${label}]: ${detail}`);
@@ -977,7 +998,7 @@ export async function discoverWithFallback(
       console.log(`[discover] ✓ ws:${ip} succeeded`);
       return { result, via: attempts.join(' → ') };
     } catch (e2) {
-      if (e2 instanceof InvalidCredentialsError) throw e2;
+      if (e2 instanceof InvalidCredentialsError || e2 instanceof AccountLockedError || e2 instanceof NoSchedulableGroupError) throw e2;
       const { label, detail } = classifyFetchError(e2);
       attempts.push(`ws:${ip}[${label}]`);
       console.warn(`[discover] ✗ ws:${ip} [${label}]: ${detail}`);
@@ -999,6 +1020,16 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
 
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
     return c.json({ error: 'email must be a valid email address' }, 400);
+  }
+  // A typo'd domain can only fail the login, and every failed login counts toward the
+  // portal's account lockout. Stop it here instead of spending the attempt.
+  const suggestedDomain = suggestEmailDomain(email);
+  if (suggestedDomain) {
+    return c.json({
+      error: 'email_domain_typo',
+      suggestedEmail: `${email.split('@')[0]}@${suggestedDomain}`,
+      message: `Revisa el correo: ¿querías escribir @${suggestedDomain}?`,
+    }, 400);
   }
   if (!password || typeof password !== 'string') {
     return c.json({ error: 'password is required' }, 400);
@@ -1042,6 +1073,28 @@ botsRouter.post('/discover-account', clerkAuth({ required: false }), async (c) =
       console.log(`[discover-account] INVALID email=${email}`);
       logAuth({ email, action: 'discover', locale, result: 'invalid', password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
       return c.json({ error: 'invalid_credentials' }, 401);
+    }
+    if (e instanceof NoSchedulableGroupError) {
+      // The credentials work. The account simply has no group that can hold an
+      // appointment — the visa fee is unpaid. Nothing to poll, so do not create a bot.
+      console.log(`[discover-account] NO_SCHEDULABLE_GROUP email=${email} states=${e.states.join(',')}`);
+      logAuth({ email, action: 'discover', locale, result: 'error', errorMessage: e.message, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+      return c.json({
+        error: 'visa_fee_unpaid',
+        portalStates: e.states,
+        message: 'La cuenta no tiene ninguna cita programable. Paga el arancel de visa en el portal y vuelve a intentar.',
+      }, 422);
+    }
+    if (e instanceof AccountLockedError) {
+      // The portal locked the account after repeated failed logins. Retrying extends
+      // the lock, so this must not surface as a transient 503 discovery_failed.
+      console.log(`[discover-account] LOCKED email=${email} until=${e.lockedUntil?.toISOString() ?? 'unknown'}`);
+      logAuth({ email, action: 'discover', locale, result: 'invalid', errorMessage: e.message, password, clerkUserId: clerkUser?.clerkUserId, ip: getClientIp(c) });
+      return c.json({
+        error: 'account_locked',
+        lockedUntil: e.lockedUntil?.toISOString() ?? null,
+        message: e.message,
+      }, 423);
     }
     const errMsg = e instanceof Error ? e.message : String(e);
     const cause = e instanceof Error && e.cause ? String(e.cause) : undefined;
@@ -1152,6 +1205,7 @@ botsRouter.get('/:id', async (c) => {
     targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
     maxReschedules: bots.maxReschedules, rescheduleCount: bots.rescheduleCount,
     maxCasGapDays: bots.maxCasGapDays,
+    excludedWeekdays: bots.excludedWeekdays,
     minDaysFromToday: bots.minDaysFromToday,
     pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
     skipCas: bots.skipCas,
@@ -1216,6 +1270,7 @@ botsRouter.get('/:id', async (c) => {
     maxReschedules: bot.maxReschedules,
     rescheduleCount: bot.rescheduleCount,
     maxCasGapDays: bot.maxCasGapDays ?? null,
+    excludedWeekdays: bot.excludedWeekdays ?? null,
     minDaysFromToday: bot.minDaysFromToday ?? null,
     pollIntervalSeconds: bot.pollIntervalSeconds ?? null,
     targetPollsPerMin: bot.targetPollsPerMin ?? null,
@@ -1287,6 +1342,18 @@ botsRouter.put('/:id', async (c) => {
   if (body.sniperMode !== undefined) updates.sniperMode = !!body.sniperMode;
   if (body.maxReschedules !== undefined) updates.maxReschedules = body.maxReschedules != null ? parseInt(body.maxReschedules, 10) : null;
   if (body.maxCasGapDays !== undefined) updates.maxCasGapDays = body.maxCasGapDays != null ? parseInt(body.maxCasGapDays as string, 10) : null;
+  if (body.excludedWeekdays !== undefined) {
+    // 0 = domingo … 6 = sabado. null o [] = sin restriccion.
+    const raw = body.excludedWeekdays;
+    if (raw == null) updates.excludedWeekdays = null;
+    else {
+      const list = (Array.isArray(raw) ? raw : [raw]).map((v: unknown) => parseInt(String(v), 10));
+      if (list.some(n => !Number.isInteger(n) || n < 0 || n > 6)) {
+        return c.json({ error: 'excludedWeekdays must be integers 0-6 (0=Sunday, 6=Saturday)' }, 400);
+      }
+      updates.excludedWeekdays = [...new Set(list)].sort();
+    }
+  }
   if (body.minDaysFromToday !== undefined) updates.minDaysFromToday = body.minDaysFromToday != null ? parseInt(body.minDaysFromToday as string, 10) : null;
   if (body.pollIntervalSeconds !== undefined) updates.pollIntervalSeconds = body.pollIntervalSeconds != null ? parseInt(body.pollIntervalSeconds, 10) : null;
   if (body.targetPollsPerMin !== undefined) updates.targetPollsPerMin = body.targetPollsPerMin != null ? parseInt(body.targetPollsPerMin, 10) : null;

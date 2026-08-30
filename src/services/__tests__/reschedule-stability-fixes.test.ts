@@ -73,6 +73,11 @@ function makeClient(overrides: Record<string, any> = {}) {
     getConfig: vi.fn().mockReturnValue({ proxyProvider: 'direct' }),
     updateSession: vi.fn(),
     refreshTokens: vi.fn().mockResolvedValue(undefined),
+    // Edad del token precalentado. Infinity = desconocida, o sea siempre se refresca:
+    // es el comportamiento historico que estos casos ya cubren.
+    getTokensAgeMs: vi.fn().mockReturnValue(Number.POSITIVE_INFINITY),
+    getTokensRefreshedAt: vi.fn().mockReturnValue(null),
+    ensureTokens: vi.fn().mockResolvedValue(true),
     ...overrides,
   } as any;
 }

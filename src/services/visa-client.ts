@@ -3,6 +3,39 @@ import { USER_AGENT, BROWSER_HEADERS, getBaseUrl, getLocaleTexts, type LocaleTex
 import { proxyFetch, type ProxyProvider, type ProxyFetchMeta } from './proxy-fetch.js';
 import { extractAppointments, extractGroups } from './html-parsers.js';
 
+/**
+ * Techo por PETICION del camino critico, en milisegundos.
+ *
+ * El agente global de undici usa `headersTimeout: 12_000` (`proxy-fetch.ts`), que
+ * es correcto para el login: son paginas pesadas y no corren contra el reloj de un
+ * cupo. Dentro del camino critico esos 12 s se gastan enteros cuando una ruta se
+ * cuelga, y el cupo dura segundos. Medido el 2026-08-27: `refreshTokens()` gasto
+ * 12.294 ms identicos en el bot 7 y en el bot 299.
+ *
+ * Se aplica con `AbortSignal.timeout()` por peticion, no en el agente, entonces el
+ * login conserva su margen completo. El POST de reagendamiento NUNCA lleva techo:
+ * abortarlo del lado del cliente deja la duda de si el portal ya lo proceso.
+ */
+export const TECHO_CARRERA_MS = 3_000;
+
+/**
+ * Techo de `times.json` y de las dos peticiones de CAS, en milisegundos.
+ *
+ * Mas alto que `TECHO_CARRERA_MS` por una razon concreta: `refreshTokens()` y
+ * `getCurrentAppointment()` tienen SEGUNDA RUTA. Abortarlas rapido es gratis, porque
+ * el corte arranca el intento por proxy. `times.json` no tiene segunda ruta: el
+ * reintento de `proxyFetch` solo cubre errores de TCP, y un abort no lo es
+ * (`TCP_RE` no lo reconoce). Ahi un techo corto convierte "lento pero vivo" en
+ * "perdido", que es peor que esperar.
+ *
+ * Medido el 2026-08-30: con 3.000 ms el ensayo del sniper aborto en el primer
+ * intento. Sigue muy por debajo de los 12.000 ms del agente.
+ */
+export const TECHO_HORAS_MS = 8_000;
+
+/** Techo del GET de dias. Mas suelto: perder este tick cuesta un ciclo, no un cupo. */
+export const TECHO_DIAS_MS = 6_000;
+
 export class SessionExpiredError extends Error {
   constructor(detail?: string) {
     super(`Session expired${detail ? ` (${detail})` : ''}`);
@@ -55,6 +88,22 @@ export interface VisaClientConfig {
   userId?: string | null;
   locale?: string;
   captureHtml?: boolean;
+  /**
+   * Cuando se emitio el `authenticity_token` que viene en la sesion. Sale de
+   * `sessions.tokens_refreshed_at`. Sin este dato el token cuenta como vencido y
+   * `ensureTokens()` lo refresca, que es el comportamiento historico.
+   */
+  tokensRefreshedAt?: Date | null;
+}
+
+/**
+ * Agrega un techo de tiempo por peticion sin pisar un `signal` que ya venga puesto.
+ * Con `techoMs` sin definir devuelve las mismas opciones, entonces el llamador que
+ * no pide techo no cambia de comportamiento.
+ */
+function conTecho(options: RequestInit, techoMs?: number): RequestInit {
+  if (!techoMs || options.signal) return options;
+  return { ...options, signal: AbortSignal.timeout(techoMs) };
 }
 
 export class VisaClient {
@@ -73,12 +122,21 @@ export class VisaClient {
    * critico salen por la misma IP: sin tuneles frios y con una sola huella.
    */
   private readonly stickyKey = `vc-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+  /**
+   * Momento en que el portal emitio el `authenticity_token` que trae la sesion.
+   *
+   * Se siembra desde `sessions.tokens_refreshed_at`, entonces un token precalentado
+   * en un run anterior sigue contando como fresco en este. `null` = edad desconocida,
+   * que se trata como vencido.
+   */
+  private tokensRefreshedAt: Date | null = null;
   private lastProxyMeta: ProxyFetchMeta = { proxyAttemptIp: null, fallbackReason: null, websharePoolSize: 0, errorSource: null, tcpSubcategory: null, poolExhausted: false, socketBytesRead: null };
 
   constructor(session: VisaSession, config: VisaClientConfig) {
     this.session = { ...session };
     this.config = config;
     if (config.userId) this.userId = config.userId;
+    if (config.tokensRefreshedAt) this.tokensRefreshedAt = config.tokensRefreshedAt;
     const locale = config.locale ?? 'es-co';
     this.baseUrl = getBaseUrl(locale);
     this.texts = getLocaleTexts(locale);
@@ -116,6 +174,33 @@ export class VisaClient {
   /** Whether ASC form fields exist in the appointment HTML. false = renewal/interview-waiver account. */
   getHasAscFields(): boolean | null {
     return this.hasAscFields;
+  }
+
+  /** Momento de emision del `authenticity_token`, para persistirlo en `sessions`. */
+  getTokensRefreshedAt(): Date | null {
+    return this.tokensRefreshedAt;
+  }
+
+  /** Edad del token en milisegundos. `Infinity` cuando no se conoce la emision. */
+  getTokensAgeMs(): number {
+    if (!this.tokensRefreshedAt || !this.session.authenticityToken) return Number.POSITIVE_INFINITY;
+    const edad = Date.now() - this.tokensRefreshedAt.getTime();
+    return edad < 0 ? Number.POSITIVE_INFINITY : edad;
+  }
+
+  /**
+   * Refresca el `authenticity_token` SOLO si hace falta.
+   *
+   * Precomputar lo precomputable: el token vive con la sesion de Rails, no con la
+   * peticion, entonces se puede pedir con calma antes de que aparezca el cupo. En el
+   * camino critico esta llamada cuesta 0 ms cuando el token ya esta fresco.
+   *
+   * Devuelve `true` si toco pedir la pagina al portal.
+   */
+  async ensureTokens(maxAgeMs: number): Promise<boolean> {
+    if (this.getTokensAgeMs() <= maxAgeMs) return false;
+    await this.refreshTokens();
+    return true;
   }
 
   updateSession(newSession: Partial<VisaSession>): void {
@@ -176,11 +261,14 @@ export class VisaClient {
     options: RequestInit,
     label: string,
     perfil: 'normal' | 'carrera' = 'normal',
+    techoMs?: number,
   ): Promise<Response> {
     const BACKOFF = perfil === 'carrera' ? [50] : [300, 600];
     const RETRIES = BACKOFF.length;
     for (let attempt = 0; ; attempt++) {
-      const resp = await this.doFetch(url, options);
+      // El techo se arma DENTRO del bucle: un `AbortSignal.timeout` ya vencido
+      // aborta el reintento antes de que salga.
+      const resp = await this.doFetch(url, conTecho(options, techoMs));
       if (resp.status < 500 || attempt >= RETRIES) return resp;
       // Se consume el cuerpo para liberar la conexion
       await resp.text().catch(() => {});
@@ -267,12 +355,15 @@ export class VisaClient {
     const puedeCaerAlProxy = this.config.proxyProvider !== 'direct'
       && this.config.proxyProvider !== 'firecrawl';
 
+    // Techo por peticion en LAS DOS rutas. Sin el, la ruta directa colgada gasta los
+    // 12 s del agente y recien ahi arranca el proxy: 12 s antes de la primera
+    // alternativa. Con techo, el peor caso es 2 x TECHO_CARRERA_MS.
     let resp: Response;
     try {
-      resp = await this.doDirectFetch(url, opciones);
+      resp = await this.doDirectFetch(url, conTecho(opciones, TECHO_CARRERA_MS));
     } catch (err) {
       if (!puedeCaerAlProxy) throw err;
-      const { response, meta } = await proxyFetch(url, opciones, this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
+      const { response, meta } = await proxyFetch(url, conTecho(opciones, TECHO_CARRERA_MS), this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
       this.lastProxyMeta = meta;
       this.updateCookieFromResponse(response);
       resp = response;
@@ -290,6 +381,9 @@ export class VisaClient {
     const authMatch = html.match(/<input[^>]+name="authenticity_token"[^>]+value="([^"]+)"/);
     if (!authMatch?.[1]) throw new Error('authenticity_token not found in appointment page HTML');
     this.session.authenticityToken = authMatch[1];
+    // Sello de emision. Lo lee `ensureTokens()` y lo persiste `poll-visa` en
+    // `sessions.tokens_refreshed_at` para que el proximo run herede la frescura.
+    this.tokensRefreshedAt = new Date();
 
     const userIdMatch = html.match(/\/groups\/(\d+)/);
     if (userIdMatch?.[1]) {
@@ -335,10 +429,10 @@ export class VisaClient {
     // rule in doDirectFetch exists for POSTs, where Bright Data returns 402).
     let resp: Response;
     try {
-      resp = await this.doDirectFetch(url, options);
+      resp = await this.doDirectFetch(url, conTecho(options, TECHO_CARRERA_MS));
     } catch (err) {
       if (this.config.proxyProvider === 'direct') throw err;
-      const { response, meta } = await proxyFetch(url, options, this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
+      const { response, meta } = await proxyFetch(url, conTecho(options, TECHO_CARRERA_MS), this.config.proxyProvider, this.config.proxyUrls, this.stickyKey);
       this.lastProxyMeta = meta;
       this.updateCookieFromResponse(response);
       resp = response;
@@ -369,6 +463,8 @@ export class VisaClient {
       `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/days/${this.config.consularFacilityId}.json?appointments[expedite]=false`,
       { headers: this.ajaxHeaders() },
       'Consular days',
+      'normal',
+      TECHO_DIAS_MS,
     );
     this.assertOk(resp, 'Consular days');
     return this.safeJson<DaySlot[]>(resp, 'Consular days');
@@ -382,6 +478,7 @@ export class VisaClient {
       { headers: this.ajaxHeaders() },
       'Consular times',
       'carrera',   // ya vimos el cupo: aqui cada 100 ms cuenta
+      TECHO_HORAS_MS,
     );
     this.assertOk(resp, 'Consular times');
     return this.safeJson<TimeSlots>(resp, 'Consular times');
@@ -394,6 +491,8 @@ export class VisaClient {
       `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/days/${this.config.ascFacilityId}.json?consulate_id=${this.config.consularFacilityId}&consulate_date=${consularDate}&consulate_time=${consularTime}&appointments[expedite]=false`,
       { headers: this.ajaxHeaders() },
       'CAS days',
+      'carrera',
+      TECHO_HORAS_MS,
     );
     this.assertOk(resp, 'CAS days');
     return this.safeJson<DaySlot[]>(resp, 'CAS days');
@@ -407,7 +506,7 @@ export class VisaClient {
       url += `&consulate_id=${this.config.consularFacilityId}&consulate_date=${consularDate}&consulate_time=${consularTime}`;
     }
     url += '&appointments[expedite]=false';
-    const resp = await this.fetchWithRetry(url, { headers: this.ajaxHeaders() }, 'CAS times', 'carrera');
+    const resp = await this.fetchWithRetry(url, { headers: this.ajaxHeaders() }, 'CAS times', 'carrera', TECHO_HORAS_MS);
     this.assertOk(resp, 'CAS times');
     return this.safeJson<TimeSlots>(resp, 'CAS times');
   }

@@ -25,6 +25,19 @@ export const CROSS_POLL_BLOCK_MS = 6 * 60 * 60 * 1000; // 6h (was 2h)
 export const CROSS_POLL_WINDOW_MS = 3 * 60 * 60 * 1000; // 3h (was 1h)
 
 /**
+ * Tuning of the sliding window. Omit for the fleet defaults (5 fallos en 3h → bloqueo 6h),
+ * que estan pensados para el poll normal de 2 min.
+ *
+ * Un sniper que consulta cada 30s necesita otra escala: bloquear 6h una fecha por falta de
+ * CAS le haria perder justo la liberacion que esta esperando. Por eso el parametro.
+ */
+export interface FailureTuning {
+  threshold?: number;
+  blockMs?: number;
+  windowMs?: number;
+}
+
+/**
  * Increment a tracker entry. Pure: returns a new entry, never mutates input.
  *
  * - undefined entry OR window expired → fresh entry { totalCount: 1 }
@@ -36,10 +49,14 @@ export function recordFailure(
   entry: DateFailureEntry | undefined,
   dimension: FailureDimension,
   now: number,
+  tuning: FailureTuning = {},
 ): DateFailureEntry {
+  const threshold = tuning.threshold ?? CROSS_POLL_THRESHOLD;
+  const blockMs = tuning.blockMs ?? CROSS_POLL_BLOCK_MS;
+  const windowMs = tuning.windowMs ?? CROSS_POLL_WINDOW_MS;
   const nowIso = new Date(now).toISOString();
   const windowExpired =
-    !!entry && (now - new Date(entry.windowStartedAt).getTime()) > CROSS_POLL_WINDOW_MS;
+    !!entry && (now - new Date(entry.windowStartedAt).getTime()) > windowMs;
 
   if (!entry || windowExpired) {
     return {
@@ -64,8 +81,8 @@ export function recordFailure(
     ...(entry.blockedUntil ? { blockedUntil: entry.blockedUntil } : {}),
   };
 
-  if (totalCount >= CROSS_POLL_THRESHOLD && !updated.blockedUntil) {
-    updated.blockedUntil = new Date(now + CROSS_POLL_BLOCK_MS).toISOString();
+  if (totalCount >= threshold && !updated.blockedUntil) {
+    updated.blockedUntil = new Date(now + blockMs).toISOString();
   }
 
   return updated;

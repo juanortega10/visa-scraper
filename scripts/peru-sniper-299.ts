@@ -93,13 +93,68 @@ let ultimoEscaneo: { masTemprana: string; enMs: number } | null = null;
  * A 2 vueltas por minuto, escribir todo serian 2.880 filas por dia. Con esta
  * regla quedan ~290, y la pagina sigue viendo lo mismo.
  */
+/**
+ * Metricas del camino critico. Todas se miden con `Date.now()` sobre codigo que ya
+ * corria, entonces el costo es una resta por vuelta. Ninguna agrega una peticion.
+ */
+export interface MetricasCamino {
+  /** Milisegundos que costo leer la fila del bot. Con la copia en memoria debe ser ~0. */
+  msLeerBot?: number;
+  /** Segundo del minuto UTC en que SALIO `days.json`. La ventana de es-pe es s15-s24. */
+  segundoTick?: number;
+  /** De la respuesta de `days.json` hasta lanzar la peticion de horas. Es el tiempo REGALADO. */
+  msDiasAHoras?: number;
+  /** Reloj de pared de las dos peticiones en paralelo. */
+  msCarrera?: number;
+  /** Cada una por separado. Si `msCarrera` se parece a la suma, el paralelo se rompio. */
+  msTimes?: number;
+  msApt?: number;
+  /** true = el token ya estaba precalentado y no se pidio la pagina del appointment. */
+  tokenPrecalentado?: boolean;
+  /** Vuelta completa, de leer el bot a decidir. */
+  msVuelta?: number;
+  /** Motivo si alguna de las dos peticiones del ensayo fallo. null = las dos bien. */
+  falloEnsayo?: string | null;
+  /**
+   * Cuantas horas devolvio `times.json` para la fecha del ensayo.
+   *
+   * Es la respuesta a "cuando HAY horas de verdad". `days.json` lista un dia; solo
+   * `times.json` dice si ese dia se puede reservar. Historicamente el bot 299 tiene
+   * DOS muestras de times.json en toda su vida, las dos vacias (2026-08-27). Sin este
+   * campo no hay con que armar el histograma de disponibilidad real.
+   */
+  horasEncontradas?: number | null;
+  /**
+   * CUALES horas, no solo cuantas. Es lo que decide si se puede adivinar la hora y
+   * saltarse `times.json`. Hoy `SPECULATIVE_TIMES` en `reschedule-logic.ts` apuesta a
+   * ['10:15','10:00','07:30'] sin respaldo medido para es-pe: las 354 apariciones de
+   * ese trio en la base son la CONSTANTE del propio fallback, no lecturas del portal.
+   */
+  horas?: string[] | null;
+  /** La fecha que se le pregunto a `times.json`. Contexto del numero de arriba. */
+  fechaEnsayo?: string | null;
+  /** Dias entre hoy y la fecha del ensayo. La disponibilidad depende de la distancia. */
+  diasHastaFecha?: number | null;
+}
+
 async function registrarEscaneo(args: {
   masTemprana: string; dias: number; msDias: number; fase: string;
   ventanaFin: string | null; edadTokenS: number | null;
+  metricas?: MetricasCamino;
+  /** Salta la regla de latido: el ensayo siempre se escribe. */
+  siempre?: boolean;
 }): Promise<void> {
   const cambio = ultimoEscaneo?.masTemprana !== args.masTemprana;
   const viejo = !ultimoEscaneo || Date.now() - ultimoEscaneo.enMs > LATIDO_MS;
-  if (!cambio && !viejo) return;
+  if (!args.siempre && !cambio && !viejo) return;
+  // El sello se marca ANTES del viaje a Neon. Sin esto, dos vueltas seguidas
+  // dispararian dos INSERT del mismo latido mientras el primero sigue en vuelo.
+  //
+  // El ENSAYO no toca el sello. Escribe con `siempre: true` cada 10 min, y si moviera
+  // el reloj del latido le robaria turnos a los ticks normales: medido el 2026-08-30,
+  // `buscando` bajo de 11 filas por hora a 6. Son dos flujos distintos y cada uno
+  // lleva su propia cadencia.
+  if (!args.siempre) ultimoEscaneo = { masTemprana: args.masTemprana, enMs: Date.now() };
   try {
     await db.insert(sniperScans).values({
       scanKey: SCAN_KEY,
@@ -110,19 +165,80 @@ async function registrarEscaneo(args: {
         masTemprana: args.masTemprana, dias: args.dias, msDias: args.msDias,
         edadTokenS: args.edadTokenS, segundosTick: [...SEGUNDOS_TICK],
         ventanaSeg: [VENTANA_PE.inicioSeg, VENTANA_PE.finSeg - 1],
+        ...(args.metricas ?? {}),
       },
     });
-    ultimoEscaneo = { masTemprana: args.masTemprana, enMs: Date.now() };
   } catch (e) {
+    // El sello se revierte para que el latido se reintente en la vuelta siguiente.
+    if (!args.siempre) ultimoEscaneo = null;
     log(`  [escaneo] no se pudo registrar: ${(e as Error).message}`);
   }
 }
 
-/** Fila del bot, leida en vivo. Nunca se cachea: el cupo puede cambiar por fuera. */
-async function leerBot(): Promise<FilaBot> {
+/**
+ * Registra el escaneo SIN esperar el viaje a Neon.
+ *
+ * Medido desde el RPi el 2026-08-30: un INSERT a Neon (us-east-1) tarda 87-90 ms
+ * de mediana. Esos 90 ms caian entre ver el cupo en `days.json` y pedir las horas,
+ * que es la carrera que el sniper existe para ganar. Es telemetria: no decide nada,
+ * entonces no bloquea. El error ya se maneja adentro.
+ */
+function registrarEscaneoSinEsperar(args: Parameters<typeof registrarEscaneo>[0]): void {
+  void registrarEscaneo(args);
+}
+
+/** Fila del bot, leida en vivo contra Neon. */
+async function leerBotEnVivo(): Promise<FilaBot> {
   const [row] = await db.select().from(bots).where(eq(bots.id, BOT_ID));
   if (!row) throw new Error(`bot ${BOT_ID} no existe`);
   return row;
+}
+
+/**
+ * Fila del bot en memoria, con refresco de fondo.
+ *
+ * Neon vive en us-east-1 y desde el RPi cada consulta cuesta 87-90 ms de mediana
+ * (medido el 2026-08-30). Esa lectura corria ANTES de `days.json`, o sea que el
+ * sniper llegaba 90 ms tarde a cada tick sin ganar nada.
+ *
+ * Por que es seguro cachearla: ninguna de las tres decisiones duras depende de esta
+ * copia.
+ *
+ *   1. La cita actual sale del PORTAL (`getCurrentAppointment`), nunca de aqui.
+ *      Lo dice V2 de `verificarDisparo`, y sin cita leida el disparo se cancela.
+ *   2. El cupo se toma con un UPDATE atomico contra Neon (`reclamarCupo`). Si otro
+ *      proceso ya lo consumio, ese UPDATE no devuelve filas y el disparo se cancela.
+ *   3. `status` y `targetDateBefore` solo estrechan la busqueda. Una copia de hasta
+ *      60 s ordena igual, y los verificadores duros vuelven a correr contra el
+ *      portal antes del POST.
+ *
+ * El refresco sale sin esperar: la vuelta usa la copia que ya tiene.
+ */
+const EDAD_MAX_FILA_MS = 60_000;
+let filaBot: { row: FilaBot; enMs: number } | null = null;
+let refrescoEnVuelo: Promise<void> | null = null;
+
+function refrescarFilaSinEsperar(): void {
+  if (refrescoEnVuelo) return;
+  refrescoEnVuelo = leerBotEnVivo()
+    .then((row) => { filaBot = { row, enMs: Date.now() }; })
+    .catch((e) => { log(`  [fila] refresco fallo: ${(e as Error).message}`); })
+    .finally(() => { refrescoEnVuelo = null; });
+}
+
+async function leerBot(): Promise<FilaBot> {
+  if (!filaBot) {
+    // Arranque en frio: la primera vuelta si espera.
+    filaBot = { row: await leerBotEnVivo(), enMs: Date.now() };
+    return filaBot.row;
+  }
+  if (Date.now() - filaBot.enMs > EDAD_MAX_FILA_MS) refrescarFilaSinEsperar();
+  return filaBot.row;
+}
+
+/** Invalida la copia. Se llama tras cualquier escritura propia sobre `bots`. */
+function olvidarFila(): void {
+  filaBot = null;
 }
 
 function configDe(row: FilaBot, citaPortal: string | null): SniperPeruConfig {
@@ -226,6 +342,7 @@ async function reclamarCupo(): Promise<boolean> {
       or(isNull(bots.portalRemainingReschedules), gt(bots.portalRemainingReschedules, 0)),
     ))
     .returning({ rescheduleCount: bots.rescheduleCount });
+  olvidarFila();   // el contador cambio: la copia en memoria ya no sirve
   return filas.length > 0;
 }
 
@@ -237,26 +354,117 @@ async function devolverCupo(motivo: string): Promise<void> {
       portalRemainingReschedules: sql`COALESCE(${bots.portalRemainingReschedules}, 0) + 1`,
     })
     .where(eq(bots.id, BOT_ID));
+  olvidarFila();
   log(`  [cupo] devuelto (${motivo})`);
 }
 
 interface Resultado { agendado: boolean; fatal?: string }
 
+/** Momento de emision del token ANTES de `sesionLista`. Sirve para saber si hubo refresco. */
+function s0Token(): number | null {
+  return sesion?.token?.emitidoMs ?? null;
+}
+
+// ── Ensayo del camino critico ────────────────────────────────────────────────
+
+/**
+ * Cadencia del ensayo. A 2 vueltas por minuto el sniper hace 120 `days.json` por
+ * hora; el ensayo agrega 12 peticiones, o sea 10% mas. Es el precio de saber si las
+ * mejoras del 2026-08-30 son reales en produccion y no solo en los tests.
+ */
+const ENSAYO_MS = 10 * 60_000;
+let ultimoEnsayoMs = 0;
+let ensayoEnVuelo = false;
+
+/**
+ * Corre el MISMO par de peticiones del camino critico contra una fecha que el portal
+ * ya ofrece, y mide. Nunca postea: no llama a `verificarDisparo`, no llama a
+ * `reclamarCupo` y no llama a `reschedule`. Es un cronometro, no un disparo.
+ *
+ * Existe porque las detecciones reales son rarisimas: el bot 299 tuvo 2 en toda su
+ * vida. Sin ensayo no habria con que comprobar que el camino critico mejoro.
+ *
+ * La fecha elegida es la MAS TEMPRANA que ofrece el portal, que hoy es 2028-01-10 y
+ * esta lejisimos de la meta. Aunque el codigo se rompiera, esa fecha no pasa V2 ni V3.
+ */
+function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, msDias: number): void {
+  if (ensayoEnVuelo || Date.now() - ultimoEnsayoMs < ENSAYO_MS) return;
+  const fecha = dias.map((d) => d.date).filter(Boolean).sort()[0];
+  if (!fecha) return;
+  ensayoEnVuelo = true;
+  ultimoEnsayoMs = Date.now();
+
+  void (async () => {
+    const tVisto = Date.now();
+    try {
+      const tCarrera = Date.now();
+      const msDiasAHoras = tCarrera - tVisto;
+      let msTimes = 0;
+      let msApt = 0;
+      let fallo: string | null = null;
+      // Cada lado atrapa lo suyo: un fallo de una peticion no borra la medicion de
+      // la otra, y el motivo queda escrito. Sin esto, un solo abort dejaba la fila
+      // sin escribir y el verificador se quedaba sin muestra.
+      const [horas, apt] = await Promise.all([
+        (async () => {
+          const t = Date.now();
+          try { return await s.client.getConsularTimes(fecha); }
+          catch (e) { fallo = `times: ${(e as Error).message}`; return null; }
+          finally { msTimes = Date.now() - t; }
+        })(),
+        (async () => {
+          const t = Date.now();
+          try { return await s.client.getCurrentAppointment(); }
+          catch (e) { fallo = `${fallo ? fallo + ' · ' : ''}cita: ${(e as Error).message}`; return null; }
+          finally { msApt = Date.now() - t; }
+        })(),
+      ]);
+      const msCarrera = Date.now() - tCarrera;
+      const edadTokenS = s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null;
+      log(`  [ensayo] ${fecha} · carrera ${msCarrera} ms (times ${msTimes}, cita ${msApt}) · horas ${(horas?.available_times ?? []).length} · cita ${apt?.consularDate ?? '?'}${fallo ? ` · FALLO ${fallo}` : ''}`);
+      await registrarEscaneo({
+        masTemprana: fecha, dias: dias.length, msDias, fase: 'ensayo',
+        ventanaFin: row.targetDateBefore ?? null, edadTokenS, siempre: true,
+        metricas: {
+          msDiasAHoras, msCarrera, msTimes, msApt, falloEnsayo: fallo,
+          horasEncontradas: horas ? (horas.available_times ?? []).filter(Boolean).length : null,
+          horas: horas ? ((horas.available_times ?? []).filter(Boolean) as string[]) : null,
+          fechaEnsayo: fecha,
+          diasHastaFecha: Math.round((Date.parse(`${fecha}T00:00:00Z`) - Date.now()) / 86_400_000),
+        },
+      });
+    } catch (e) {
+      log(`  [ensayo] fallo: ${(e as Error).message}`);
+    } finally {
+      ensayoEnVuelo = false;
+    }
+  })();
+}
+
 /** Una vuelta completa: pedir dias, verificar, y disparar si todo cierra. */
 async function vuelta(): Promise<Resultado> {
+  const tVuelta = Date.now();
+  const tLeer = Date.now();
   const row = await leerBot();
+  const msLeerBot = Date.now() - tLeer;
 
   if (row.status !== 'active') { log(`  bot ${BOT_ID} en estado ${row.status}. No se dispara.`); return { agendado: false }; }
 
   const cupoDb = cupoEfectivo(configDe(row, row.currentConsularDate));
   if (cupoDb.quedan <= 0) return { agendado: false, fatal: `sin cupo (tope ${cupoDb.topeDe})` };
 
+  const tokenAntes = s0Token();
   const s = await sesionLista(row);
+  const tokenPrecalentado = tokenAntes === s.token?.emitidoMs;
 
   // 1 · dias. Es la unica peticion en la vuelta normal.
   const t0 = Date.now();
+  const segundoTick = Math.floor((t0 % 60_000) / 1000);
   const dias = await s.client.getConsularDays();
   const msDias = Date.now() - t0;
+  // Momento exacto en que el cupo se hace VISIBLE para nosotros. Desde aqui corre el
+  // reloj que perdimos las dos veces que el bot 299 vio algo util.
+  const tVisto = Date.now();
 
   const cfgPrevia = configDe(row, row.currentConsularDate);
   const fecha = elegirFecha(dias as Array<{ date: string }>, cfgPrevia, hoyUtc());
@@ -267,11 +475,15 @@ async function vuelta(): Promise<Resultado> {
     // el portal se acerca a la meta, y para notar un filtro que descarta de mas.
     const masTemprana = (dias as Array<{ date: string }>).map((d) => d.date).sort()[0] ?? '(ninguna)';
     log(`  dias ${dias.length} · ${msDias} ms · nada util · mas temprana ${masTemprana} (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
-    await registrarEscaneo({
+    registrarEscaneoSinEsperar({
       masTemprana, dias: dias.length, msDias, fase: 'buscando',
       ventanaFin: row.targetDateBefore ?? null,
       edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
+      metricas: { msLeerBot, segundoTick, tokenPrecalentado, msVuelta: Date.now() - tVuelta },
     });
+    // El ensayo mide el camino critico de verdad, con la cadencia de ENSAYO_MS.
+    // Sale sin esperar y nunca puede postear.
+    quizasEnsayo(s, dias as Array<{ date: string }>, row, msDias);
     return { agendado: false };
   }
   if (Date.now() < quemadaHasta) {
@@ -281,20 +493,52 @@ async function vuelta(): Promise<Resultado> {
 
   log(`  DETECCION ${fecha} · dias ${dias.length} · ${msDias} ms · ventana ${enVentana(Date.now()) ? 'SI' : 'NO'}`);
   ultimoEscaneo = null;   // una deteccion siempre se escribe
-  await registrarEscaneo({
+  registrarEscaneoSinEsperar({
     masTemprana: fecha, dias: dias.length, msDias, fase: 'deteccion',
     ventanaFin: row.targetDateBefore ?? null,
     edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
+    metricas: { msLeerBot, segundoTick, tokenPrecalentado },
   });
 
-  // 2 · la cita actual sale del PORTAL, no de la base de datos. La regla critica se
-  //     verifica contra lo que el portal dice hoy.
-  const apt = await s.client.getCurrentAppointment();
+  // 2 y 3 · horas Y cita actual, EN PARALELO.
+  //
+  // Las dos son peticiones al portal y ninguna depende de la otra. En serie
+  // sumaban; ahora se cobra el maximo. `times.json` es la carrera: el cupo del
+  // 2026-10-26 vivio 15 segundos y el bot llego a los 16,6 (medido 2026-08-27).
+  //
+  // La cita actual sale del PORTAL, nunca de la base de datos: la regla critica se
+  // verifica contra lo que el portal dice hoy. Si esa lectura falla queda en null, y
+  // V2 de `verificarDisparo` cancela el disparo. No se cachea: en Peru el bloqueo es
+  // irreversible y un dato viejo podria autorizar un movimiento hacia adelante.
+  const tCarrera = Date.now();
+  // Tiempo REGALADO: de ver el cupo a pedir las horas. Era 4.408 ms y 13.832 ms en
+  // las dos detecciones del 2026-08-27. Con el escaneo sin esperar y el token
+  // precalentado tiene que quedar en pocos milisegundos.
+  const msDiasAHoras = tCarrera - tVisto;
+  let msTimes = 0;
+  let msApt = 0;
+  const [resHoras, apt] = await Promise.all([
+    (async () => { const t = Date.now(); try { return await s.client.getConsularTimes(fecha); } finally { msTimes = Date.now() - t; } })(),
+    (async () => {
+      const t = Date.now();
+      try { return await s.client.getCurrentAppointment(); }
+      catch (e) { log(`  [cita] no se pudo leer del portal: ${(e as Error).message}`); return null; }
+      finally { msApt = Date.now() - t; }
+    })(),
+  ]);
+  const msCarrera = Date.now() - tCarrera;
   const cfg = configDe(row, apt?.consularDate ?? null);
-  log(`  portal dice cita ${apt?.consularDate ?? '(no leida)'} ${apt?.consularTime ?? ''}`);
+  log(`  regalado ${msDiasAHoras} ms · carrera ${msCarrera} ms (times ${msTimes}, cita ${msApt}) · portal dice cita ${apt?.consularDate ?? '(no leida)'} ${apt?.consularTime ?? ''}`);
+  // Se escribe la medicion de la deteccion real, sin esperar.
+  registrarEscaneoSinEsperar({
+    masTemprana: fecha, dias: dias.length, msDias, fase: 'deteccion_medida',
+    ventanaFin: row.targetDateBefore ?? null,
+    edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
+    siempre: true,
+    metricas: { msLeerBot, segundoTick, tokenPrecalentado, msDiasAHoras, msCarrera, msTimes, msApt },
+  });
 
-  // 3 · horas
-  const horas = ((await s.client.getConsularTimes(fecha)).available_times ?? []).filter(Boolean) as string[];
+  const horas = (resHoras.available_times ?? []).filter(Boolean) as string[];
   if (!horas.length) {
     log(`  ${fecha} sin horas. Se quema 20 min.`);
     quemadas.set(fecha, Date.now() + QUEMADA_MS);
@@ -367,6 +611,7 @@ async function vuelta(): Promise<Resultado> {
       currentConsularTime: real.consularTime,
       updatedAt: new Date(),
     }).where(eq(bots.id, BOT_ID));
+    olvidarFila();
     log(`  *** AGENDADO ${real.consularDate} ${real.consularTime} ***`);
     ultimoEscaneo = null;
     await registrarEscaneo({

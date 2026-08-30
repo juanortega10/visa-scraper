@@ -197,7 +197,9 @@ const APPT_WITH_CHECKBOXES = `
 </body>
 </html>`;
 
-// Appointment page with multiple consular facility options
+// Appointment page with multiple consular facility options.
+// The selected city is deliberately NOT first: the portal lists cities
+// alphabetically, so a parser that reads option[0] picks the wrong consulate.
 const APPT_MULTI_FACILITY = `
 <html>
 <body>
@@ -205,20 +207,52 @@ const APPT_MULTI_FACILITY = `
   <div id="consulate_appointment">
     <select id="appointments_consulate_appointment_facility_id" name="appointments[consulate_appointment][facility_id]">
       <option value="">-- Select --</option>
-      <option value="88" selected="selected">Mexico City</option>
       <option value="89">Guadalajara</option>
+      <option value="88" selected="selected">Mexico City</option>
     </select>
   </div>
   <div id="asc_appointment">
     <select id="appointments_asc_appointment_facility_id" name="appointments[asc_appointment][facility_id]">
       <option value="">-- Select --</option>
-      <option value="90">Mexico City ASC</option>
       <option value="91">Guadalajara ASC</option>
+      <option value="90" selected="selected">Mexico City ASC</option>
     </select>
   </div>
 </form>
 </body>
 </html>`;
+
+// Real es-mx appointment page ordering, captured live from bot 281's account
+// (schedule 75498415) on 2026-08-17. Ten cities, alphabetical, appointment in
+// Mexico City (70/82). Reading option[0] yields Ciudad Juarez (65/76), which
+// returns [] on days.json forever — the bot polled it 24,253 times for nothing.
+const APPT_MX_REAL = `
+<form id="appointments_form">
+  <select id="appointments_consulate_appointment_facility_id" name="appointments[consulate_appointment][facility_id]">
+    <option value=""></option>
+    <option value="65">Ciudad Juarez</option>
+    <option value="66">Guadalajara</option>
+    <option value="67">Hermosillo</option>
+    <option value="68">Matamoros</option>
+    <option value="69">Merida</option>
+    <option value="70" selected="selected">Mexico City</option>
+    <option value="71">Monterrey</option>
+    <option value="72">Nogales</option>
+    <option value="73">Nuevo Laredo</option>
+    <option value="74">Tijuana</option>
+  </select>
+  <select id="appointments_asc_appointment_facility_id" name="appointments[asc_appointment][facility_id]">
+    <option value=""></option>
+    <option value="76">Ciudad Juarez ASC</option>
+    <option value="77">Guadalajara ASC</option>
+    <option value="82" selected="selected">Mexico City ASC</option>
+    <option value="88">Tijuana ASC</option>
+  </select>
+</form>`;
+
+// Same shape, but with no appointment yet: the portal renders no `selected`.
+// Falling back to the first numeric option is correct here.
+const APPT_MX_NO_SELECTION = APPT_MX_REAL.replace(/ selected="selected"/g, '');
 
 // Fixture E: Real-world Colombia, 4 applicants, &#58; entity + &mdash; in appointment text
 // Captured from bot 12 (es-co) — structure matches production HTML exactly.
@@ -1172,7 +1206,7 @@ describe('extractFacilityIds', () => {
     });
   });
 
-  it('extracts correct facility with multiple options (picks first numeric)', () => {
+  it('picks the SELECTED option, not the first, when there are several cities', () => {
     expect(extractFacilityIds(APPT_MULTI_FACILITY, true, 'es-mx')).toEqual({
       consularFacilityId: '88',
       ascFacilityId: '90',
@@ -1181,10 +1215,37 @@ describe('extractFacilityIds', () => {
 
   it('skips placeholder options with empty value', () => {
     // The multi-facility fixture has <option value="">-- Select --</option> first
-    // Should skip it and pick value="88"
+    // Should skip it and land on the selected value="88"
     const result = extractFacilityIds(APPT_MULTI_FACILITY, true, 'es-mx');
     expect(result.consularFacilityId).toBe('88');
     expect(result.ascFacilityId).toBe('90');
+  });
+
+  // Regression: bot 281 (es-mx) was onboarded onto Ciudad Juarez (65/76) — the
+  // first option — while its appointment was in Mexico City (70/82). Ciudad
+  // Juarez returns [] on days.json permanently, so the bot never saw a single
+  // date in 24,253 polls. Same root cause as bot 162 (fr-ca) landing on Calgary.
+  it('real es-mx page: reads Mexico City (70/82), never Ciudad Juarez (65/76)', () => {
+    expect(extractFacilityIds(APPT_MX_REAL, true, 'es-mx')).toEqual({
+      consularFacilityId: '70',
+      ascFacilityId: '82',
+    });
+  });
+
+  it('falls back to the first numeric option when nothing is selected', () => {
+    expect(extractFacilityIds(APPT_MX_NO_SELECTION, true, 'es-mx')).toEqual({
+      consularFacilityId: '65',
+      ascFacilityId: '76',
+    });
+  });
+
+  it('handles selected written before value in the attribute list', () => {
+    const html = `
+      <select id="appointments_consulate_appointment_facility_id">
+        <option value="89">Calgary</option>
+        <option selected value="95">Vancouver</option>
+      </select>`;
+    expect(extractFacilityIds(html, true, 'fr-ca').consularFacilityId).toBe('95');
   });
 
   describe('fallback to known facilities', () => {
