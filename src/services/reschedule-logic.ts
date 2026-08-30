@@ -397,10 +397,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     // Manda el mas estricto. El del portal lo llena `scripts/sync-portal-limits.ts`.
     // Un solo UPDATE: sube el contador y baja el saldo del portal a la vez. Atomico,
     // y sin viaje extra a la base de datos en el camino critico.
+    // NULL en portal_remaining_reschedules significa "el portal no pone tope"
+    // (Colombia, Mexico). Tiene que SEGUIR en NULL. La version con
+    // COALESCE(saldo, 1) - 1 escribia 0 en el primer cobro y convertia
+    // "sin tope" en "agotado" para siempre. Ver bots 298, 300, 301 y 302.
     const rows = await db.update(bots)
       .set({
         rescheduleCount: sql`${bots.rescheduleCount} + 1`,
-        portalRemainingReschedules: sql`GREATEST(0, COALESCE(${bots.portalRemainingReschedules}, 1) - 1)`,
+        portalRemainingReschedules: sql`CASE WHEN ${bots.portalRemainingReschedules} IS NULL THEN NULL
+                                             ELSE GREATEST(0, ${bots.portalRemainingReschedules} - 1) END`,
       })
       .where(and(
         eq(bots.id, botId),
@@ -432,8 +437,19 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       logger.info('releaseSlot: skipped (initial booking)', { botId, reason });
       return;
     }
+    // Devolver el cupo tiene que ser simetrico con claimSlot. Antes solo bajaba
+    // rescheduleCount, entonces un intento fallido quemaba el saldo del portal
+    // para siempre. El tope del portal nunca puede subir por encima de
+    // portal_max_reschedules, y un saldo en NULL se queda en NULL.
     await db.update(bots)
-      .set({ rescheduleCount: sql`GREATEST(${bots.rescheduleCount} - 1, 0)` })
+      .set({
+        rescheduleCount: sql`GREATEST(${bots.rescheduleCount} - 1, 0)`,
+        portalRemainingReschedules: sql`CASE
+          WHEN ${bots.portalRemainingReschedules} IS NULL THEN NULL
+          WHEN ${bots.portalMaxReschedules} IS NOT NULL
+            THEN LEAST(${bots.portalMaxReschedules}, ${bots.portalRemainingReschedules} + 1)
+          ELSE ${bots.portalRemainingReschedules} + 1 END`,
+      })
       .where(eq(bots.id, botId));
     lastClaimWasReal = false;
     logger.info('releaseSlot', { botId, reason });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
 // ── Mock proxyFetch ────────────────────────────────────
@@ -32,8 +32,19 @@ import { VisaClient, SessionExpiredError } from '../visa-client.js';
 // ── Load real HTML fixtures from bot 12 ──────────────
 
 const FIXTURES_DIR = join(import.meta.dirname, 'fixtures', 'bot-12-es-co');
-const APPOINTMENT_HTML = readFileSync(join(FIXTURES_DIR, 'appointment-page.html'), 'utf-8');
-const GROUPS_HTML = readFileSync(join(FIXTURES_DIR, 'groups-page.html'), 'utf-8');
+
+// Las fixtures son HTML real del portal, con datos de un solicitante de verdad,
+// y por eso viven fuera de git (.gitignore). Sin ellas el archivo entero se
+// salta en vez de reventar en la carga, que dejaba el suite en rojo en
+// cualquier checkout limpio y en CI.
+const HAY_FIXTURES = existsSync(join(FIXTURES_DIR, 'appointment-page.html'))
+  && existsSync(join(FIXTURES_DIR, 'groups-page.html'));
+const d = HAY_FIXTURES ? describe : describe.skip;
+
+const APPOINTMENT_HTML = HAY_FIXTURES
+  ? readFileSync(join(FIXTURES_DIR, 'appointment-page.html'), 'utf-8') : '';
+const GROUPS_HTML = HAY_FIXTURES
+  ? readFileSync(join(FIXTURES_DIR, 'groups-page.html'), 'utf-8') : '';
 
 // ── Helpers ────────────────────────────────────────────
 
@@ -75,7 +86,7 @@ function makeBot12Client(userId: string | null = '49983575') {
 
 // ── Tests ──────────────────────────────────────────────
 
-describe('refreshTokens (bot 12 real fixture)', () => {
+d('refreshTokens (bot 12 real fixture)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -137,7 +148,7 @@ describe('refreshTokens (bot 12 real fixture)', () => {
   });
 });
 
-describe('getCurrentAppointment (bot 12 real fixture)', () => {
+d('getCurrentAppointment (bot 12 real fixture)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -173,7 +184,7 @@ describe('getCurrentAppointment (bot 12 real fixture)', () => {
   });
 });
 
-describe('reschedule (bot 12)', () => {
+d('reschedule (bot 12)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -364,7 +375,7 @@ describe('reschedule (bot 12)', () => {
   });
 });
 
-describe('followRedirectChain edge cases', () => {
+d('followRedirectChain edge cases', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -429,7 +440,7 @@ describe('followRedirectChain edge cases', () => {
   });
 });
 
-describe('full flow: refreshTokens → getCurrentAppointment → reschedule', () => {
+d('full flow: refreshTokens → getCurrentAppointment → reschedule', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });

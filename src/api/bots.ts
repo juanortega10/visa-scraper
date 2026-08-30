@@ -120,6 +120,85 @@ function validateCreateBot(body: Record<string, unknown>): string | null {
   return validateExclusions(body);
 }
 
+/**
+ * Fill in `body.visaPassword` from the encrypted copy stored on the credential
+ * attempt, for the one case where the browser legitimately cannot send it: the
+ * agency table rehydrates rows from GET /agencies/me after a reload, which
+ * returns the email but never the secret (see agencias-flow.tsx `rehydrateRows`).
+ *
+ * Mutates `body` in place. Authorization is strict, because this turns an
+ * attempt id into "create a bot with somebody else's credentials":
+ *   - the caller must be authenticated with Clerk, and
+ *   - must own the attempt (directly for B2C, or through its agency for B2B), and
+ *   - the email in the body must match the attempt's stored email.
+ * Anything short of that leaves the body untouched, so validateCreateBot still
+ * rejects the empty password.
+ */
+async function recoverAttemptPassword(
+  body: Record<string, unknown>,
+  clerkUserId: string | undefined,
+): Promise<{ error: string | null; status: 401 | 403 | 404 | 409 }> {
+  const ok = { error: null, status: 409 } as const;
+
+  // Only kick in for a genuinely missing password — never override a real one.
+  if (typeof body.visaPassword === 'string' && body.visaPassword.length > 0) return ok;
+  if (body.credentialAttemptId == null) return ok;
+
+  const attemptId = typeof body.credentialAttemptId === 'number'
+    ? body.credentialAttemptId
+    : parseInt(String(body.credentialAttemptId), 10);
+  if (isNaN(attemptId)) return ok;
+
+  if (!clerkUserId) {
+    return { error: 'authentication required to reuse a stored credential attempt', status: 401 };
+  }
+
+  const [attempt] = await db
+    .select({
+      visaEmail: botCredentialAttempts.visaEmail,
+      visaPassword: botCredentialAttempts.visaPassword,
+      agencyId: botCredentialAttempts.agencyId,
+      clerkUserId: botCredentialAttempts.clerkUserId,
+    })
+    .from(botCredentialAttempts)
+    .where(eq(botCredentialAttempts.id, attemptId));
+
+  if (!attempt) return { error: 'credential_attempt_not_found', status: 404 };
+
+  // Ownership: B2B goes through the agency, B2C is the attempt's own clerk user.
+  let owner: string | null = attempt.clerkUserId ?? null;
+  if (attempt.agencyId != null) {
+    const [agencyRow] = await db
+      .select({ clerkUserId: agencies.clerkUserId })
+      .from(agencies)
+      .where(eq(agencies.id, attempt.agencyId));
+    owner = agencyRow?.clerkUserId ?? null;
+  }
+  if (!owner || owner !== clerkUserId) return { error: 'forbidden', status: 403 };
+
+  let storedEmail: string;
+  let storedPassword: string;
+  try {
+    storedEmail = decrypt(attempt.visaEmail);
+    storedPassword = decrypt(attempt.visaPassword);
+  } catch {
+    console.warn(`[create-bot] attempt #${attemptId} credentials failed to decrypt`);
+    return { error: 'stored_credentials_unreadable', status: 409 };
+  }
+
+  // The body's email decides which account is being activated. Refuse to pair it
+  // with a password that belongs to a different account.
+  const bodyEmail = typeof body.visaEmail === 'string' ? body.visaEmail.trim().toLowerCase() : '';
+  if (bodyEmail && bodyEmail !== storedEmail.trim().toLowerCase()) {
+    return { error: 'credential_attempt_email_mismatch', status: 409 };
+  }
+  if (!bodyEmail) body.visaEmail = storedEmail;
+
+  body.visaPassword = storedPassword;
+  console.log(`[create-bot] recovered stored password for attempt #${attemptId} (${storedEmail})`);
+  return ok;
+}
+
 function validateUpdateBot(body: Record<string, unknown>): string | null {
   if (body.proxyProvider !== undefined && !VALID_PROXY_PROVIDERS.includes(body.proxyProvider as string))
     return `proxyProvider must be one of: ${VALID_PROXY_PROVIDERS.join(', ')}`;
@@ -492,6 +571,13 @@ botsRouter.get('/recent-events', async (c) => {
 // Create bot
 botsRouter.post('/', clerkAuth({ required: false }), async (c) => {
   const body = await c.req.json();
+
+  // The password never survives a page reload in the browser: the agency table
+  // rehydrates rows from GET /agencies/me, which returns the email but not the
+  // secret. Recover it from the encrypted copy we already hold for the attempt,
+  // so "reload then activate" stops failing with `visaPassword is required`.
+  const passwordRecovery = await recoverAttemptPassword(body, c.get('clerkUser')?.clerkUserId);
+  if (passwordRecovery.error) return c.json({ error: passwordRecovery.error }, passwordRecovery.status);
 
   const validationError = validateCreateBot(body);
   if (validationError) return c.json({ error: validationError }, 400);

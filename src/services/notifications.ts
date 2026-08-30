@@ -756,8 +756,14 @@ export async function notifyUser(
     promises.push(sendEmail(bot.id, event, bot.notificationEmail, subject, html));
   }
 
-  // Owner only gets reschedule_success — no operational spam
-  if (bot.ownerEmail && event === 'reschedule_success') {
+  // Owner only gets reschedule_success — no operational spam. Skip when it is
+  // the same inbox as notificationEmail, otherwise the agency gets the identical
+  // reschedule email twice.
+  const ownerIsDuplicate =
+    !!bot.ownerEmail && !!bot.notificationEmail &&
+    bot.ownerEmail.trim().toLowerCase() === bot.notificationEmail.trim().toLowerCase() &&
+    NOTIFICATION_EMAIL_EVENTS.has(event);
+  if (bot.ownerEmail && event === 'reschedule_success' && !ownerIsDuplicate) {
     const { subject, html } = buildEmail(event, data, buildOpts(bot.ownerEmail));
     promises.push(sendEmail(bot.id, event, bot.ownerEmail, subject, html));
   }
