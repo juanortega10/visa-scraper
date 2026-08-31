@@ -132,8 +132,10 @@ export function alignToReleaseWindow(args: {
   locale?: string;
   baseSeconds: number;
   nowMs: number;
+  /** Ventana explicita. La usa el A/B para probar una mas apretada sin tocar la global. */
+  ventana?: ReleaseWindow;
 }): { seconds: number; aligned: boolean } {
-  const w = getReleaseWindow(args.locale);
+  const w = args.ventana ?? getReleaseWindow(args.locale);
   const base = Math.max(1, args.baseSeconds);
   if (!w) return { seconds: base, aligned: false };
 
