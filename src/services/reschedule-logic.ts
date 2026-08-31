@@ -116,6 +116,38 @@ export interface RescheduleAttempt {
   timesSeen?: number;
 }
 
+/** Lo que `columnasDeIntento` necesita de un intento fallido. */
+export type ColumnasIntento = Pick<
+  RescheduleAttempt,
+  'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound' | 'msToPost' | 'timesSeen'
+>;
+
+/**
+ * Traduce un intento fallido a las columnas de `reschedule_logs`. UNA sola fuente.
+ *
+ * Existe por un bug del 2026-08-31. La rama que registra "se acabaron los intentos"
+ * armaba este objeto a mano, campo por campo, y se le olvidaron `msToPost` y
+ * `timesSeen`. Las otras seis ramas si los escribian. Resultado: las 23.494 filas de
+ * `reschedule_logs` con `times_seen` nulo, incluidas las DOS unicas detecciones del
+ * bot 299 de Peru, que es justo donde el dato hacia falta.
+ *
+ * Cualquier campo diagnostico nuevo se agrega AQUI y llega solo a todas las ramas.
+ */
+export function columnasDeIntento(a: ColumnasIntento) {
+  return {
+    failStep: a.failStep ?? null,
+    failReason: a.failReason,
+    durationMs: a.durationMs,
+    msToPost: a.msToPost ?? null,
+    timesSeen: a.timesSeen ?? null,
+    detail: {
+      ...(a.timesFound !== undefined ? { timesFound: a.timesFound } : {}),
+      ...(a.cause ? { cause: a.cause } : {}),
+      ...(a.error ? { error: a.error } : {}),
+    } satisfies Record<string, unknown>,
+  };
+}
+
 export interface RescheduleParams {
   client: VisaClient;
   botId: number;
@@ -197,25 +229,14 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
    * como se ve ganar, solo como se ve perder.
    */
   const diag = (
-    attempt?: Pick<RescheduleAttempt, 'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound' | 'msToPost' | 'timesSeen'>,
+    attempt?: ColumnasIntento,
     carrera?: { msToPost?: number; timesSeen?: number },
   ) => ({
     runId: runId ?? null,
     provider,
     sessionAgeMs: sessionAgeMs ?? null,
     ...(carrera ? { msToPost: carrera.msToPost ?? null, timesSeen: carrera.timesSeen ?? null } : {}),
-    ...(attempt ? {
-      failStep: attempt.failStep ?? null,
-      failReason: attempt.failReason,
-      durationMs: attempt.durationMs,
-      msToPost: attempt.msToPost ?? null,
-      timesSeen: attempt.timesSeen ?? null,
-      detail: {
-        ...(attempt.timesFound !== undefined ? { timesFound: attempt.timesFound } : {}),
-        ...(attempt.cause ? { cause: attempt.cause } : {}),
-        ...(attempt.error ? { error: attempt.error } : {}),
-      } satisfies Record<string, unknown>,
-    } : {}),
+    ...(attempt ? columnasDeIntento(attempt) : {}),
   });
   let successfulPosts = 0; // Track POSTs in this invocation for maxReschedules guard
   const minDate = computeMinDate(bot.minDaysFromToday);
@@ -1503,19 +1524,31 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       newConsularTime: firstAttempt?.consularTime ?? null,
       success: false,
       error: failSummary,
-      ...diag(firstAttempt ? {
-        failReason: firstAttempt.failReason,
-        failStep: firstAttempt.failStep,
-        durationMs: firstAttempt.durationMs,
-        timesFound: firstAttempt.timesFound,
-        error: firstAttempt.error,
-        cause: firstAttempt.cause,
-      } : undefined),
+      // Se pasa el intento ENTERO, nunca una copia campo por campo.
+      //
+      // Antes esto reconstruia el objeto a mano y se le olvidaron `msToPost` y
+      // `timesSeen`. Las otras seis ramas si los escribian; esta no. Y esta es la que
+      // registra "se acabaron los intentos", por donde salen TODAS las filas
+      // `no_times`, que es como falla es-pe (Peru no tiene CAS). Resultado: las 23.494
+      // filas de `reschedule_logs` con `times_seen` nulo, incluidas las DOS unicas
+      // detecciones del bot 299.
+      //
+      // `timesSeen` es lo que decide el caso: 0 = fecha fantasma (el calendario la
+      // lista sin cupo real), mayor que 0 = habia cupo y perdimos la carrera. Sin el
+      // no se puede saber si el fallback especulativo sirve de algo.
+      //
+      // `diag` recibe un `Pick`, entonces mandar el objeto completo compila igual y
+      // deja de ser una lista que hay que acordarse de actualizar.
+      ...diag(firstAttempt),
       ...(failedAttempts.length > 1 ? {
         detail: {
           allAttempts: failedAttempts.map(a => ({
             date: a.date, failReason: a.failReason, failStep: a.failStep,
             timesFound: a.timesFound, durationMs: a.durationMs,
+            // `timesSeen` es el CONTEO que dio el portal. `timesFound` puede traer la
+            // constante especulativa, entonces no sirve para contar. Ver
+            // [[horas-especulativas-contaminadas]].
+            timesSeen: a.timesSeen, msToPost: a.msToPost,
           })),
         },
       } : {}),
