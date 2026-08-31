@@ -7,6 +7,7 @@ import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
 import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
+import { asignadoAlineado, VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
 import { executeReschedule, MAX_EDAD_TOKEN_MS, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -140,7 +141,7 @@ export const pollVisaTask = task({
       activeRunId: bots.activeRunId, activeCloudRunId: bots.activeCloudRunId,
       pollEnvironments: bots.pollEnvironments, cloudEnabled: bots.cloudEnabled,
       activatedAt: bots.activatedAt, targetDateBefore: bots.targetDateBefore, targetDateAfter: bots.targetDateAfter, sniperMode: bots.sniperMode,
-      maxReschedules: bots.maxReschedules, portalRemainingReschedules: bots.portalRemainingReschedules, phaseAligned: bots.phaseAligned, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, speculativeTimes: bots.speculativeTimes, minDaysFromToday: bots.minDaysFromToday, excludedWeekdays: bots.excludedWeekdays,
+      maxReschedules: bots.maxReschedules, portalRemainingReschedules: bots.portalRemainingReschedules, phaseAligned: bots.phaseAligned, phaseExperiment: bots.phaseExperiment, rescheduleCount: bots.rescheduleCount, maxCasGapDays: bots.maxCasGapDays, skipCas: bots.skipCas, speculativeTimeFallback: bots.speculativeTimeFallback, speculativeTimes: bots.speculativeTimes, minDaysFromToday: bots.minDaysFromToday, excludedWeekdays: bots.excludedWeekdays,
       pollIntervalSeconds: bots.pollIntervalSeconds, targetPollsPerMin: bots.targetPollsPerMin,
       skippedPollsSinceLog: bots.skippedPollsSinceLog,
       proxyUrls: bots.proxyUrls,
@@ -1795,9 +1796,18 @@ export const pollVisaTask = task({
       let normalDelay = getPollingDelay(bot.locale, baseInterval, elapsedMs);
       // Fase alineada (opt-in): mueve el proximo poll a la ventana donde el portal
       // libera cupos. Ver `analyze-release-clock.ts` para la medicion.
-      if (bot.phaseAligned) {
+      // El experimento manda sobre `phaseAligned`: cuando esta prendido, el brazo lo
+      // decide la hora y el botId, y el bot alterna solo. Ver `experimento-fase.ts`.
+      const enExperimento = bot.phaseExperiment === true;
+      const alinearAhora = enExperimento
+        ? asignadoAlineado(botId, Date.now())
+        : bot.phaseAligned === true;
+      if (alinearAhora) {
         const startToStart = Math.max(1, baseInterval - elapsedMs / 1000);
-        const al = alignToReleaseWindow({ locale: bot.locale ?? undefined, baseSeconds: startToStart, nowMs: Date.now() });
+        // En el experimento la ventana es la APRETADA (s22-32 para es-co), que es la
+        // que se quiere probar. Fuera del experimento se usa la de siempre.
+        const ventana = enExperimento ? VENTANA_EXPERIMENTO[bot.locale ?? ''] : undefined;
+        const al = alignToReleaseWindow({ locale: bot.locale ?? undefined, baseSeconds: startToStart, nowMs: Date.now(), ventana });
         if (al.aligned) {
           logger.info('Fase alineada a la ventana de liberacion', {
             botId, locale: bot.locale, naturalSeconds: Math.round(startToStart), alignedSeconds: Math.round(al.seconds),

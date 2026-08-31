@@ -128,6 +128,12 @@ export const bots = pgTable(
     // (`alignToReleaseWindow` en scheduling.ts). Opt-in por bot: concentra los
     // polls donde de verdad aparecen cupos y baja el total de peticiones.
     phaseAligned: boolean('phase_aligned').notNull().default(false),
+    /**
+     * A/B de la alineacion de fase. Cuando es true, `phaseAligned` deja de mandar y
+     * el brazo lo decide `asignadoAlineado(botId, ahora)`: el bot alterna por hora y
+     * es su propio control. Ver `src/services/experimento-fase.ts`.
+     */
+    phaseExperiment: boolean('phase_experiment').notNull().default(false),
     maxCasGapDays: integer('max_cas_gap_days'),                            // null = default (8), max days between CAS and consular
     skipCas: boolean('skip_cas').notNull().default(false),                    // true = visa renewal, no CAS/ASC needed
     speculativeTimeFallback: boolean('speculative_time_fallback').notNull().default(false), // true = try historical times when getConsularTimes returns empty (no-CAS only)
