@@ -15,8 +15,9 @@
  *   3  POST con el token YA precalentado (no se pide en el momento)
  *   4  verificacion contra `/groups`
  *
- * El token se refresca por rutina cada 10 min, FUERA del camino critico. Techo duro
- * de edad 45 min. Ver `POLITICA_TOKEN` en `peru-sniper-core.ts`.
+ * El token se refresca por rutina cada 30 min, FUERA del camino critico. Techo duro
+ * de edad 45 min. Ver `POLITICA_TOKEN` en `peru-sniper-core.ts`. Cuando el refresco
+ * FALLA, `intentarToken` espacia los reintentos en vez de pedirlo en cada vuelta.
  *
  * Seguridad: los verificadores V1-V7 de `peru-sniper-core.ts` mas un reclamo
  * ATOMICO del cupo en la base de datos, con la misma consulta que `claimSlot()` de
@@ -58,7 +59,6 @@ const SEGUNDOS_TICK = [14, 18] as const;
 const SESION_MAX_MS = 44 * 60_000;
 /** Una fecha que fallo el POST no se reintenta durante este tiempo. */
 const QUEMADA_MS = 20 * 60_000;
-/** Errores seguidos antes de una pausa larga. Evita golpear al portal si algo se rompio. */
 
 /** Clave del sniper en `sniper_scans`. La pagina /dashboard/peru la lee. */
 const SCAN_KEY = 'peru-299';
@@ -277,7 +277,9 @@ async function abrirSesion(row: FilaBot): Promise<Sesion> {
   );
   log(`  [sesion] login por ${via}, cookie ${login.cookie.length} bytes`);
   const s: Sesion = { client, creadaMs: Date.now(), id: `ses-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, token: null };
-  await precalentar(s);
+  // Por `intentarToken` y no por `precalentar` directo: si la ruta del schedule esta
+  // cerrada, un login nuevo no es motivo para volver a golpearla fuera del espaciado.
+  await intentarToken(s);
   return s;
 }
 
@@ -302,6 +304,69 @@ async function precalentar(s: Sesion): Promise<boolean> {
   }
 }
 
+/**
+ * Prueba si la COOKIE sigue sirviendo, sin tocar la ruta del schedule.
+ *
+ * `getCurrentAppointment()` pega a `/groups/{userId}`, que es una ruta distinta de
+ * `/schedule/{id}/...`. Ese detalle es todo el valor de esta funcion.
+ *
+ * Medido el 2026-08-31 en el bot 299, por las DOS rutas de salida:
+ *
+ *   appointment  direct FALLO   webshare FALLO
+ *   days.json    direct FALLO   webshare FALLO
+ *   groups       direct 200     webshare 200     <- la cookie esta sana
+ *
+ * Sin esta prueba, el sniper leia el fallo de `refreshTokens()` como "la sesion
+ * murio" y hacia un login completo. Con la ruta cerrada eso se repetia en cada
+ * disparo: 4 IPs quemadas en el token, mas un login, mas 4 IPs en `days.json`.
+ * El login es el endpoint mas vigilado del portal, y esa presion alarga el bloqueo
+ * en vez de dejarlo expirar.
+ *
+ * Devuelve `false` solo si la cookie de verdad no sirve. Un fallo de red tambien
+ * devuelve `false`, y ahi el re-login es la respuesta correcta de todos modos.
+ */
+async function cookieSigueViva(s: Sesion): Promise<boolean> {
+  try {
+    return (await s.client.getCurrentAppointment()) !== null;
+  } catch (e) {
+    log(`  [sesion] la prueba de /groups fallo: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+// ── Espaciado de los reintentos del token ────────────────────────────────────
+
+let ultimoIntentoTokenMs = 0;
+let fallosTokenSeguidos = 0;
+
+/**
+ * Pide el token respetando un espaciado que crece con los fallos seguidos.
+ *
+ * Por que existe. `POLITICA_TOKEN.cadenciaMs` solo gobierna un token QUE EXISTE.
+ * Un token en `null` siempre da `vencido`, y eso pedia "refresco obligatorio" en
+ * cada vuelta. Medido en el RPi el 2026-08-31 con la ruta cerrada: 7 intentos en
+ * 20 min, o sea unas 500 lecturas al dia de `/schedule/{id}/appointment`. Es MAS
+ * carga que las 144 al dia que la cadencia de 30 min queria bajar a 48.
+ *
+ * Reusa `minutosEntreDisparos` (0/1/2/5/10 min) para no inventar una segunda curva.
+ * Con la ruta cerrada el espaciado llega a 10 min, o sea 6 intentos por hora.
+ * Al primer exito el contador vuelve a cero y el token se recupera en la vuelta
+ * siguiente, entonces reabrir la ruta no cuesta mas de 10 min de retraso.
+ *
+ * `aplazado` NO es un fallo: dice que todavia no toca reintentar.
+ */
+async function intentarToken(s: Sesion): Promise<'ok' | 'fallo' | 'aplazado'> {
+  if (!tocaDisparar(fallosTokenSeguidos, ultimoIntentoTokenMs, Date.now())) return 'aplazado';
+  ultimoIntentoTokenMs = Date.now();
+  if (await precalentar(s)) {
+    if (fallosTokenSeguidos > 0) log(`  [token] recuperado tras ${fallosTokenSeguidos} fallos.`);
+    fallosTokenSeguidos = 0;
+    return 'ok';
+  }
+  fallosTokenSeguidos += 1;
+  return 'fallo';
+}
+
 /** Devuelve una sesion con token utilizable. Re-login si la sesion es vieja o el token murio. */
 async function sesionLista(row: FilaBot): Promise<Sesion> {
   if (sesion && Date.now() - sesion.creadaMs > SESION_MAX_MS) {
@@ -312,13 +377,18 @@ async function sesionLista(row: FilaBot): Promise<Sesion> {
 
   const v = veredictoToken(sesion.token, sesion.id, Date.now(), POLITICA_TOKEN);
   if (v === 'refrescar') {
-    log('  [token] paso la cadencia de 10 min. Refresco por rutina.');
-    await precalentar(sesion);
+    log(`  [token] paso la cadencia de ${POLITICA_TOKEN.cadenciaMs / 60_000} min. Refresco por rutina.`);
+    await intentarToken(sesion);
   } else if (v === 'vencido') {
-    log('  [token] vencido o de otra sesion. Refresco obligatorio.');
-    if (!(await precalentar(sesion))) {
-      log('  [token] sin token tras el refresco. Re-login completo.');
-      sesion = await abrirSesion(row);
+    const r = await intentarToken(sesion);
+    if (r === 'fallo') {
+      // El refresco fallo. Antes de gastar un login, se pregunta QUE murio.
+      if (await cookieSigueViva(sesion)) {
+        log(`  [token] sin token, pero /groups responde. Es la ruta del schedule, no la sesion. NO se hace login. Proximo intento en ${minutosEntreDisparos(fallosTokenSeguidos)} min.`);
+      } else {
+        log('  [token] sin token y /groups tampoco responde. Re-login completo.');
+        sesion = await abrirSesion(row);
+      }
     }
   }
   return sesion;
@@ -606,7 +676,7 @@ async function vuelta(): Promise<Resultado> {
   // 5 · el token debe estar vivo AHORA, no cuando se precalento
   if (veredictoToken(s.token, s.id, Date.now(), POLITICA_TOKEN) === 'vencido') {
     log('  ABORTA: el token vencio justo antes del POST. Se refresca para la proxima.');
-    await precalentar(s);
+    await intentarToken(s);
     return { agendado: false };
   }
 
@@ -718,10 +788,17 @@ async function main() {
       if (r.fatal) { log(`  ALTO: ${r.fatal}. Fin.`); break; }
     } catch (e) {
       errores += 1;
-      sesion = null;
       // SIN PAUSA. Una pausa de 15 min se come 30 ventanas de liberacion seguidas, y
       // el cupo de Peru aparece justo ahi. Se sigue disparando y se avisa en el log.
-      // La sesion ya se solto arriba, entonces la vuelta siguiente vuelve a entrar.
+      //
+      // La sesion se suelta SOLO si la cookie de verdad murio. Un fallo de `days.json`
+      // no prueba nada sobre la cookie: el 2026-08-31 la ruta del schedule estaba
+      // cerrada y `/groups` respondia 200. Tirar la sesion ahi costaba un login por
+      // error, contra el endpoint mas vigilado del portal. Ver `cookieSigueViva`.
+      if (sesion && !(await cookieSigueViva(sesion))) {
+        log('  [sesion] la cookie murio. Se suelta y la vuelta siguiente entra de nuevo.');
+        sesion = null;
+      }
       log(`  ERROR (${errores} seguidos): ${(e as Error).message}`);
       if (errores % 10 === 0) log(`  ATENCION: ${errores} errores seguidos y sigue intentando.`);
     }

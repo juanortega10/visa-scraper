@@ -161,14 +161,29 @@ export interface EstadoToken {
 }
 
 export interface PoliticaToken {
-  /** Cada cuanto se refresca por rutina. Juan pidio 10 min. */
+  /** Cada cuanto se refresca por rutina. */
   cadenciaMs: number;
   /** Edad maxima aceptada en el momento del disparo. Techo duro. */
   techoMs: number;
 }
 
+/**
+ * Cadencia 30 min, techo 45 min. Subida de 10 a 30 el 2026-08-31.
+ *
+ * Por que. `refreshTokens()` es el UNICO consumidor de rutina de
+ * `/schedule/{id}/appointment`, y esa ruta es exactamente la que el portal cerro
+ * primero en el bot 299: el 2026-08-27 cayo solo el HTML, `days.json` seguia vivo.
+ * El bot 7 pollea al mismo ritmo que el 299 (unos 4.000 al dia) y nunca se bloqueo;
+ * la diferencia es que el bot 7 casi no lee esa pagina.
+ *
+ * A 10 min eran 144 lecturas al dia. A 30 min son 48, o sea 67% menos.
+ *
+ * El techo de 45 min no se toca: manda sobre la cadencia y protege el disparo. Entre
+ * 30 y 45 quedan 15 min de margen para que un refresco fallido se reintente antes de
+ * que el token deje de servir.
+ */
 export const POLITICA_TOKEN: PoliticaToken = {
-  cadenciaMs: 10 * 60_000,
+  cadenciaMs: 30 * 60_000,
   techoMs: 45 * 60_000,
 };
 

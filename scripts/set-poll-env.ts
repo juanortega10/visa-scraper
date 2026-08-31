@@ -7,7 +7,15 @@
  * The old runtime's chain self-stops via the guard in poll-visa.ts:165-169; the new
  * runtime's cron picks the bot up within one cycle. Reversible: just flip back.
  *
- * Usage: npx tsx --env-file=.env scripts/set-poll-env.ts <botId> <dev|prod>
+ * `none` = ZERO owners inside Trigger.dev. Sets pollEnvironments to [] so BOTH guards
+ * fire and neither cron ever picks the bot up. It exists for a bot whose polling is
+ * owned by a standalone process instead — today only bot 299, driven by the systemd
+ * service `peru-sniper-299` on the RPi. Without it that account was polled twice:
+ * ~4.100 polls/day from poll-visa PLUS ~2.900/day from the sniper, against a portal
+ * that closed the route on 2026-08-31. `audit-chains` skips [] bots on its own
+ * (`entornos.includes(entorno)` is false for both), so this raises no false alarm.
+ *
+ * Usage: npx tsx --env-file=.env scripts/set-poll-env.ts <botId> <dev|prod|none>
  */
 import { db } from '../src/db/client.js';
 import { bots, pollLogs } from '../src/db/schema.js';
@@ -15,8 +23,8 @@ import { eq, and, sql, gte } from 'drizzle-orm';
 
 const botId = parseInt(process.argv[2] ?? '', 10);
 const target = process.argv[3];
-if (!botId || (target !== 'dev' && target !== 'prod')) {
-  console.error('Usage: set-poll-env.ts <botId> <dev|prod>');
+if (!botId || (target !== 'dev' && target !== 'prod' && target !== 'none')) {
+  console.error('Usage: set-poll-env.ts <botId> <dev|prod|none>');
   process.exit(1);
 }
 
@@ -49,6 +57,21 @@ console.log({ status: bot.status, cohort: bot.cohort, locale: bot.locale, provid
   health_24h: { polls: Number(h?.polls ?? 0), ok: Number(h?.ok ?? 0), blockPct } });
 
 const current = (bot.pollEnvironments as string[] | null) ?? ['dev'];
+if (target === 'none') {
+  if (current.length === 0) {
+    console.log(`\nNo-op: bot ${botId} already has no Trigger.dev owner.`);
+    process.exit(0);
+  }
+  // Both pointers go, because both runtimes are being left at once.
+  await db.update(bots)
+    .set({ pollEnvironments: [], activeRunId: null, activeCloudRunId: null, updatedAt: new Date() })
+    .where(eq(bots.id, botId));
+  console.log(`\n✅ bot ${botId}: [${current.join(',')}] → [] (cleared activeRunId AND activeCloudRunId)`);
+  console.log('   Both chains stop on their next run via the guards; neither cron picks it up again.');
+  console.log('   The bot keeps status=active. Polling must come from a standalone owner.');
+  console.log(`   Rollback: npx tsx --env-file=.env scripts/set-poll-env.ts ${botId} ${current[0] ?? 'dev'}\n`);
+  process.exit(0);
+}
 if (current.length === 1 && current[0] === target) {
   console.log(`\nNo-op: bot ${botId} already ['${target}'].`);
   process.exit(0);

@@ -170,9 +170,25 @@ describe('veredictoToken', () => {
     expect(veredictoToken(estado, 'ses1', T0 + 45_000)).toBe('ok');
   });
 
-  it('a los 10 min pide refresco y todavia sirve', () => {
+  it('al cumplir la cadencia pide refresco y todavia sirve', () => {
     expect(veredictoToken(estado, 'ses1', T0 + POLITICA_TOKEN.cadenciaMs)).toBe('refrescar');
-    expect(veredictoToken(estado, 'ses1', T0 + 44 * 60_000)).toBe('refrescar');
+    expect(veredictoToken(estado, 'ses1', T0 + POLITICA_TOKEN.techoMs - 60_000)).toBe('refrescar');
+  });
+
+  // Estos dos no miden `veredictoToken`. Cuidan la POLITICA, que es un dato suelto
+  // que cualquiera puede tocar sin darse cuenta de lo que rompe.
+  it('la cadencia deja al menos 10 min de margen antes del techo', () => {
+    // Sin margen no existe el estado `refrescar`: el token salta de `ok` a `vencido`
+    // y el precalentado deja de servir. Ahi el refresco vuelve al camino critico,
+    // que es justo lo que se saco el 2026-08-30. El margen tambien da lugar a que un
+    // refresco fallido se reintente antes de que el token deje de valer.
+    const margenMs = POLITICA_TOKEN.techoMs - POLITICA_TOKEN.cadenciaMs;
+    expect(margenMs).toBeGreaterThanOrEqual(10 * 60_000);
+  });
+
+  it('existe una franja real donde el veredicto es refrescar', () => {
+    const aMitad = T0 + (POLITICA_TOKEN.cadenciaMs + POLITICA_TOKEN.techoMs) / 2;
+    expect(veredictoToken(estado, 'ses1', aMitad)).toBe('refrescar');
   });
 
   it('a los 45 min queda vencido', () => {
