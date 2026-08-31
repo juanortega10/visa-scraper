@@ -754,7 +754,7 @@ export const pollVisaTask = task({
           const firstEarliest = days[0]?.date;
           const firstStatus = softBanNotified ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
           const firstDateChanges = computeDateChanges(allDays, previousDates);
-          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, banPhase: getBanPhase(firstStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo });
+          logPoll(pending, botId, firstEarliest ?? null, days.length, Date.now() - startMs, firstStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: 0, runId: ctx.run.id, publicIp, dateChanges: firstDateChanges, banPhase: getBanPhase(firstStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo }, undefined, hb);
           if (hasOpenBanEpisode) hasOpenBanEpisode = false; // recovery consumed
           persistDateSightings(pending, botId, firstDateChanges, bot.currentConsularDate, bot.targetDateBefore);
           previousDates = new Set(allDays.map(d => d.date));
@@ -810,7 +810,7 @@ export const pollVisaTask = task({
                   const proxyIp = client.getLastProxyMeta().proxyAttemptIp;
                   if (proxyIp) publicIp = proxyIp;
                 }
-                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: null, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+                logPoll(pending, botId, null, 0, fetchMs, 'error', errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: null, connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) }, undefined, hb);
                 logger.warn(`Super-critical fetch ${loopFetchCount} — HTTP 5xx (${consecutive5xx} consecutive)`, { botId, error: errMsg });
                 if (consecutive5xx >= 2 && !throttleNotified) {
                   throttleNotified = true;
@@ -839,7 +839,7 @@ export const pollVisaTask = task({
                 if (proxyIp) publicIp = proxyIp;
               }
               const scLogStatus = tcpBlock ? 'tcp_blocked' : 'error';
-              logPoll(pending, botId, null, 0, fetchMs, scLogStatus, errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: getBanPhase(scLogStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+              logPoll(pending, botId, null, 0, fetchMs, scLogStatus, errMsg, undefined, undefined, { provider: effectiveProvider, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, banPhase: getBanPhase(scLogStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) }, undefined, hb);
               logger.warn(`Super-critical fetch ${loopFetchCount} error`, { botId, consecutiveErrors, error: errMsg });
               if (tcpBlock && !tcpBlockNotified) {
                 tcpBlockNotified = true;
@@ -881,7 +881,7 @@ export const pollVisaTask = task({
             const fetchMs2 = Date.now() - fetchStart;
             const fetchStatus = isSoftBan ? 'soft_ban' : (days.length > 0 ? 'ok' : 'filtered_out');
             const loopDateChanges = computeDateChanges(allDays, previousDates);
-            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, banPhase: getBanPhase(fetchStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) });
+            logPoll(pending, botId, fetchEarliest ?? null, days.length, fetchMs2, fetchStatus, undefined, allDays.slice(0, 10).map(d => d.date), undefined, { rawDatesCount: allDays.length, provider: effectiveProvider, allDates: allDays, chainId, pollPhase: 'super-critical', fetchIndex: loopFetchCount - 1, runId: ctx.run.id, publicIp, dateChanges: loopDateChanges, banPhase: getBanPhase(fetchStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra) }, undefined, hb);
             if (hasOpenBanEpisode) hasOpenBanEpisode = false;
             persistDateSightings(pending, botId, loopDateChanges, bot.currentConsularDate, bot.targetDateBefore);
             previousDates = new Set(allDays.map(d => d.date));
@@ -1435,7 +1435,7 @@ export const pollVisaTask = task({
               chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal',
               fetchIndex: batchFetchCount,
               runId: ctx.run.id, publicIp, banPhase: getBanPhase(batchLogStatus, hasOpenBanEpisode), connectionInfo: captureConnInfo(client.getLastProxyMeta(), connInfoExtra),
-            });
+            }, undefined, hb);
           if (isTcp && !tcpBlockNotified) {
             tcpBlockNotified = true;
             const errorSource = classifyProxyError(fetchErr, fetchMs);
@@ -1489,7 +1489,7 @@ export const pollVisaTask = task({
         }
       }
       logger.error(`Poll error: ${errMsg}`, { botId, responseTimeMs, tcpBlock, serverOverload });
-      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal', runId: ctx.run.id, publicIp, banPhase: getBanPhase(logStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo });
+      logPoll(pending, botId, null, 0, responseTimeMs, logStatus, errMsg, undefined, undefined, { rawDatesCount: runRawDatesCount > 0 ? runRawDatesCount : undefined, provider: effectiveProvider, reloginHappened, phaseTimings: { ...timings }, chainId, pollPhase: isInSuperCriticalWindow(bot.locale) ? 'super-critical' : 'normal', runId: ctx.run.id, publicIp, banPhase: getBanPhase(logStatus, hasOpenBanEpisode), connectionInfo: capturedConnInfo }, undefined, hb);
 
       if (error instanceof SessionExpiredError) {
         logger.warn(`SESSION EXPIRED: ${errMsg} — attempting inline re-login`, { botId });
@@ -1987,12 +1987,16 @@ function logPoll(
   // 30-min date trends are preserved because a row is written at least every HEARTBEAT_MS.
   // `heartbeat` is mutated: skips increment `skipped`, writes flush it into polls_since_prev.
   heartbeat?: HeartbeatState,
+  // El reloj va SEPARADO del heartbeat a proposito. `heartbeat` decide si la fila
+  // se escribe, y las rutas de rafaga no lo reciben porque tienen que escribir
+  // siempre. Si la ceguera se midiera con `heartbeat`, esas rutas quedarian sin
+  // medir, y son justo las de error y bloqueo, donde la ceguera importa mas.
+  reloj?: Pick<HeartbeatState, 'lastPolledAt'>,
 ): void {
   const now = Date.now();
-  // Ceguera: distancia al poll anterior. Se mide siempre, incluso cuando la fila
-  // no se escribe, para que el marcador no dependa del ahorro de escrituras.
-  const blindMs = heartbeat?.lastPolledAt ? now - heartbeat.lastPolledAt.getTime() : null;
-  if (heartbeat) heartbeat.lastPolledAt = new Date(now);
+  const marcador = reloj ?? heartbeat;
+  const blindMs = marcador?.lastPolledAt ? now - marcador.lastPolledAt.getTime() : null;
+  if (marcador) marcador.lastPolledAt = new Date(now);
   if (
     heartbeat &&
     shouldSkipHeartbeatPoll(
