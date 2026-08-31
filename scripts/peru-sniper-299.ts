@@ -130,6 +130,17 @@ export interface MetricasCamino {
    * ese trio en la base son la CONSTANTE del propio fallback, no lecturas del portal.
    */
   horas?: string[] | null;
+  /**
+   * `business_times` de la MISMA respuesta. Es el horario del consulado para ese dia,
+   * o sea TODAS las horas posibles, libres o no. `horas` es el subconjunto libre.
+   *
+   * Medido en el bot 7 el 2026-08-31:
+   *   2028-01-12  available ["09:45"]  business ["09:45","10:00","10:15","10:30"]
+   *
+   * Es la lista de candidatos EXACTA para adivinar una hora, y viene gratis. Si un dia
+   * `horas` sale vacio y esto sale lleno, ahi esta la respuesta a las especulativas.
+   */
+  horasNegocio?: string[] | null;
   /** La fecha que se le pregunto a `times.json`. Contexto del numero de arriba. */
   fechaEnsayo?: string | null;
   /** Dias entre hoy y la fecha del ensayo. La disponibilidad depende de la distancia. */
@@ -517,6 +528,7 @@ function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, ms
           msDiasAHoras, msCarrera, msTimes, msApt, falloEnsayo: fallo,
           horasEncontradas: horas ? (horas.available_times ?? []).filter(Boolean).length : null,
           horas: horas ? ((horas.available_times ?? []).filter(Boolean) as string[]) : null,
+          horasNegocio: horas ? ((horas.business_times ?? []).filter(Boolean) as string[]) : null,
           fechaEnsayo: fecha,
           diasHastaFecha: Math.round((Date.parse(`${fecha}T00:00:00Z`) - Date.now()) / 86_400_000),
         },

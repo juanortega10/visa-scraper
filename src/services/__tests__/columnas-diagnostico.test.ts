@@ -28,6 +28,7 @@ const COMPLETO: ColumnasIntento = {
   msToPost: 567,
   timesSeen: 3,
   timesFound: ['07:30', '10:15'],
+  businessTimes: ['07:30', '08:00', '10:15'],
   cause: 'carrera perdida',
   error: 'times.json vacio',
 };
@@ -69,13 +70,22 @@ describe('columnasDeIntento', () => {
     for (const k of COLUMNAS) expect(c[k]).not.toBeUndefined();
   });
 
-  it('detail lleva timesFound, cause y error cuando existen', () => {
+  it('detail lleva timesFound, businessTimes, cause y error cuando existen', () => {
     const c = columnasDeIntento(COMPLETO);
     expect(c.detail).toEqual({
       timesFound: ['07:30', '10:15'],
+      businessTimes: ['07:30', '08:00', '10:15'],
       cause: 'carrera perdida',
       error: 'times.json vacio',
     });
+  });
+
+  it('businessTimes vacio se distingue de businessTimes ausente', () => {
+    // `[]` con la fecha DENTRO de days.json seria un hallazgo: querria decir que el
+    // portal no publica horario para ese dia. Ausente solo quiere decir que la rama
+    // no lo capturo. Confundirlos borraria el hallazgo.
+    expect(columnasDeIntento({ ...COMPLETO, businessTimes: [] }).detail).toHaveProperty('businessTimes', []);
+    expect(columnasDeIntento({ failReason: 'no_times', durationMs: 1 }).detail).not.toHaveProperty('businessTimes');
   });
 
   it('detail queda vacio si no hay nada que contar', () => {

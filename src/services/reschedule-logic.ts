@@ -114,12 +114,27 @@ export interface RescheduleAttempt {
    * cupo real detras. Mayor que 0 significa que el cupo existia y nos ganaron.
    */
   timesSeen?: number;
+  /**
+   * `business_times` de la MISMA respuesta de `times.json`. Es el horario del
+   * consulado para ese dia, o sea TODAS las horas que ese dia puede tener, esten
+   * libres o no. `available_times` es el subconjunto que queda libre.
+   *
+   * Medido en el bot 7 el 2026-08-31, una sola peticion:
+   *   fecha en days.json   available ["09:45"]  business ["09:45","10:00","10:15","10:30"]
+   *   fecha fuera          available [null]     business []
+   *
+   * Importa porque es la lista de candidatos EXACTA para adivinar una hora, y viene
+   * gratis en la respuesta que ya pedimos. Hoy `SPECULATIVE_TIMES` adivina con una
+   * constante escrita a mano que no mira la fecha. Se registra para poder decidir con
+   * datos si conviene cambiar. Ver [[horas-especulativas-contaminadas]].
+   */
+  businessTimes?: string[];
 }
 
 /** Lo que `columnasDeIntento` necesita de un intento fallido. */
 export type ColumnasIntento = Pick<
   RescheduleAttempt,
-  'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound' | 'msToPost' | 'timesSeen'
+  'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound' | 'msToPost' | 'timesSeen' | 'businessTimes'
 >;
 
 /**
@@ -142,6 +157,7 @@ export function columnasDeIntento(a: ColumnasIntento) {
     timesSeen: a.timesSeen ?? null,
     detail: {
       ...(a.timesFound !== undefined ? { timesFound: a.timesFound } : {}),
+      ...(a.businessTimes !== undefined ? { businessTimes: a.businessTimes } : {}),
       ...(a.cause ? { cause: a.cause } : {}),
       ...(a.error ? { error: a.error } : {}),
     } satisfies Record<string, unknown>,
@@ -702,6 +718,9 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       // de verdad", no "que nos quedo despues de nuestros filtros".
       const portalTimes = consularTimesData.available_times?.filter((t): t is string => !!t) ?? [];
       const timesSeen = portalTimes.length;
+      // Viene en la MISMA respuesta, sin una peticion mas. Es el horario del consulado
+      // para ese dia: la lista de candidatos exacta si hay que adivinar una hora.
+      const businessTimes = consularTimesData.business_times?.filter((t): t is string => !!t) ?? [];
       const consularTimes = filterTimes(candidate.date, portalTimes, timeExclusions)
         .reverse(); // Try later times first — less competed than early morning slots
       logger.info('Consular times (reversed)', { botId, date: candidate.date, available: consularTimesData.available_times, afterFilter: consularTimes });
@@ -718,7 +737,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       }
       if (consularTimes.length === 0) {
         logger.warn('No consular times, re-fetching days', { botId });
-        failedAttempts.push({ date: candidate.date, failReason: 'no_times', failStep: 'get_consular_times', timesFound: portalTimes, timesSeen, durationMs: Date.now() - attemptStart });
+        failedAttempts.push({ date: candidate.date, failReason: 'no_times', failStep: 'get_consular_times', timesFound: portalTimes, timesSeen, businessTimes, durationMs: Date.now() - attemptStart });
         dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
         bumpTracker(candidate.date, 'consularNoTimes');
         exhaustedDates.add(candidate.date);
@@ -1548,7 +1567,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             // `timesSeen` es el CONTEO que dio el portal. `timesFound` puede traer la
             // constante especulativa, entonces no sirve para contar. Ver
             // [[horas-especulativas-contaminadas]].
-            timesSeen: a.timesSeen, msToPost: a.msToPost,
+            timesSeen: a.timesSeen, msToPost: a.msToPost, businessTimes: a.businessTimes,
           })),
         },
       } : {}),
