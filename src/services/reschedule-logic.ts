@@ -990,7 +990,15 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
         const filteredCasDays = filterDates(casDays, dateExclusions, bot.targetDateBefore, minDate, bot.targetDateAfter, bot.excludedWeekdays);
         logger.info('CAS days', { botId, consularTime, total: casDays.length, afterFilter: filteredCasDays.length, first: filteredCasDays[0]?.date });
         if (filteredCasDays.length === 0) {
-          failedAttempts.push({ date: candidate.date, consularTime, failReason: 'no_cas_days', durationMs: Date.now() - attemptStart });
+          // `failStep` y `timesSeen` van aqui igual que en las otras ramas. Sin ellos
+          // esta rama quedaba fuera de toda consulta de diagnostico, y es la que MAS
+          // falla en la flota: al 2026-08-31 `no_cas_days` es el 84% de las perdidas.
+          // `timesSeen` responde "cuantas horas consulares habia cuando el CAS fallo",
+          // que separa "la fecha era fantasma" de "el muro es el CAS, no el consular".
+          failedAttempts.push({
+            date: candidate.date, consularTime, failReason: 'no_cas_days',
+            failStep: 'parallel_cas_days', timesSeen, durationMs: Date.now() - attemptStart,
+          });
           dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
           bumpTracker(candidate.date, 'casNoDays');
           continue;
