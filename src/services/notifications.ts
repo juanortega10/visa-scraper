@@ -958,3 +958,119 @@ export async function notifyUser(
 
   await Promise.allSettled(promises);
 }
+
+// ── Telegram ─────────────────────────────────────────────────────────────────
+
+/**
+ * Manda un mensaje a Telegram. Devuelve `false` sin lanzar cuando no esta configurado.
+ *
+ * Por que existe junto al correo y no en vez del correo: son dos canales con fallas
+ * distintas. El correo se puede ir a spam o quedarse en una bandeja que nadie mira en
+ * el dia; Telegram suena en el telefono. Una alerta que solo llega por un canal es una
+ * alerta que se puede perder entera, y el detector de citas vencidas existe justamente
+ * porque un problema estuvo dos meses sin que nadie lo viera.
+ *
+ * NUNCA lanza. Un fallo de aviso no puede tumbar el cron que lo produjo: si Telegram
+ * se cae, el correo tiene que salir igual.
+ */
+export async function sendTelegram(texto: string): Promise<boolean> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.warn('[notify] telegram sin configurar (falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)');
+    return false;
+  }
+  if (!texto.trim()) return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: texto,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      console.error(`[notify] telegram HTTP ${res.status}: ${t.slice(0, 200)}`);
+      return false;
+    }
+    console.log('[notify] telegram enviado');
+    return true;
+  } catch (e) {
+    console.error(`[notify] telegram FALLO: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+// ── Citas vencidas ───────────────────────────────────────────────────────────
+
+export interface CitaVencidaAviso {
+  botId: number;
+  locale: string;
+  cita: string;
+  diasVencida: number;
+  polls24h: number;
+  severidad: 'critico' | 'alto' | 'medio';
+  motivo: string;
+  agencia: string | null;
+}
+
+/**
+ * Correo del detector de citas vencidas.
+ *
+ * Lleva el detalle completo, porque es el canal donde se puede leer una tabla. El
+ * mensaje corto va por Telegram (`textoTelegram` en `citas-vencidas.ts`).
+ */
+export async function sendCitasVencidasEmail(
+  to: string,
+  filas: CitaVencidaAviso[],
+  resumen: { total: number; criticos: number; pollsDesperdiciados: number; porcentajeDeFlota: number },
+): Promise<void> {
+  if (!to || filas.length === 0) return;
+  const color: Record<string, string> = { critico: '#dc2626', alto: '#ea580c', medio: '#ca8a04' };
+  const celda = (v: string) => `<td style="padding:6px 12px;border-top:1px solid #e2e8f0">${v}</td>`;
+  const cuerpo = filas.map((f) => `<tr>
+      ${celda(`<strong>${f.botId}</strong>`)}
+      ${celda(f.locale)}
+      ${celda(f.cita)}
+      ${celda(`${f.diasVencida} d`)}
+      ${celda(f.polls24h.toLocaleString('es-CO'))}
+      ${celda(f.agencia ?? 'directo')}
+      ${celda(`<span style="color:${color[f.severidad]}">${f.severidad}</span>`)}
+    </tr>`).join('');
+  const html = `
+  <div style="font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;color:#0f172a">
+    <h2>Citas vencidas: ${resumen.total} bots</h2>
+    <p style="color:#475569">
+      Estos bots figuran <code>active</code> y su cita ya paso. Un bot solo puede reagendar
+      a una fecha estrictamente ANTERIOR a la que tiene, entonces con la cita vencida no
+      existe ninguna fecha valida: pollea sin poder ganar nunca.
+    </p>
+    <p style="color:#475569">
+      Estan gastando <strong>${resumen.pollsDesperdiciados.toLocaleString('es-CO')} polls</strong>
+      en 24 h, el <strong>${resumen.porcentajeDeFlota}%</strong> de la carga de la flota.
+      ${resumen.criticos} pasan de 300 polls al dia.
+    </p>
+    <table style="border-collapse:collapse;width:100%;font-size:14px">
+      <tr style="text-align:left;color:#64748b">
+        <th style="padding:6px 12px">bot</th><th style="padding:6px 12px">locale</th>
+        <th style="padding:6px 12px">cita</th><th style="padding:6px 12px">vencida</th>
+        <th style="padding:6px 12px">polls 24h</th><th style="padding:6px 12px">dueno</th>
+        <th style="padding:6px 12px">severidad</th>
+      </tr>
+      ${cuerpo}
+    </table>
+    <p style="margin-top:16px;color:#475569">
+      Antes de pausar uno, revisa si queda saldo por cobrar. Para pausar:
+      <code>POST /api/bots/&lt;id&gt;/pause</code>
+    </p>
+    <p style="color:#94a3b8;font-size:12px">
+      Detector: <code>scripts/audit-citas-vencidas.ts</code> ·
+      <code>audit-blind-bots.ts</code> NO ve estos casos, porque estos bots si ven fechas.
+    </p>
+  </div>`;
+  await sendEmail(0, 'citas_vencidas', to, `${resumen.total} bots con la cita vencida`, html);
+}
