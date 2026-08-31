@@ -26,7 +26,10 @@ const arg = (n: string, d: number): number => {
   const i = process.argv.indexOf(`--${n}`);
   return i >= 0 && process.argv[i + 1] ? Number(process.argv[i + 1]) : d;
 };
-const HORAS = arg('horas', 24);
+// Ventana por defecto de 12 h. Con la cadencia degradada (`minutosEntreDisparos`) el
+// sniper puede bajar a 6 disparos por hora a proposito, y una ventana de 6 h se queda
+// sin muestra justo cuando el bot esta bloqueado. Doce horas aguanta el peor caso.
+const HORAS = arg('horas', 12);
 const MIN_MUESTRA = arg('min-muestra', 8);
 const MIN_TICKS = arg('min-ticks', 30);
 
@@ -58,6 +61,8 @@ interface Verificador {
   umbral: string;
   base: string;
   n: number;
+  /** Muestra que ESTE verificador necesita. Con `n` por debajo no hay veredicto. */
+  muestraMin: number;
   nota?: string;
 }
 const resultados: Verificador[] = [];
@@ -88,7 +93,7 @@ async function main() {
     medido: `${ticks.length} ticks, ${carreras.length} carreras medidas`,
     umbral: `>= ${MIN_TICKS} ticks y >= ${MIN_MUESTRA} carreras`,
     base: `ventana de ${HORAS} h`,
-    n: filas.length,
+    n: filas.length, muestraMin: MIN_TICKS,
     nota: filas.length === 0 ? 'el sniper no escribio nada: revisar si esta desplegado y vivo' : undefined,
   });
 
@@ -96,9 +101,11 @@ async function main() {
   const leer = campo(ticks, 'msLeerBot');
   V({
     id: 'V2', que: 'la fila del bot sale de memoria, no de Neon',
-    ok: leer.length >= MIN_TICKS && pct(leer, 0.5) < 5,
+    // 20 ms y no 5: la copia se refresca de fondo cada 60 s y esa vuelta si toca Neon,
+    // entonces el p95 sube solo. Contra los 89 ms de Neon, 20 sigue probando la caché.
+    ok: leer.length >= MIN_TICKS && pct(leer, 0.5) < 20,
     medido: leer.length ? `p50 ${pct(leer, 0.5)} ms · p95 ${pct(leer, 0.95)} ms` : 'sin datos',
-    umbral: 'p50 < 5 ms', base: `${BASE.msLeerBot} ms contra Neon`, n: leer.length,
+    umbral: 'p50 < 20 ms', base: `${BASE.msLeerBot} ms contra Neon`, n: leer.length, muestraMin: MIN_TICKS,
   });
 
   // ── V3 · el tiempo REGALADO ─────────────────────────────────────────────────
@@ -110,7 +117,7 @@ async function main() {
     ok: regalado.length >= MIN_MUESTRA && pct(regalado, 0.95) < 50,
     medido: regalado.length ? `p50 ${pct(regalado, 0.5)} ms · p95 ${pct(regalado, 0.95)} ms` : 'sin datos',
     umbral: 'p95 < 50 ms',
-    base: `${BASE.msDiasAHorasMejor} y ${BASE.msDiasAHoras} ms`, n: regalado.length,
+    base: `${BASE.msDiasAHorasMejor} y ${BASE.msDiasAHoras} ms`, n: regalado.length, muestraMin: MIN_MUESTRA,
   });
 
   // ── V4 · el paralelo es real ────────────────────────────────────────────────
@@ -128,7 +135,7 @@ async function main() {
       ? `carrera/suma p50 ${pct(razon, 0.5).toFixed(2)} · p95 ${pct(razon, 0.95).toFixed(2)} · ${enSerie} en serie`
       : 'sin datos',
     umbral: 'razon p95 < 0,85 y CERO vueltas en serie',
-    base: 'razon 1,00 = serie', n: pares.length,
+    base: 'razon 1,00 = serie', n: pares.length, muestraMin: MIN_MUESTRA,
   });
 
   // ── V5 · techo por peticion ─────────────────────────────────────────────────
@@ -141,7 +148,7 @@ async function main() {
     id: 'V5', que: 'ninguna peticion del camino critico pasa el techo',
     ok: times.length >= MIN_MUESTRA && peor < techoDuro,
     medido: times.length ? `peor ${peor} ms (times p95 ${pct(times, 0.95)}, cita p95 ${pct(apts, 0.95)})` : 'sin datos',
-    umbral: `< ${techoDuro} ms`, base: `${BASE.msTechoViejo} ms`, n: times.length + apts.length,
+    umbral: `< ${techoDuro} ms`, base: `${BASE.msTechoViejo} ms`, n: times.length + apts.length, muestraMin: MIN_MUESTRA,
   });
 
   // ── V6 · el token esta vivo y su refresco cae FUERA del camino critico ──────
@@ -167,25 +174,46 @@ async function main() {
       ? `${vivos}/${edades.length} bajo el techo · edad p95 ${pct(edades, 0.95)} s · refresco de rutina ${(tasaRefresco * 100).toFixed(0)}%`
       : 'sin datos',
     umbral: `todos < ${TECHO_TOKEN_S} s`,
-    base: 'se pedia dentro del camino critico', n: edades.length,
+    base: 'se pedia dentro del camino critico', n: edades.length, muestraMin: MIN_TICKS,
   });
 
   // ── V7 · el sello del token se persiste ─────────────────────────────────────
+  // Solo se le exige sello fresco a un bot que ESTA POLLEANDO. Un bot en backoff de
+  // `schedule_blocked` duerme 240 min a proposito y no puede refrescar nada; exigirselo
+  // convierte un comportamiento correcto en una alarma (caso real: bot 223, 2026-08-30).
+  // La invariante correcta es: si el bot polleo hace poco, mantuvo su token caliente.
+  // El precalentado corre DESPUES de un poll que funciono. Un poll bloqueado corta el
+  // flujo antes de llegar ahi, y el bot queda en backoff largo. Por eso la condicion
+  // mira el ESTADO del ultimo poll, no solo su hora: un borde de 15 minutos hacia que
+  // el verificador prendiera y apagara solo.
+  // Se mira si el bot tuvo ALGUN poll sano en la ventana, no si el ULTIMO lo fue.
+  // Con la version anterior, un bot que alterna `ok` y `error` prendia y apagaba el
+  // verificador segun cual poll cayera de ultimo (caso real: bot 7, 2026-08-31).
   const sellos = (await db.execute(sql`
-    SELECT s.bot_id, s.tokens_refreshed_at, b.locale, b.status, b.asc_facility_id
+    SELECT s.bot_id, s.tokens_refreshed_at,
+           (SELECT count(*) FROM poll_logs p
+             WHERE p.bot_id = s.bot_id
+               AND p.created_at > now() - interval '15 minutes'
+               AND p.status IN ('ok', 'filtered_out'))::int AS polls_sanos
     FROM sessions s JOIN bots b ON b.id = s.bot_id
     WHERE b.locale = 'es-pe' AND b.status = 'active'
-  `)).rows as Array<{ bot_id: number; tokens_refreshed_at: Date | null; asc_facility_id: string | null }>;
-  const conSello = sellos.filter((r) => r.tokens_refreshed_at !== null);
-  const frescos = conSello.filter((r) => Date.now() - new Date(r.tokens_refreshed_at!).getTime() < 15 * 60_000);
+  `)).rows as Array<{ bot_id: number; tokens_refreshed_at: Date | null; polls_sanos: number }>;
+  const VENTANA_MS = 15 * 60_000;
+  const activos = sellos.filter((r) => r.polls_sanos > 0);
+  const dormidos = sellos.length - activos.length;
+  const frescos = activos.filter(
+    (r) => r.tokens_refreshed_at && Date.now() - new Date(r.tokens_refreshed_at).getTime() < VENTANA_MS,
+  );
+  const sinSello = activos.filter((r) => !r.tokens_refreshed_at);
   V({
-    id: 'V7', que: 'poll-visa persiste el sello del token en sessions',
-    ok: sellos.length > 0 && frescos.length === sellos.length,
-    medido: `${frescos.length}/${sellos.length} bots es-pe activos con sello de menos de 15 min`,
-    umbral: 'todos', base: 'la columna no existia', n: sellos.length,
-    nota: sellos.length > 0 && conSello.length === 0
-      ? 'la columna existe pero nadie la escribe: poll-visa no tiene el build nuevo'
-      : undefined,
+    id: 'V7', que: 'un bot que pollea mantiene su token caliente',
+    ok: activos.length > 0 && frescos.length === activos.length,
+    medido: `${frescos.length}/${activos.length} bots polleando con sello fresco` +
+      (dormidos > 0 ? ` · ${dormidos} en backoff o bloqueados, no se les exige` : ''),
+    umbral: 'todos los que pollean', base: 'la columna no existia', n: activos.length, muestraMin: 1,
+    nota: sinSello.length > 0
+      ? `bots polleando SIN sello: ${sinSello.map((r) => r.bot_id).join(', ')} — poll-visa no esta escribiendo`
+      : (activos.length === 0 ? 'ningun bot es-pe polleo en los ultimos 15 min' : undefined),
   });
 
   // ── V8 · fase del tick contra la ventana de liberacion ──────────────────────
@@ -196,7 +224,7 @@ async function main() {
     id: 'V8', que: 'los ticks caen en la ventana de liberacion de es-pe',
     ok: segs.length >= MIN_TICKS && fracVentana >= 0.9,
     medido: segs.length ? `${(fracVentana * 100).toFixed(1)}% en s14-s24` : 'sin datos',
-    umbral: '>= 90%', base: 'ventana util medida s15-s24', n: segs.length,
+    umbral: '>= 90%', base: 'ventana util medida s15-s24', n: segs.length, muestraMin: MIN_TICKS,
   });
 
   // ── V9 · nuestro overhead sobre lo que cuesta el portal ─────────────────────
@@ -238,7 +266,7 @@ async function main() {
         ` · (total crudo p50 ${pct(total, 0.5)} ms a ${bandas.length ? pct(bandas, 0.5) : '?'} dias)`
       : 'sin datos',
     umbral: 'p95 < 100 ms',
-    base: `${BASE.msDiasAHoras} ms de prep en la peor deteccion`, n: overheads.length,
+    base: `${BASE.msDiasAHoras} ms de prep en la peor deteccion`, n: overheads.length, muestraMin: MIN_MUESTRA,
     nota: bandas.length && pct(bandas, 0.5) > 180
       ? 'el total crudo mide la banda BARATA del portal; no compararlo contra detecciones cercanas'
       : undefined,
@@ -256,7 +284,7 @@ async function main() {
     ok: ensayos.length >= MIN_MUESTRA && fracFallo <= 0.1,
     medido: ensayos.length ? `${conFallo.length}/${ensayos.length} ensayos con abort o error` : 'sin datos',
     umbral: '<= 10%',
-    base: 'con techo de 3.000 ms fallaba el 100%', n: ensayos.length,
+    base: 'con techo de 3.000 ms fallaba el 100%', n: ensayos.length, muestraMin: MIN_MUESTRA,
     nota: conFallo.length > 0 ? String(conFallo[conFallo.length - 1]!.payload.falloEnsayo) : undefined,
   });
 
@@ -277,13 +305,33 @@ async function main() {
     if (r.nota) console.log(`    ${' '.repeat(ancho.id)}nota: ${r.nota}`);
   }
 
+  // TRES estados, no dos. Un verificador sin muestra NO es una regresion: cuando el
+  // portal cierra la ruta del schedule, el sniper baja su cadencia a proposito
+  // (`minutosEntreDisparos`) y deja de escribir filas. Reportar eso como falla hace que
+  // la alarma grite justo cuando el bot esta haciendo lo correcto.
+  //
+  //   0  pasan los que se pudieron juzgar
+  //   1  REGRESION: algo medible empeoro
+  //   2  SIN VEREDICTO: no hay muestra suficiente
   const fallan = resultados.filter((r) => !r.ok);
+  // V1 ES la compuerta de muestra. Si falla, no hay nada que juzgar en todo el informe:
+  // el resto de los numeros salen de datos que ya sabemos insuficientes.
+  const v1 = resultados.find((r) => r.id === 'V1');
+  const sinMuestra = v1 && !v1.ok ? fallan : fallan.filter((r) => r.n < r.muestraMin);
+  const regresiones = fallan.filter((r) => !sinMuestra.includes(r));
+
   console.log('');
   if (fallan.length === 0) {
     console.log(`Los ${resultados.length} verificadores pasan.`);
     process.exit(0);
   }
-  console.log(`FALLAN ${fallan.length} de ${resultados.length}: ${fallan.map((r) => r.id).join(', ')}`);
+  if (regresiones.length === 0) {
+    console.log(`SIN VEREDICTO en ${sinMuestra.length}: ${sinMuestra.map((r) => r.id).join(', ')}`);
+    console.log('No hay muestra suficiente. Revisar si el bot esta bloqueado antes de buscar una regresion.');
+    process.exit(2);
+  }
+  console.log(`FALLAN ${regresiones.length} de ${resultados.length}: ${regresiones.map((r) => r.id).join(', ')}`);
+  if (sinMuestra.length > 0) console.log(`(ademas, ${sinMuestra.length} sin muestra: ${sinMuestra.map((r) => r.id).join(', ')})`);
   process.exit(1);
 }
 

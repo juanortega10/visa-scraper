@@ -37,6 +37,7 @@ import { loginWithFallback } from '../src/services/login.js';
 import { VisaClient } from '../src/services/visa-client.js';
 import {
   elegirFecha, verificarDisparo, cupoEfectivo, veredictoToken, POLITICA_TOKEN,
+  tocaDisparar, minutosEntreDisparos,
   msHastaProximoTick, enVentana, VENTANA_PE,
   type SniperPeruConfig, type EstadoToken,
 } from '../src/services/peru-sniper-core.js';
@@ -58,8 +59,6 @@ const SESION_MAX_MS = 44 * 60_000;
 /** Una fecha que fallo el POST no se reintenta durante este tiempo. */
 const QUEMADA_MS = 20 * 60_000;
 /** Errores seguidos antes de una pausa larga. Evita golpear al portal si algo se rompio. */
-const ERRORES_PARA_PAUSA = 5;
-const PAUSA_MS = 15 * 60_000;
 
 /** Clave del sniper en `sniper_scans`. La pagina /dashboard/peru la lee. */
 const SCAN_KEY = 'peru-299';
@@ -441,6 +440,41 @@ function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, ms
   })();
 }
 
+/**
+ * Verificacion PROGRESIVA de la cita despues del POST.
+ *
+ * El POST miente: puede decir que salio bien y la cita no haberse movido. La unica
+ * verdad es leer `/groups`. Lo que cambia aqui es COMO se espera.
+ *
+ * Antes: `await sleep(2500)` fijo y una sola lectura. Se pagaban los 2,5 s completos
+ * siempre, incluso cuando el portal ya habia guardado el cambio.
+ *
+ * Ahora: se pregunta a los 400 ms y se corta apenas la cita aparece con la fecha
+ * nueva. Si no aparece, se vuelve a los 800 y a los 1.300 ms. El techo de espera sigue
+ * siendo 2.500 ms, entonces el peor caso no empeora, y el caso bueno pasa de ~3.200 ms
+ * a ~1.100 ms.
+ *
+ * Devuelve la ultima lectura que se consiguio, o `null` si ninguna respondio.
+ */
+async function verificarCita(
+  s: Sesion,
+  fecha: string,
+  esperas: readonly number[] = [400, 800, 1300],
+): Promise<Awaited<ReturnType<VisaClient['getCurrentAppointment']>>> {
+  let ultima: Awaited<ReturnType<VisaClient['getCurrentAppointment']>> = null;
+  for (const espera of esperas) {
+    await sleep(espera);
+    try {
+      const leida = await s.client.getCurrentAppointment();
+      if (leida) ultima = leida;
+      if (leida?.consularDate === fecha) return leida;   // ya quedo, no se espera mas
+    } catch (e) {
+      log(`  verificacion: lectura fallo (${(e as Error).message})`);
+    }
+  }
+  return ultima;
+}
+
 /** Una vuelta completa: pedir dias, verificar, y disparar si todo cierra. */
 async function vuelta(): Promise<Resultado> {
   const tVuelta = Date.now();
@@ -451,7 +485,20 @@ async function vuelta(): Promise<Resultado> {
   if (row.status !== 'active') { log(`  bot ${BOT_ID} en estado ${row.status}. No se dispara.`); return { agendado: false }; }
 
   const cupoDb = cupoEfectivo(configDe(row, row.currentConsularDate));
-  if (cupoDb.quedan <= 0) return { agendado: false, fatal: `sin cupo (tope ${cupoDb.topeDe})` };
+  if (cupoDb.quedan <= 0) {
+    // La fila viene de memoria y puede tener hasta 60 s. Otra cadena puede haber
+    // tomado el cupo y devuelto un instante despues. Matar el proceso con un dato
+    // viejo lo deja muerto para siempre (`Restart=on-failure` no revive un exit 0).
+    // Se confirma EN VIVO antes de rendirse.
+    olvidarFila();
+    const vivo = await leerBot();
+    const cupoVivo = cupoEfectivo(configDe(vivo, vivo.currentConsularDate));
+    if (cupoVivo.quedan > 0) {
+      log(`  cupo en memoria decia 0 y en vivo quedan ${cupoVivo.quedan}. Se sigue.`);
+    } else {
+      return { agendado: false, fatal: `sin cupo (tope ${cupoVivo.topeDe})` };
+    }
+  }
 
   const tokenAntes = s0Token();
   const s = await sesionLista(row);
@@ -573,8 +620,12 @@ async function vuelta(): Promise<Resultado> {
 
   // 6 · reclamo atomico. Solo despues de esto se toca el portal.
   if (!(await reclamarCupo())) {
-    log('  ABORTA: otra cadena ya tomo el cupo (UPDATE atomico sin filas).');
-    return { agendado: false, fatal: 'cupo tomado por otra cadena' };
+    // NO es fatal. `poll-visa` corre sobre el mismo bot y puede reclamar y devolver el
+    // cupo en la misma vuelta. Antes esto mataba el sniper para siempre por una
+    // carrera de segundos. Se salta el tick y la vuelta siguiente lee en vivo.
+    log('  Se salta: otra cadena tiene el cupo ahora (UPDATE atomico sin filas).');
+    olvidarFila();
+    return { agendado: false };
   }
 
   // 7 · UN solo POST por deteccion. Sin reintento a ciegas.
@@ -586,12 +637,10 @@ async function vuelta(): Promise<Resultado> {
   log(`  POST → ${dijoOk ? 'dice OK' : `dice NO (${errPost ?? 'sin excepcion'})`} · ${Date.now() - tPost} ms`);
 
   // 8 · verificacion contra el portal. El POST miente: ver `followRedirectChain`.
-  await sleep(2500);
-  let real: Awaited<ReturnType<VisaClient['getCurrentAppointment']>> = null;
-  try { real = await s.client.getCurrentAppointment(); }
-  catch (e) { log(`  verificacion fallo: ${(e as Error).message}`); }
+  const tVerif = Date.now();
+  const real = await verificarCita(s, fecha);
   const quedo = real?.consularDate === fecha;
-  log(`  portal ahora: ${real?.consularDate ?? '?'} ${real?.consularTime ?? ''} → ${quedo ? 'QUEDO' : 'NO QUEDO'}`);
+  log(`  portal ahora: ${real?.consularDate ?? '?'} ${real?.consularTime ?? ''} → ${quedo ? 'QUEDO' : 'NO QUEDO'} · ${Date.now() - tVerif} ms`);
 
   await db.insert(rescheduleLogs).values({
     botId: BOT_ID,
@@ -643,22 +692,38 @@ async function main() {
   try { await sesionLista(row); } catch (e) { log(`  [sesion] arranque fallo: ${(e as Error).message}`); }
 
   let errores = 0;
+  let ultimoDisparoMs = 0;
+  let saltadosSeguidos = 0;
   for (;;) {
     await sleep(msHastaProximoTick(Date.now(), SEGUNDOS_TICK));
+
+    // Cadencia degradada. NO es una pausa: el proceso sigue despertando en los segundos
+    // 14 y 18, conserva su fase contra la ventana de liberacion, y solo saltea disparos
+    // mientras la racha de errores dure. Al primer poll sano vuelve a la cadencia plena.
+    if (!tocaDisparar(errores, ultimoDisparoMs, Date.now())) {
+      saltadosSeguidos += 1;
+      if (saltadosSeguidos === 1) {
+        log(`  cadencia reducida a 1 cada ${minutosEntreDisparos(errores)} min por ${errores} errores seguidos. Sigue vivo.`);
+      }
+      continue;
+    }
+    saltadosSeguidos = 0;
+    ultimoDisparoMs = Date.now();
+
     try {
       const r = await vuelta();
+      if (errores > 0) log(`  recuperado tras ${errores} errores. Cadencia plena otra vez.`);
       errores = 0;
       if (r.agendado) { log('  objetivo cumplido. Fin.'); break; }
       if (r.fatal) { log(`  ALTO: ${r.fatal}. Fin.`); break; }
     } catch (e) {
       errores += 1;
       sesion = null;
-      log(`  ERROR (${errores}/${ERRORES_PARA_PAUSA}): ${(e as Error).message}`);
-      if (errores >= ERRORES_PARA_PAUSA) {
-        log(`  ${ERRORES_PARA_PAUSA} errores seguidos. Pausa de ${PAUSA_MS / 60000} min.`);
-        await sleep(PAUSA_MS);
-        errores = 0;
-      }
+      // SIN PAUSA. Una pausa de 15 min se come 30 ventanas de liberacion seguidas, y
+      // el cupo de Peru aparece justo ahi. Se sigue disparando y se avisa en el log.
+      // La sesion ya se solto arriba, entonces la vuelta siguiente vuelve a entrar.
+      log(`  ERROR (${errores} seguidos): ${(e as Error).message}`);
+      if (errores % 10 === 0) log(`  ATENCION: ${errores} errores seguidos y sigue intentando.`);
     }
     if (UNA_VUELTA) break;
   }
