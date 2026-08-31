@@ -219,6 +219,14 @@ export function blockBackoffMs(blockCls: string | null, count: number): number {
 export interface RecentBlockRow {
   status: string;
   blockCls: string | null;
+  /**
+   * Momento de la fila. Con este dato la racha se corta cuando dos bloqueos quedan
+   * demasiado lejos en el tiempo. Sin el, se mantiene el conteo por posicion.
+   *
+   * Se acepta string porque `jsonb_agg` y `db.execute` devuelven texto donde Drizzle
+   * devuelve Date. {@link msDeFila} normaliza los dos.
+   */
+  createdAt?: Date | string | null;
 }
 
 /**
@@ -231,6 +239,13 @@ export interface RecentBlockRow {
 export const SUSTAINED_BLOCK_CLASSES = ['account_ban', 'schedule_blocked'];
 
 /**
+ * Cuanto puede estirarse el hueco entre dos bloqueos sin romper la racha, como multiplo
+ * del backoff que se programo. El 1,5 es el mismo margen que usa `debeDespertar`: cubre
+ * el jitter del cron y el arranque del run, y descarta un hueco de horas.
+ */
+export const VENTANA_RACHA = 1.5;
+
+/**
  * Cuenta los bloqueos de cuenta SEGUIDOS al frente de la ventana de `poll_logs`.
  *
  * Corta la racha cualquier fila que no sea un `tcp_blocked` de tipo `account_ban`.
@@ -239,11 +254,48 @@ export const SUSTAINED_BLOCK_CLASSES = ['account_ban', 'schedule_blocked'];
  * entonces las filas sanas no cortaban nada: dos bloqueos con polls buenos en medio
  * contaban como cinco y el backoff saltaba de un golpe al tope de 480m.
  */
+/**
+ * Momento de la fila en ms, o `null` si no se puede saber.
+ *
+ * `createdAt` llega como Date desde Drizzle y como string desde `jsonb_agg` o desde
+ * `db.execute` crudo. Sin normalizar, un string reventaba con `getTime is not a function`
+ * y tumbaba al detector entero. Ante cualquier valor raro devuelve `null`, y el contador
+ * cae al conteo por posicion: pierde el corte por tiempo, nunca se rompe.
+ */
+function msDeFila(r: RecentBlockRow): number | null {
+  const v = r.createdAt;
+  if (!v) return null;
+  const t = v instanceof Date ? v.getTime() : new Date(v as unknown as string).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
 export function countSustainedAccountBans(rows: RecentBlockRow[]): number {
-  const firstBreak = rows.findIndex(
-    (r) => !(r.status === 'tcp_blocked' && SUSTAINED_BLOCK_CLASSES.includes(r.blockCls ?? '')),
-  );
-  return firstBreak === -1 ? rows.length : firstBreak;
+  const esBloqueo = (r: RecentBlockRow) =>
+    r.status === 'tcp_blocked' && SUSTAINED_BLOCK_CLASSES.includes(r.blockCls ?? '');
+
+  let n = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const fila = rows[i]!;
+    if (!esBloqueo(fila)) break;
+
+    // Corte por tiempo: dos bloqueos solo forman racha si el segundo llego poco despues
+    // de que vencio el backoff del primero. Con el ahorro de escrituras, un bot bloqueado
+    // deja UNA fila por sondeo, y los sondeos van separados por horas: sin este corte las
+    // 5 filas de la ventana parecian seguidas y el contador saltaba al tope.
+    //
+    // Caso real del 2026-08-31, bot 303: filas a las 06:23, 04:23 y 23:01 del dia anterior.
+    // Separadas por 2 h y 5 h, contaban 4 y disparaban la curva de 6 h; el nivel real era 1,
+    // o sea 30 min. Lo mismo en los bots 302, 269 y 299 a la misma hora.
+    const previa = rows[i + 1];
+    const tA = msDeFila(fila);
+    const tB = previa ? msDeFila(previa) : null;
+    if (previa && esBloqueo(previa) && tA !== null && tB !== null) {
+      const esperado = blockBackoffMs(previa.blockCls ?? null, i) * VENTANA_RACHA;
+      if (tA - tB > esperado) { n++; break; }
+    }
+    n++;
+  }
+  return n;
 }
 
 /** Trigger.dev delay string form of {@link accountBanBackoffMs}. */

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   cupoEfectivo, sumarDias, elegirFecha, verificarDisparo,
   veredictoToken, POLITICA_TOKEN, msHastaSegundo, msHastaProximoTick, enVentana, VENTANA_PE,
+  minutosEntreDisparos, tocaDisparar,
   type SniperPeruConfig,
 } from '../peru-sniper-core.js';
 
@@ -250,5 +251,58 @@ describe('msHastaProximoTick', () => {
 
   it('sin segundos configurados espera un minuto', () => {
     expect(msHastaProximoTick(min, [])).toBe(60_000);
+  });
+});
+
+/**
+ * Cadencia degradada: baja el ritmo con la racha de errores y NUNCA pausa.
+ *
+ * El 2026-08-31 el sniper acumulo 41 errores seguidos con todas las IPs de webshare
+ * rebotando en la ruta del schedule 75610929. Sin freno reintentaba 4 IPs por vuelta
+ * contra una ruta cerrada, y cada fallo penaliza esa IP en el circuit breaker.
+ */
+describe('cadencia degradada', () => {
+  it('sin errores no cambia nada: dispara en todos los ticks', () => {
+    expect(minutosEntreDisparos(0)).toBe(0);
+    expect(tocaDisparar(0, Date.now(), Date.now())).toBe(true);
+    expect(tocaDisparar(0, 0, 0)).toBe(true);
+  });
+
+  it('ADVERSARIAL: NUNCA pausa, por alta que sea la racha', () => {
+    for (const n of [1, 5, 15, 30, 100, 10_000, Number.MAX_SAFE_INTEGER]) {
+      const min = minutosEntreDisparos(n);
+      expect(Number.isFinite(min)).toBe(true);
+      expect(min).toBeLessThanOrEqual(10);      // techo duro: 6 disparos por hora
+      // Con el espaciado cumplido, SIEMPRE vuelve a disparar.
+      expect(tocaDisparar(n, 0, min * 60_000)).toBe(true);
+    }
+  });
+
+  it('la curva sube y nunca baja', () => {
+    let previo = -1;
+    for (let n = 0; n <= 60; n++) {
+      const m = minutosEntreDisparos(n);
+      expect(m).toBeGreaterThanOrEqual(previo);
+      previo = m;
+    }
+  });
+
+  it('respeta el espaciado antes de cumplirse', () => {
+    const t0 = 1_000_000;
+    expect(tocaDisparar(3, t0, t0 + 59_000)).toBe(false);   // 1 min pedido, 59 s pasados
+    expect(tocaDisparar(3, t0, t0 + 60_000)).toBe(true);
+    expect(tocaDisparar(20, t0, t0 + 4 * 60_000)).toBe(false);  // 5 min pedidos
+    expect(tocaDisparar(20, t0, t0 + 5 * 60_000)).toBe(true);
+  });
+
+  it('se recupera de golpe: un solo poll sano vuelve a la cadencia plena', () => {
+    const t0 = 1_000_000;
+    expect(tocaDisparar(41, t0, t0 + 1000)).toBe(false);   // en racha, hay que esperar
+    expect(tocaDisparar(0, t0, t0 + 1000)).toBe(true);     // racha en cero, dispara ya
+  });
+
+  it('el techo deja al menos 6 disparos por hora dentro de la ventana', () => {
+    const porHora = 60 / minutosEntreDisparos(10_000);
+    expect(porHora).toBeGreaterThanOrEqual(6);
   });
 });

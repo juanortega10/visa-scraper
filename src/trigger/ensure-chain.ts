@@ -1,12 +1,24 @@
 import { schedules, logger, runs } from '@trigger.dev/sdk/v3';
 import { db } from '../db/client.js';
 import { bots, pollLogs } from '../db/schema.js';
+import { HEARTBEAT_MS } from '../services/poll-logging.js';
 import { eq, inArray, and, desc, sql } from 'drizzle-orm';
 import { notifyUserTask } from './notify-user.js';
 import { visaPollingPerBotQueue } from './queues.js';
-import { calculatePriority, blockBackoffMs, SUSTAINED_BLOCK_CLASSES } from '../services/scheduling.js';
+import { calculatePriority, blockBackoffMs, SUSTAINED_BLOCK_CLASSES, countSustainedAccountBans, debeDespertar } from '../services/scheduling.js';
+import { TECHO_EXECUTING_MIN } from '../services/guardianes.js';
 
 type RunAction = 'executing' | 'pulled_forward' | 'resurrected' | 'cron_ok';
+
+/**
+ * Silencio que hace sospechar de un bot cron, en minutos.
+ *
+ * Tiene que quedar POR ENCIMA de `HEARTBEAT_MS`, que es el intervalo minimo entre filas
+ * de un bot sano. Con el heartbeat en 5 min, los huecos observados llegan a 9 min, y el
+ * triple del heartbeat deja margen para el jitter del cron sin tapar un bot muerto de
+ * verdad: la cadena dormida se detecta igual, solo que 10 min mas tarde.
+ */
+export const SILENCIO_CRON_MIN = (HEARTBEAT_MS / 60_000) * 3;
 
 async function getRunStatus(runId: string | null): Promise<string | null> {
   if (!runId) return null;
@@ -35,7 +47,7 @@ async function getRunStatus(runId: string | null): Promise<string | null> {
  */
 async function getBanBackoff(
   botId: number,
-): Promise<{ banned: boolean; lastPollAgeMs: number; backoffMs: number }> {
+): Promise<{ banned: boolean; count: number; blockCls: string | null; lastPollAgeMs: number; backoffMs: number }> {
   const recent = await db
     .select({
       status: pollLogs.status,
@@ -49,16 +61,18 @@ async function getBanBackoff(
 
   const last = recent[0];
   if (!last || last.status !== 'tcp_blocked' || !SUSTAINED_BLOCK_CLASSES.includes(last.blockCls ?? '')) {
-    return { banned: false, lastPollAgeMs: 0, backoffMs: 0 };
+    return { banned: false, count: 0, blockCls: null, lastPollAgeMs: 0, backoffMs: 0 };
   }
 
-  // Filas de bloqueo seguidas (mismo recuento que el de poll-visa.ts).
-  // `schedule_blocked` cuenta igual que `account_ban`: es la misma racha, con curva mas larga.
-  const firstNonBan = recent.findIndex((r) => !SUSTAINED_BLOCK_CLASSES.includes(r.blockCls ?? ''));
-  const count = firstNonBan === -1 ? recent.length : firstNonBan;
+  // Fuente unica del recuento: `countSustainedAccountBans`. Antes esto era una copia con
+  // `findIndex`, y por eso se quedaba sin el corte por tiempo que esa funcion aplica.
+  // Tres lectores tienen que ver el mismo numero: poll-visa, chain-health y este.
+  const count = countSustainedAccountBans(recent);
 
   return {
     banned: true,
+    count,
+    blockCls: last.blockCls,
     lastPollAgeMs: Date.now() - last.createdAt.getTime(),
     backoffMs: blockBackoffMs(last.blockCls, count),
   };
@@ -75,12 +89,28 @@ async function ensureChainForBot(
   concurrencyKey: string,
   activatedAt: Date | null,
   tags: string[],
-  usesCron: boolean,
+  /** Sin uso desde el 2026-08-31: la comprobacion de vida ya no depende de esto. */
+  _usesCron: boolean,
   chainId?: 'dev' | 'cloud',
 ): Promise<{ action: RunAction; newRunId?: string }> {
   const status = await getRunStatus(runId);
 
-  if (status === 'EXECUTING') return { action: 'executing' };
+  if (status === 'EXECUTING') {
+    // Un run de `poll-visa` vive segundos o pocos minutos, y mientras trabaja escribe en
+    // `poll_logs`. Un EXECUTING que lleva media hora sin dejar una fila esta trabado.
+    // Nadie lo tocaba: `poll-cron` respeta el run vivo y esta rama salia sin mirar el
+    // reloj. Lo encontro el barrido exhaustivo de `guardianes-invariante.test.ts`.
+    const [ultima] = await db.select({ createdAt: pollLogs.createdAt })
+      .from(pollLogs).where(eq(pollLogs.botId, botId))
+      .orderBy(desc(pollLogs.createdAt)).limit(1);
+    const minSinPoll = ultima ? (Date.now() - ultima.createdAt.getTime()) / 60_000 : Number.MAX_SAFE_INTEGER;
+    if (minSinPoll < TECHO_EXECUTING_MIN) return { action: 'executing' };
+    logger.warn('ensure-chain: run EXECUTING colgado, se cancela', {
+      botId, runId, minSinPoll: Math.round(minSinPoll),
+    });
+    try { await runs.cancel(runId!); } catch {}
+    // Cae al re-disparo de mas abajo.
+  }
 
   // Respect an intentional account-ban backoff (poll-visa scheduled a long DELAYED run).
   // Without this guard the guardian re-polls the banned account every ~10 min and defeats
@@ -88,8 +118,35 @@ async function ensureChainForBot(
   const ban = await getBanBackoff(botId);
   if (ban.banned) {
     // Live backoff run → leave it; it fires when the delay elapses (like EXECUTING).
+    //
+    // SALVO que el retraso ya se haya pasado de largo. Sin esa salida habia un abrazo
+    // mortal: `poll-cron` ve el run DELAYED y hace `continue` sin disparar nada
+    // (poll-cron.ts:55), el despertador de `poll-visa` vive DENTRO de un run que por eso
+    // nunca existe, y `ensure-chain` devolvia `cron_ok` sin mirar el reloj. Si el run
+    // DELAYED no se ejecutaba, ninguno de los tres creaba uno nuevo y el bot quedaba
+    // dormido para siempre.
+    //
+    // Casos reales del 2026-08-31: bots 240 (69 min) y 223 (64 min), los dos con
+    // `account_ban x1`, o sea 30 min de backoff. El correo del cron los reporto y
+    // hubo que despertarlos a mano.
+    //
+    // El umbral sale de `debeDespertar`, la misma funcion que usa el DEDUP FALLBACK de
+    // `poll-visa` y el verificador de `chain-health`. Una sola fuente para los tres.
     if (status === 'DELAYED' || status === 'QUEUED') {
-      return { action: 'cron_ok' };
+      const vencido = debeDespertar({
+        msSinPoll: ban.lastPollAgeMs,
+        bansSeguidos: ban.count,
+        blockCls: ban.blockCls,
+      });
+      if (!vencido) return { action: 'cron_ok' };
+
+      logger.warn('ensure-chain: CADENA DORMIDA — el retraso vencio y el run no arranco', {
+        botId, runId, status,
+        minSinPoll: Math.round(ban.lastPollAgeMs / 60_000),
+        backoffMin: Math.round(ban.backoffMs / 60_000),
+        bansSeguidos: ban.count,
+      });
+      // Cae a la cancelacion + re-disparo de mas abajo.
     }
     // Dead/null run: only resurrect once the intended backoff has actually elapsed.
     // (When the ban clears, the next probe recovers within one backoff window.)
@@ -105,8 +162,35 @@ async function ensureChainForBot(
   }
 
   // For cron bots, null activeRunId is normal (cleared between cron ticks).
-  // Only resurrect if no recent poll_log (cron should fire every 2 min, 5 min gap = something's wrong).
-  if (usesCron && !runId) {
+  // El bot escribe una fila cada HEARTBEAT_MS como MINIMO, no cada poll: el ahorro de
+  // escrituras de `poll-logging.ts` se salta los polls tranquilos. Un bot sano tiene su
+  // fila mas nueva con 5 a 9 min de antiguedad, entonces exigir menos de 5 min era pedir
+  // algo que casi nunca pasa.
+  //
+  // Efecto medido el 2026-08-31: 80 de los ultimos 100 `notify-user` de prod eran
+  // `chain_resurrected`, sobre 11 de los 12 bots. `ensure-chain` resucitaba TODA la flota
+  // en CADA corrida, y cada resurreccion disparaba un `poll-visa` que chocaba con el del
+  // cron; el dedup mataba a uno de los dos y el bot perdia el turno.
+  //
+  // La comprobacion vale para CUALQUIER bot sin run vivo, encadenado o no. Antes estaba
+  // detras de `usesCron = envs.length > 1`, o sea "corre en dev Y en prod". Los 12 bots
+  // de prod tienen `["prod"]`, largo 1, entonces nunca entraban aca. Medido el
+  // 2026-08-31: 80 de los ultimos 100 `notify-user` de prod eran `chain_resurrected`,
+  // sobre 11 de los 12 bots, 8 veces cada uno.
+  //
+  // Una fila reciente prueba que el bot esta polleando, y con eso no hay nada que
+  // resucitar. El caso de un backoff legitimo ya se resolvio mas arriba, en la rama de
+  // DELAYED, entonces llegar aca con actividad reciente significa bot vivo.
+  //
+  // La condicion mira el ESTADO del run, no si el id existe. `activeCloudRunId` casi
+  // siempre apunta a un run CANCELED: el dedup de `poll-visa` cancela el run anterior
+  // en cuanto llega el del cron siguiente, y eso pasa hasta en los bots sanos (medido el
+  // 2026-08-31: bots 242 y 185, sanos, con 11 de 11 runs CANCELED). Con `if (!runId)` el
+  // flujo saltaba esta comprobacion y caia derecho a resucitar. En este punto EXECUTING
+  // ya se descarto arriba, y DELAYED/QUEUED se manejan abajo, entonces lo que queda es
+  // un run terminal o inexistente: los dos significan "sin run vivo".
+  const sinRunVivo = !runId || (status !== 'DELAYED' && status !== 'QUEUED');
+  if (sinRunVivo) {
     const [recentLog] = await db.select({ createdAt: pollLogs.createdAt })
       .from(pollLogs)
       .where(eq(pollLogs.botId, botId))
@@ -115,8 +199,8 @@ async function ensureChainForBot(
 
     if (recentLog) {
       const minSince = (Date.now() - recentLog.createdAt.getTime()) / 60000;
-      if (minSince < 5) {
-        logger.info('ensure-chain: cron bot has recent poll, skipping', { botId, minSince: Math.round(minSince) });
+      if (minSince < SILENCIO_CRON_MIN) {
+        logger.info('ensure-chain: bot con poll reciente, no se resucita', { botId, minSince: Math.round(minSince) });
         return { action: 'cron_ok' };
       }
     }

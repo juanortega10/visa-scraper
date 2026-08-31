@@ -202,25 +202,97 @@ const scheduleProbeCache = new Map<string, { verdict: 'schedule_blocked' | 'acco
 /** Ventana de reuso del veredicto. Un bloqueo del portal no cambia en segundos. */
 const SCHEDULE_PROBE_TTL_MS = 5 * 60_000;
 
-export async function probeScheduleBlock(locale: string = 'es-co'): Promise<'schedule_blocked' | 'account_ban'> {
-  const cached = scheduleProbeCache.get(locale);
-  if (cached && Date.now() - cached.at < SCHEDULE_PROBE_TTL_MS) return cached.verdict;
-  const probeUrl = `https://ais.usvisa-info.com/${locale}/niv/users/sign_in`;
+/**
+ * Pausa antes de reintentar la ruta del schedule.
+ *
+ * Corta pero suficiente para separar un corte de red de un bloqueo por ruta, sin frenar
+ * la cadena: este camino solo se recorre cuando el poll ya fallo.
+ */
+const REINTENTO_SONDA_MS = 1_500;
+
+const PROBE_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+
+/** `true` si la URL contesta cualquier cosa; `false` si la conexion se cae (nginx 444, timeout). */
+async function responde(url: string): Promise<boolean> {
   try {
-    const r = await fetch(probeUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36' },
+    const r = await fetch(url, {
+      headers: { 'User-Agent': PROBE_UA },
       signal: AbortSignal.timeout(5_000),
       redirect: 'manual',
     });
-    // Any HTTP response (200, 302, 403, 404) means the domain is reachable → schedule path blocked
     void r.body?.cancel();
-    scheduleProbeCache.set(locale, { verdict: 'schedule_blocked', at: Date.now() });
-    return 'schedule_blocked';
+    return true;
   } catch {
-    // Domain itself is unreachable → true account/IP ban
-    scheduleProbeCache.set(locale, { verdict: 'account_ban', at: Date.now() });
-    return 'account_ban';
+    return false;
   }
+}
+
+/**
+ * Distingue un bloqueo de la ruta del schedule de un bloqueo de cuenta o IP.
+ *
+ * Se comparan DOS rutas, porque una sola no alcanza. Hasta el 2026-08-31 esta sonda
+ * pedia solo `/{locale}/niv/users/sign_in` y devolvia `schedule_blocked` ante cualquier
+ * respuesta HTTP. Esa pagina contesta 200 siempre (verificado en es-co, es-pe y es-mx),
+ * entonces el veredicto era `schedule_blocked` sin excepcion, y cargaba la curva larga
+ * de 240→720 min en vez de la de cuenta 30→480. Efecto medido: 9 bots `dev` callados
+ * entre 2 y 5 h el 2026-08-30, de a uno por hora, y la categoria `transient` (76 casos
+ * en dos dias) desaparecio.
+ *
+ * Con `scheduleId`, nginx 444 sobre la ruta del schedule corta la conexion y el fetch
+ * lanza, mientras `sign_in` sigue contestando. Esa asimetria es la unica evidencia real
+ * de un bloqueo por ruta:
+ *
+ *   schedule cae + sign_in contesta  -> `schedule_blocked` (curva larga, correcto)
+ *   schedule contesta                -> `account_ban` (la ruta esta sana, curva corta)
+ *   los dos caen                     -> `account_ban` (bloqueo de cuenta o IP)
+ *
+ * Sin `scheduleId` se mantiene el comportamiento viejo, para no cambiar en silencio a
+ * un llamador que no puede aportar la ruta.
+ *
+ * Usa fetch directo (sin proxy) para que el veredicto sea independiente del proveedor
+ * del bot, y corta a los 5 s para no frenar la cadena de polls.
+ */
+export async function probeScheduleBlock(
+  locale: string = 'es-co',
+  scheduleId?: string,
+): Promise<'schedule_blocked' | 'account_ban'> {
+  const clave = scheduleId ? `${locale}:${scheduleId}` : locale;
+  const cached = scheduleProbeCache.get(clave);
+  if (cached && Date.now() - cached.at < SCHEDULE_PROBE_TTL_MS) return cached.verdict;
+
+  const signInUrl = `https://ais.usvisa-info.com/${locale}/niv/users/sign_in`;
+  const scheduleUrl = scheduleId
+    ? `https://ais.usvisa-info.com/${locale}/niv/schedule/${scheduleId}`
+    : null;
+
+  const [dominioVivo, rutaPrimerIntento] = await Promise.all([
+    responde(signInUrl),
+    scheduleUrl ? responde(scheduleUrl) : Promise.resolve(false),
+  ]);
+
+  // Un nginx 444 sobre la ruta es persistente; un fallo de red es momentaneo. Antes de
+  // cargarle al bot la curva larga (240 a 720 min), se reintenta la ruta una vez.
+  //
+  // Caso real del 2026-08-31: el bot 299 quedo marcado `schedule_blocked` a las 09:40 UTC.
+  // Media hora despues la ruta respondia 302 tanto desde el RPi como desde afuera, o sea
+  // el fallo duro un instante y le costo 12 h de silencio.
+  const rutaViva = rutaPrimerIntento || (scheduleUrl !== null && dominioVivo
+    ? await new Promise<boolean>((r) => setTimeout(r, REINTENTO_SONDA_MS)).then(() => responde(scheduleUrl))
+    : false);
+
+  const verdict: 'schedule_blocked' | 'account_ban' =
+    !dominioVivo ? 'account_ban'
+    : scheduleUrl === null ? 'schedule_blocked'
+    : rutaViva ? 'account_ban'
+    : 'schedule_blocked';
+
+  scheduleProbeCache.set(clave, { verdict, at: Date.now() });
+  return verdict;
+}
+
+/** Solo para tests: limpia el cache de veredictos entre casos. */
+export function _limpiarCacheSonda(): void {
+  scheduleProbeCache.clear();
 }
 
 // ── Proxy Pool Manager ───────────────────────────────────────────────────────

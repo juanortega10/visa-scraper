@@ -325,3 +325,70 @@ describe('la matriz cubre de verdad los dos lados', () => {
 
 
 });
+
+/**
+ * Las dos medidas nuevas de la carrera por un cupo.
+ *
+ * El 31 de agosto de 2026, en Peru, 162 intentos en dos meses dieron 0 exitos y
+ * 134 murieron en `verification_failed`. Con lo que se guardaba entonces era
+ * imposible saber cual de las dos cosas pasaba: que el cupo no existiera, o que
+ * nos ganaran la carrera. `times_seen` separa esos dos casos y `ms_to_post` mide
+ * lo unico que compite.
+ */
+describe('medidas de la carrera: ms_to_post y times_seen', () => {
+  it('times_seen cuenta los horarios del PORTAL, no los especulativos', async () => {
+    // El portal no ofrece ni un horario. El bot tiene fallback especulativo, asi
+    // que igual va a postear, pero el registro debe decir 0: fecha fantasma.
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: [] }),
+      reschedule: vi.fn().mockResolvedValue(false),
+    });
+
+    await run({
+      client,
+      bot: bot({ speculativeTimeFallback: true, speculativeTimes: ['09:30'] } as never),
+      portalRemaining: null, maxReschedules: null,
+    }).catch(() => {});
+
+    const log = insertValues.find((v) => v.timesSeen !== undefined);
+    expect(log).toBeDefined();
+    expect(log!.timesSeen).toBe(0);
+  });
+
+  it('times_seen mayor que cero cuando el cupo si existia', async () => {
+    const client = makeClient({
+      getConsularTimes: vi.fn().mockResolvedValue({ available_times: ['09:00', '10:15', '11:30'] }),
+      reschedule: vi.fn().mockResolvedValue(false),
+    });
+
+    await run({ client, portalRemaining: null, maxReschedules: null }).catch(() => {});
+
+    const log = insertValues.find((v) => v.timesSeen !== undefined && v.timesSeen !== null);
+    expect(log!.timesSeen).toBe(3);
+  });
+
+  it('ms_to_post se registra y NO incluye la verificacion posterior', async () => {
+    // La verificacion corre despues del POST y ya no compite por el cupo. Si
+    // `ms_to_post` la incluyera, seria otra copia de `duration_ms` y no serviria
+    // para decidir si llegamos tarde.
+    const client = makeClient({ reschedule: vi.fn().mockResolvedValue(false) });
+
+    await run({ client, portalRemaining: null, maxReschedules: null }).catch(() => {});
+
+    const log = insertValues.find((v) => v.msToPost !== undefined && v.msToPost !== null);
+    expect(log).toBeDefined();
+    expect(typeof log!.msToPost).toBe('number');
+    expect(log!.msToPost).toBeLessThanOrEqual(log!.durationMs as number);
+  });
+
+  it('un EXITO tambien registra las dos medidas', async () => {
+    // Sin esto no hay con que comparar: se sabria como se ve perder y no como se
+    // ve ganar.
+    await run({ portalRemaining: null, maxReschedules: null });
+
+    const exito = insertValues.find((v) => v.success === true);
+    expect(exito).toBeDefined();
+    expect(exito!.msToPost).toEqual(expect.any(Number));
+    expect(exito!.timesSeen).toEqual(expect.any(Number));
+  });
+});

@@ -15,8 +15,17 @@ import { extractAppointments, extractGroups } from './html-parsers.js';
  * Se aplica con `AbortSignal.timeout()` por peticion, no en el agente, entonces el
  * login conserva su margen completo. El POST de reagendamiento NUNCA lleva techo:
  * abortarlo del lado del cliente deja la duda de si el portal ya lo proceso.
+ *
+ * CORREGIDO el 2026-08-30, mismo dia. La primera version puso 3.000 / 6.000 / 8.000 ms
+ * y eso fue apretar de mas: en las 9 h siguientes aparecieron 930 errores pegados a
+ * esos valores (713 en 3 s, 204 en 6 s, 13 en 8 s), contra 40 en las 24 h previas. Una
+ * peticion lenta pero viva quedaba convertida en error.
+ *
+ * El objetivo original ya no depende de estos numeros: `refreshTokens()` salio del
+ * camino critico con el precalentado, entonces el techo dejo de ser lo que evita los
+ * 12 s y paso a ser solo una red de seguridad. Como red, conviene floja.
  */
-export const TECHO_CARRERA_MS = 3_000;
+export const TECHO_CARRERA_MS = 6_000;
 
 /**
  * Techo de `times.json` y de las dos peticiones de CAS, en milisegundos.
@@ -31,16 +40,39 @@ export const TECHO_CARRERA_MS = 3_000;
  * Medido el 2026-08-30: con 3.000 ms el ensayo del sniper aborto en el primer
  * intento. Sigue muy por debajo de los 12.000 ms del agente.
  */
-export const TECHO_HORAS_MS = 8_000;
+export const TECHO_HORAS_MS = 10_000;
 
 /** Techo del GET de dias. Mas suelto: perder este tick cuesta un ciclo, no un cupo. */
-export const TECHO_DIAS_MS = 6_000;
+export const TECHO_DIAS_MS = 10_000;
 
 export class SessionExpiredError extends Error {
   constructor(detail?: string) {
     super(`Session expired${detail ? ` (${detail})` : ''}`);
     this.name = 'SessionExpiredError';
   }
+}
+
+/**
+ * El portal responde la pagina de appointment con 302 hacia el grupo del usuario.
+ *
+ * NO significa que la cita sea irreagendable. Medido el 2026-08-30: el 302 aparece
+ * cuando la sesion no tiene `authenticity_token`, y desaparece en cuanto un login
+ * devuelve `hasTokens: true`. La correlacion con la cita vencida era espuria.
+ *
+ * Evidencia (2026-08-31 01:23 UTC, misma flota, mismo minuto):
+ *   bots 66, 105, 114, 235 con `authenticity_token` presente  -> status `ok`
+ *   bots 94, 107, 219 con `authenticity_token` null           -> status `error`
+ * El bot 105 encadeno 14 `inline_relogin` hasta que uno trajo tokens, y volvio a `ok`.
+ *
+ * Por eso `assertOk` deja este caso como {@link SessionExpiredError}: el re-login
+ * inline de `poll-visa.ts` es lo que recupera al bot. Cortarlo deja al bot atascado.
+ * El costo del bucle (unos 5.600 polls por dia sobre 9 bots) se ataca haciendo que el
+ * login traiga tokens de forma confiable, nunca suprimiendo el re-login.
+ *
+ * Este predicado queda para identificar el patron en auditorias.
+ */
+export function esRedirectAlGrupo(label: string, status: number, location: string): boolean {
+  return label === 'Appointment page' && status === 302 && /\/niv\/groups\/\d+/.test(location);
 }
 
 export interface VisaSession {

@@ -80,6 +80,7 @@ export async function enrichBotVisaType(botId: number): Promise<boolean> {
           scheduleId: bot.scheduleId,
           applicantIds: bot.applicantIds,
           locale,
+          botId,
         });
         const r = await fetchEditHtml({ cookie: loginResult.cookie, scheduleId: bot.scheduleId, applicantId, locale });
         if (r.status === 200) parsed = extractVisaClassFromEditPage(r.html);

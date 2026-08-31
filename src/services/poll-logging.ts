@@ -64,4 +64,15 @@ export function shouldSkipHeartbeatPoll(
 export interface HeartbeatState {
   lastLoggedAt: Date | null;
   skipped: number;
+  /**
+   * Ultima vez que MIRAMOS el portal, aunque no se haya escrito fila.
+   *
+   * `lastLoggedAt` no sirve para medir ceguera: en regimen normal se saltan
+   * hasta el 94% de las filas, entonces usarlo diria que estuvimos ciegos
+   * minutos cuando polleamos cada 6 segundos. Este campo se actualiza en cada
+   * llamada a logPoll, se escriba o no. Se siembra con la ultima fila escrita,
+   * que en un hueco largo de verdad ES el ultimo poll, porque un poll bloqueado
+   * siempre escribe.
+   */
+  lastPolledAt: Date | null;
 }
