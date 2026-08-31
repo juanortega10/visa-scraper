@@ -444,6 +444,19 @@ function s0Token(): number | null {
 const ENSAYO_MS = 10 * 60_000;
 let ultimoEnsayoMs = 0;
 let ensayoEnVuelo = false;
+/**
+ * Cursor de rotacion de fechas del ensayo.
+ *
+ * Antes el ensayo preguntaba SIEMPRE por la fecha mas temprana. Esa fecha se queda
+ * quieta dias enteros, entonces 55 muestras dieron solo 4 fechas distintas, y de esas
+ * 33 salieron de mirar 2028-01-10 una tarde entera. Con tan pocas fechas no se puede
+ * elegir una hora especulativa: por primera hora vista, las 4 fechas dieron 4 horas
+ * distintas y ninguna se repitio. Ver [[horas-especulativas-contaminadas]].
+ *
+ * Rotando entre los dias que `days.json` ya ofrece, el mismo numero de peticiones
+ * cubre 12 fechas en vez de 1. No agrega ni una peticion: el ensayo ya corria.
+ */
+let cursorEnsayo = 0;
 
 /**
  * Corre el MISMO par de peticiones del camino critico contra una fecha que el portal
@@ -453,12 +466,18 @@ let ensayoEnVuelo = false;
  * Existe porque las detecciones reales son rarisimas: el bot 299 tuvo 2 en toda su
  * vida. Sin ensayo no habria con que comprobar que el camino critico mejoro.
  *
- * La fecha elegida es la MAS TEMPRANA que ofrece el portal, que hoy es 2028-01-10 y
- * esta lejisimos de la meta. Aunque el codigo se rompiera, esa fecha no pasa V2 ni V3.
+ * Las fechas que elige estan lejisimos de la meta (hoy el portal ofrece enero de 2028).
+ * Aunque el codigo se rompiera, ninguna pasa V2 ni V3, entonces el ensayo no puede
+ * disparar por accidente.
  */
 function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, msDias: number): void {
   if (ensayoEnVuelo || Date.now() - ultimoEnsayoMs < ENSAYO_MS) return;
-  const fecha = dias.map((d) => d.date).filter(Boolean).sort()[0];
+  // Rota entre TODAS las fechas ofrecidas, no siempre la primera. El orden queda fijo
+  // para que el cursor avance parejo aunque el portal reordene la respuesta.
+  const fechas = dias.map((d) => d.date).filter(Boolean).sort();
+  if (fechas.length === 0) return;
+  const fecha = fechas[cursorEnsayo % fechas.length]!;
+  cursorEnsayo = (cursorEnsayo + 1) % fechas.length;
   if (!fecha) return;
   ensayoEnVuelo = true;
   ultimoEnsayoMs = Date.now();
