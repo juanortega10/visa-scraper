@@ -102,6 +102,18 @@ export interface RescheduleAttempt {
   cause?: string;
   durationMs: number;
   timesFound?: string[];
+  /**
+   * Del candidato elegido al POST enviado. Es lo unico que compite en una
+   * carrera por un cupo: la verificacion posterior ya no. `durationMs` mezcla
+   * las tres cosas y por eso no sirve para decidir si llegamos tarde.
+   */
+  msToPost?: number;
+  /**
+   * Horarios que ofrecio el PORTAL para esa fecha, sin filtrar y sin contar los
+   * especulativos. 0 significa fecha fantasma: el calendario la lista y no tiene
+   * cupo real detras. Mayor que 0 significa que el cupo existia y nos ganaron.
+   */
+  timesSeen?: number;
 }
 
 export interface RescheduleParams {
@@ -115,7 +127,7 @@ export interface RescheduleParams {
   dryRun: boolean;
   maxAttempts?: number;
   pending: Promise<unknown>[];
-  loginCredentials?: { email: string; password: string; scheduleId: string; applicantIds: string[]; locale: string };
+  loginCredentials?: { email: string; password: string; scheduleId: string; applicantIds: string[]; locale: string; botId?: number };
   maxReschedules?: number | null;
   /** Saldo que reporta el PORTAL. Distinto de `maxReschedules`, que es nuestro presupuesto. */
   portalRemaining?: number | null;
@@ -179,14 +191,25 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
   const provider = client.getConfig().proxyProvider;
 
   /** Common diagnostic columns for every reschedule_logs insert. */
-  const diag = (attempt?: Pick<RescheduleAttempt, 'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound'>) => ({
+  /**
+   * `carrera` va aparte del intento fallido porque un EXITO tambien tiene que
+   * registrar cuanto tardo el POST. Sin eso no hay con que comparar: no se sabe
+   * como se ve ganar, solo como se ve perder.
+   */
+  const diag = (
+    attempt?: Pick<RescheduleAttempt, 'failStep' | 'failReason' | 'durationMs' | 'error' | 'cause' | 'timesFound' | 'msToPost' | 'timesSeen'>,
+    carrera?: { msToPost?: number; timesSeen?: number },
+  ) => ({
     runId: runId ?? null,
     provider,
     sessionAgeMs: sessionAgeMs ?? null,
+    ...(carrera ? { msToPost: carrera.msToPost ?? null, timesSeen: carrera.timesSeen ?? null } : {}),
     ...(attempt ? {
       failStep: attempt.failStep ?? null,
       failReason: attempt.failReason,
       durationMs: attempt.durationMs,
+      msToPost: attempt.msToPost ?? null,
+      timesSeen: attempt.timesSeen ?? null,
       detail: {
         ...(attempt.timesFound !== undefined ? { timesFound: attempt.timesFound } : {}),
         ...(attempt.cause ? { cause: attempt.cause } : {}),
@@ -442,7 +465,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
     if (!loginCredentials) return false;
     try {
       const { performLogin } = await import('./login.js');
-      const result = await performLogin(loginCredentials);
+      const result = await performLogin({ ...loginCredentials, botId });
       // ALWAYS call refreshTokens after re-login to prime server-side session state.
       // performLogin's appointment page GET uses redirect: 'follow' which doesn't reliably
       // set the applicant selection state. Without it, POST returns 302 → sign_in.
@@ -653,7 +676,12 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       // El refresco de tokens salio en paralelo con esta peticion. Aqui se cobra el
       // maximo de las dos, no la suma, y se aplica el override de `needsCas`.
       await esperarTokens();
-      const consularTimes = filterTimes(candidate.date, consularTimesData.available_times?.filter((t): t is string => !!t) ?? [], timeExclusions)
+      // Lo que ofrecio el portal, crudo. Se mide ANTES de filtrar y antes del
+      // fallback especulativo, porque `timesSeen` tiene que responder "habia cupo
+      // de verdad", no "que nos quedo despues de nuestros filtros".
+      const portalTimes = consularTimesData.available_times?.filter((t): t is string => !!t) ?? [];
+      const timesSeen = portalTimes.length;
+      const consularTimes = filterTimes(candidate.date, portalTimes, timeExclusions)
         .reverse(); // Try later times first — less competed than early morning slots
       logger.info('Consular times (reversed)', { botId, date: candidate.date, available: consularTimesData.available_times, afterFilter: consularTimes });
       let isSpeculative = false;
@@ -669,7 +697,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
       }
       if (consularTimes.length === 0) {
         logger.warn('No consular times, re-fetching days', { botId });
-        failedAttempts.push({ date: candidate.date, failReason: 'no_times', failStep: 'get_consular_times', timesFound: consularTimesData.available_times?.filter((t): t is string => !!t) ?? [], durationMs: Date.now() - attemptStart });
+        failedAttempts.push({ date: candidate.date, failReason: 'no_times', failStep: 'get_consular_times', timesFound: portalTimes, timesSeen, durationMs: Date.now() - attemptStart });
         dateFailureCount.set(candidate.date, (dateFailureCount.get(candidate.date) ?? 0) + 1);
         bumpTracker(candidate.date, 'consularNoTimes');
         exhaustedDates.add(candidate.date);
@@ -697,6 +725,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             speculative: isSpeculative,
           });
 
+          const postStart = Date.now();
+          const msToPost = postStart - attemptStart;
           let postSuccess = await client.reschedule(candidate.date, consularTime);
           postAttempted = true;
 
@@ -719,7 +749,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
           if (!postSuccess) {
             logger.warn('Reschedule POST returned false', { botId, date: candidate.date, consularTime });
-            const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+            const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, msToPost, timesSeen, durationMs: Date.now() - attemptStart };
             pending.push(
               db.insert(rescheduleLogs).values({
                 botId,
@@ -745,7 +775,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                 consularTime, prevDate: prevConsularDate,
               });
               verified = false;
-              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, msToPost, timesSeen, durationMs: Date.now() - attemptStart };
               pending.push(
                 db.insert(rescheduleLogs).values({
                   botId,
@@ -771,7 +801,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               });
               verified = false;
               await releaseSlot('verification_network_error_speculative');
-              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+              const fa: RescheduleAttempt = { date: candidate.date, consularTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, msToPost, timesSeen, durationMs: Date.now() - attemptStart };
               pending.push(
                 db.insert(rescheduleLogs).values({
                   botId,
@@ -810,7 +840,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               oldCasDate: prevCasDate, oldCasTime: prevCasTime,
               newConsularDate: candidate.date, newConsularTime: consularTime,
               success: true, error: strategyNote,
-              ...diag(),
+              ...diag(undefined, { msToPost, timesSeen }),
             }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
           );
 
@@ -999,6 +1029,8 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
           cas: `${casDate} ${casTime}`,
         });
 
+        const postStart = Date.now();
+        const msToPost = postStart - attemptStart;
         let postSuccess = await client.reschedule(candidate.date, consularTime, casDate, casTime);
         postAttempted = true;
 
@@ -1019,7 +1051,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
 
         if (!postSuccess) {
           logger.warn('Reschedule POST returned false', { botId, date: candidate.date, consularTime });
-          const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+          const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'post_failed', failStep: 'post_reschedule', timesFound: consularTimes, msToPost, timesSeen, durationMs: Date.now() - attemptStart };
           pending.push(
             db.insert(rescheduleLogs).values({
               botId,
@@ -1045,7 +1077,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
               consularTime, casDate, casTime, prevDate: prevConsularDate,
             });
             verified = false;
-            const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, durationMs: Date.now() - attemptStart };
+            const fa: RescheduleAttempt = { date: candidate.date, consularTime, casDate, casTime, failReason: 'verification_failed', failStep: 'post_reschedule', timesFound: consularTimes, msToPost, timesSeen, durationMs: Date.now() - attemptStart };
             pending.push(
               db.insert(rescheduleLogs).values({
                 botId,
@@ -1087,7 +1119,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
             newCasDate: casDate, newCasTime: casTime,
             success: true,
             error: strategyNote,
-            ...diag(),
+            ...diag(undefined, { msToPost, timesSeen }),
           }).catch((e) => logger.error('logReschedule failed', { error: String(e) })),
         );
 

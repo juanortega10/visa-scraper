@@ -97,6 +97,66 @@ export async function sendAgencyBatchSummaryEmail(
 }
 
 /**
+ * Alerta operativa: bots `active` que dejaron de pollear.
+ *
+ * Va al correo de admin, no al dueño del bot. Es una falla de la infraestructura,
+ * y el dueño no puede hacer nada con esa informacion.
+ */
+export interface CadenaDormidaAviso {
+  botId: number;
+  locale: string;
+  entornos: string[];
+  minSinPoll: number | null;
+  toleranciaMin: number;
+  bloqueo: string;
+  /** `true` si el cron ya la desperto en esta misma corrida. */
+  levantada?: boolean;
+}
+
+export async function sendCadenasDormidasEmail(
+  to: string,
+  filas: CadenaDormidaAviso[],
+): Promise<void> {
+  if (!to || filas.length === 0) return;
+  const celda = (v: string) => `<td style="padding:6px 12px;border-top:1px solid #e2e8f0">${v}</td>`;
+  const cuerpo = filas.map((f) => `<tr>
+      ${celda(`<strong>${f.botId}</strong>`)}
+      ${celda(f.locale)}
+      ${celda(f.entornos.join('+'))}
+      ${celda(f.minSinPoll === null ? 'nunca polleo' : `${f.minSinPoll} min`)}
+      ${celda(`${f.toleranciaMin} min`)}
+      ${celda(f.bloqueo)}
+      ${celda(f.levantada ? '<span style="color:#059669">levantada</span>' : '<span style="color:#b45309">revisar</span>')}
+    </tr>`).join('');
+  const html = `
+  <div style="font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;color:#0f172a">
+    <h2>Cadenas dormidas: ${filas.length}</h2>
+    <p style="color:#475569">
+      Estos bots figuran <code>active</code> y llevan mas tiempo sin pollear que el backoff
+      que les corresponde. El cron ya cancelo su run colgado y limpio <code>activeRunId</code>:
+      el proximo ciclo los toma en menos de 2 min. Las marcadas <strong>revisar</strong> son
+      las que no se pudieron levantar solas.
+    </p>
+    <table style="border-collapse:collapse;width:100%;font-size:14px">
+      <tr style="text-align:left;color:#64748b">
+        <th style="padding:6px 12px">bot</th><th style="padding:6px 12px">locale</th>
+        <th style="padding:6px 12px">entorno</th><th style="padding:6px 12px">sin pollear</th>
+        <th style="padding:6px 12px">tolerancia</th><th style="padding:6px 12px">bloqueo</th>
+        <th style="padding:6px 12px">accion</th>
+      </tr>
+      ${cuerpo}
+    </table>
+    <p style="margin-top:16px;color:#475569">
+      Para despertar uno: <code>npx tsx --env-file=.env scripts/wake-bot.ts &lt;id&gt; --commit</code>
+    </p>
+  </div>`;
+  const peor = filas[0]!;
+  const detalle = peor.minSinPoll === null ? 'uno nunca polleo' : `el peor lleva ${peor.minSinPoll} min`;
+  await sendEmail(0, 'cadenas_dormidas', to, `${filas.length} cadena(s) dormida(s) · ${detalle}`, html);
+}
+
+
+/**
  * Firma canónica para la función `send-cobro` de Kapso.
  *
  * Kapso BORRA todos los headers personalizados antes de invocar el worker, así que `X-Signature`

@@ -199,6 +199,44 @@ export function veredictoToken(
   return 'ok';
 }
 
+// ── Cadencia degradada ───────────────────────────────────────────────────────
+
+/**
+ * Minutos minimos entre disparos segun la racha de errores seguidos.
+ *
+ * NUNCA pausa. Devuelve un espaciado, no un sueno: el proceso sigue despertando en los
+ * segundos 14 y 18 de cada minuto, y solo se saltea disparos. La fase contra la ventana
+ * de liberacion se conserva intacta, que es lo que no se puede perder.
+ *
+ * Por que existe. El 2026-08-31 el sniper acumulo 41 errores seguidos con TODAS las IPs
+ * de webshare rebotando `embassy_block` en la ruta del schedule 75610929. Sin pausa
+ * reintentaba 4 IPs por vuelta contra una ruta cerrada, y cada fallo penaliza esa IP en
+ * el circuit breaker. Esa presion alarga el bloqueo en vez de dejarlo expirar.
+ *
+ * La curva sube despacio y tiene techo: con 30 errores o mas queda 1 disparo cada 10
+ * minutos, que sigue siendo 6 por hora dentro de la ventana. Al primer poll sano vuelve
+ * a 0 y recupera los 2 disparos por minuto en el acto.
+ */
+export function minutosEntreDisparos(erroresSeguidos: number): number {
+  if (erroresSeguidos <= 0) return 0;
+  if (erroresSeguidos < 5) return 1;
+  if (erroresSeguidos < 15) return 2;
+  if (erroresSeguidos < 30) return 5;
+  return 10;
+}
+
+/**
+ * True si toca disparar en este tick.
+ *
+ * `ultimoDisparoMs` es cuando salio el ultimo intento real. Con la racha en cero
+ * siempre devuelve true, entonces la cadencia normal no cambia en nada.
+ */
+export function tocaDisparar(erroresSeguidos: number, ultimoDisparoMs: number, ahoraMs: number): boolean {
+  const min = minutosEntreDisparos(erroresSeguidos);
+  if (min === 0) return true;
+  return ahoraMs - ultimoDisparoMs >= min * 60_000;
+}
+
 // ── Fase del minuto ──────────────────────────────────────────────────────────
 
 /** Ventana medida para es-pe con `scripts/analyze-release-clock.ts` el 2026-08-27. */

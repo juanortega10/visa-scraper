@@ -25,8 +25,15 @@ const RETENTION: { table: string; column: string; days: number }[] = [
   // /trends y dashboard hours=168), asi que 10 deja 3 dias de margen. Bajar a 7 dejaria
   // esas vistas justo en el borde.
   { table: 'poll_logs', column: 'created_at', days: 10 },
+  // El resumen por hora es chico y es la fuente del panel, entonces se guarda
+  // un ano: 40 bots activos dan unas 350 mil filas, unos pocos MB.
+  { table: 'bot_hourly', column: 'hour', days: 365 },
   { table: 'cas_prefetch_logs', column: 'created_at', days: 30 },
-  { table: 'auth_logs', column: 'created_at', days: 90 },
+  // 30 dias, antes 90. La tabla llego a 434 MB porque guardaba telemetria por
+  // poll: `token_fetch_failed` e `inline_relogin` eran el 93% de las filas y ya
+  // no se escriben (ver auth-logger.ts). Lo que queda son logins de verdad,
+  // unos pocos cientos al mes, y 30 dias cubre cualquier revision de soporte.
+  { table: 'auth_logs', column: 'created_at', days: 30 },
   // Analytics tables — small but bounded so they don't creep up over time.
   { table: 'date_sightings', column: 'appeared_at', days: 180 },
   { table: 'bookable_events', column: 'detected_at', days: 180 },

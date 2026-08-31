@@ -357,7 +357,7 @@ export const pollVisaTask = task({
     // Mutable per-run heartbeat state: logPoll skips quiet polls and counts them in `skipped`,
     // updating `lastLoggedAt` on each write. `skipped` is seeded from / persisted to the bot row
     // so the count carries across runs (handles batch bursts AND cron 1-poll/run exactly).
-    const hb: HeartbeatState = { lastLoggedAt: rateQuery[0]?.createdAt ?? null, skipped: bot.skippedPollsSinceLog ?? 0 };
+    const hb: HeartbeatState = { lastLoggedAt: rateQuery[0]?.createdAt ?? null, lastPolledAt: rateQuery[0]?.createdAt ?? null, skipped: bot.skippedPollsSinceLog ?? 0 };
     if (rateQuery.length >= 2) {
       const newest = rateQuery[0]!.createdAt.getTime();
       const oldest = rateQuery[rateQuery.length - 1]!.createdAt.getTime();
@@ -397,6 +397,7 @@ export const pollVisaTask = task({
           scheduleId: bot.scheduleId,
           applicantIds: bot.applicantIds,
           locale: bot.locale ?? 'es-co',
+          botId,
         };
         const loginResult = await performLogin(creds);
 
@@ -1508,6 +1509,7 @@ export const pollVisaTask = task({
             scheduleId: bot.scheduleId,
             applicantIds: bot.applicantIds,
             locale: bot.locale ?? 'es-co',
+            botId,
           };
           const loginResult = await performLogin(creds);
           logger.info(`Inline re-login OK — cookie=${loginResult.cookie.length}chars hasTokens=${loginResult.hasTokens}`, { botId });
@@ -1629,7 +1631,7 @@ export const pollVisaTask = task({
       // (caso real: bot 299, schedule 75610929, 2026-08-27). La sonda tiene cache de
       // 5 min por locale, entonces repetirla no agrega peticiones notables.
       if (tcpBlock && (capturedConnInfo?.blockClassification === 'account_ban')) {
-        const refined = await probeScheduleBlock(bot.locale ?? 'es-co');
+        const refined = await probeScheduleBlock(bot.locale ?? 'es-co', bot.scheduleId);
         if (refined === 'schedule_blocked' && capturedConnInfo) {
           capturedConnInfo.blockClassification = 'schedule_blocked';
           logger.warn('Schedule-level URL block detected — nginx 444 on schedule path, not account ban', {
@@ -1810,7 +1812,9 @@ export const pollVisaTask = task({
       // counters at 0 → backoff was stuck at the lowest tier and never escalated (30m/120m/240m).
       if (tcpBlockNotified) {
         const recentForBackoff = await db
-          .select({ status: pollLogs.status, blockCls: sql<string>`${pollLogs.connectionInfo}->>'blockClassification'` })
+          // `createdAt` hace falta: `countSustainedAccountBans` corta la racha cuando dos
+          // bloqueos quedan separados por mas que el backoff que se programo.
+          .select({ status: pollLogs.status, createdAt: pollLogs.createdAt, blockCls: sql<string>`${pollLogs.connectionInfo}->>'blockClassification'` })
           .from(pollLogs)
           .where(eq(pollLogs.botId, botId))
           .orderBy(desc(pollLogs.createdAt))
@@ -1985,6 +1989,10 @@ function logPoll(
   heartbeat?: HeartbeatState,
 ): void {
   const now = Date.now();
+  // Ceguera: distancia al poll anterior. Se mide siempre, incluso cuando la fila
+  // no se escribe, para que el marcador no dependa del ahorro de escrituras.
+  const blindMs = heartbeat?.lastPolledAt ? now - heartbeat.lastPolledAt.getTime() : null;
+  if (heartbeat) heartbeat.lastPolledAt = new Date(now);
   if (
     heartbeat &&
     shouldSkipHeartbeatPoll(
@@ -2035,6 +2043,7 @@ function logPoll(
       banPhase: extra?.banPhase ?? null,
       connectionInfo: extra?.connectionInfo ?? null,
       pollsSincePrev,
+      blindMs,
     }).catch((e) => logger.error('logPoll failed', { error: String(e) })),
   );
 }

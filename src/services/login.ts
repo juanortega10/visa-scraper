@@ -22,6 +22,12 @@ export interface LoginCredentials {
   scheduleId: string;
   applicantIds: string[];
   locale?: string;
+  /**
+   * Solo para `auth_logs`. Sin esto las filas `token_fetch_failed` salen con
+   * `bot_id = null` y no hay forma de saber a que bot pertenece cada fallo: el
+   * 2026-08-31 habia 1.648 filas en 6 h, todas sin dueño.
+   */
+  botId?: number;
 }
 
 export interface LoginResult extends VisaSession {
@@ -227,7 +233,7 @@ export async function pureFetchLogin(
     const cause = fetchErr instanceof Error && fetchErr.cause ? String(fetchErr.cause) : undefined;
     const detail = `fetch_error: ${errMsg}${cause ? ` cause=${cause}` : ''}`;
     console.warn(`[login] Appointment page fetch FAILED: ${detail}`);
-    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail, botId: creds.botId });
     return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
   }
 
@@ -236,7 +242,7 @@ export async function pureFetchLogin(
     const bodyPreview = await tokenResp.text().catch(() => '(unreadable)');
     const detail = `http_${tokenResp.status} location=${location} body=${bodyPreview.substring(0, 200)}`;
     console.warn(`[login] Appointment page returned HTTP ${tokenResp.status}, location=${location}, body=${bodyPreview.substring(0, 300)}`);
-    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail, botId: creds.botId });
     return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
   }
 
@@ -250,7 +256,7 @@ export async function pureFetchLogin(
     const titleMatch = apptHtml.match(/<title>([^<]*)<\/title>/);
     const detail = `parse_failed: htmlLen=${apptHtml.length} hasForm=${hasForm} cloudflare=${hasCloudflare} title="${titleMatch?.[1] ?? '(none)'}"`
     console.warn(`[login] Could not extract tokens from appointment page — ${detail}`);
-    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail });
+    logAuth({ email: creds.email, action: 'token_fetch_failed', locale, result: 'error', errorMessage: detail, botId: creds.botId });
     return { cookie, csrfToken: '', authenticityToken: '', hasTokens: false };
   }
 

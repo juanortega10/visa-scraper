@@ -195,6 +195,7 @@ export async function prefetchForBot(bot: PrefetchBot): Promise<PrefetchResult> 
         scheduleId: bot.scheduleId,
         applicantIds: bot.applicantIds,
         locale: bot.locale ?? 'es-co',
+        botId,
       };
       const loginResult = await performLogin(creds);
       cookie = loginResult.cookie;

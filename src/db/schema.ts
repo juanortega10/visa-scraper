@@ -269,6 +269,10 @@ export const pollLogs = pgTable(
     dateChanges: jsonb('date_changes').$type<{ appeared: string[], disappeared: string[] }>(),
     error: text('error'),
     banPhase: varchar('ban_phase', { length: 15 }), // null=normal, 'trigger'=first block, 'sustained'=during ban, 'recovery'=first ok post-ban
+    // Milisegundos desde el poll anterior de ESTE bot. Antes se calculaba con una
+    // funcion de ventana sobre toda la tabla cada vez que alguien preguntaba
+    // "cuanto tiempo estuvo ciego". Guardarlo lo vuelve una suma.
+    blindMs: integer('blind_ms'),
     connectionInfo: jsonb('connection_info').$type<{
       proxyAttemptIp?: string | null;  // webshare IP tried before fallback (lost if lastProxyIp reset)
       fallbackHappened?: boolean;      // webshare TCP fail → direct fallback
@@ -325,6 +329,14 @@ export const rescheduleLogs = pgTable(
     failStep: varchar('fail_step', { length: 50 }),
     failReason: varchar('fail_reason', { length: 50 }),
     durationMs: integer('duration_ms'),
+    // El numero que decide una carrera por un cupo: del candidato elegido al POST
+    // enviado. `durationMs` no sirve para eso porque mezcla los fetch previos, el
+    // POST y la verificacion posterior, y la verificacion ya no compite.
+    msToPost: integer('ms_to_post'),
+    // Cuantos horarios ofrecio el portal para esa fecha. Separa las dos causas que
+    // hoy se ven iguales: 0 = fecha fantasma (el calendario la lista sin cupo
+    // real), mayor que 0 = nos ganaron la carrera.
+    timesSeen: integer('times_seen'),
     detail: jsonb('detail').$type<Record<string, unknown>>(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
@@ -661,6 +673,74 @@ export const sniperScans = pgTable(
   },
   (table) => [index('sniper_scans_key_at_idx').on(table.scanKey, table.scannedAt)],
 );
+
+/**
+ * Resumen por bot y por hora. UNA fila por bot por hora.
+ *
+ * Existe para que el panel deje de escanear `poll_logs`. En agosto de 2026 esos
+ * escaneos secuenciales costaron 77,73 USD de compute en Neon. Con 40 bots
+ * activos esta tabla crece 960 filas al dia, o sea unos pocos MB al ano.
+ *
+ * La llena `rollup-hourly` una vez por hora, leyendo la hora recien cerrada por
+ * el indice `poll_logs_bot_created_idx`. No agrega ni una escritura al camino
+ * caliente del polleo.
+ */
+export const botHourly = pgTable(
+  'bot_hourly',
+  {
+    id: serial('id').primaryKey(),
+    botId: integer('bot_id').notNull(),
+    /** Inicio de la hora, en UTC. */
+    hour: timestamp('hour').notNull(),
+
+    // ── Cobertura ──────────────────────────────────────────────────────────
+    /** Filas de poll_logs en la hora. */
+    pollRows: integer('poll_rows').notNull().default(0),
+    /** Polls reales que esas filas representan (poll_logs.polls_since_prev). */
+    polls: integer('polls').notNull().default(0),
+    /** Milisegundos sin mirar el portal. Suma de blind_ms. */
+    blindMs: integer('blind_ms').notNull().default(0),
+    /** Polls que terminaron en tcp_blocked. */
+    blocked: integer('blocked').notNull().default(0),
+    /** Polls que terminaron en error. */
+    errors: integer('errors').notNull().default(0),
+    /**
+     * Relogins en linea. Vivian en `auth_logs` como 706.551 filas sueltas; aca
+     * son un entero por hora. Un relogin implica que fallo el fetch de tokens,
+     * asi que este contador tambien cubre lo que registraba `token_fetch_failed`.
+     */
+    relogins: integer('relogins').notNull().default(0),
+
+    // ── Oportunidad ────────────────────────────────────────────────────────
+    /** Cupos vistos por este bot que servian para su propia meta. */
+    sightings: integer('sightings').notNull().default(0),
+    /**
+     * Cupos que un bot hermano del mismo consulado vio mientras este estaba
+     * ciego. Es la unica medida de lo que perdemos por no estar mirando, y no
+     * cuesta un solo poll extra: sale de cruzar lo que ya guardamos.
+     */
+    missedWhileBlind: integer('missed_while_blind').notNull().default(0),
+
+    // ── Conversion ─────────────────────────────────────────────────────────
+    attempts: integer('attempts').notNull().default(0),
+    wins: integer('wins').notNull().default(0),
+    /** Mediana de ms_to_post en la hora. El numero de la carrera. */
+    p50MsToPost: integer('p50_ms_to_post'),
+    /** Intentos que murieron con el portal ofreciendo 0 horarios: fecha fantasma. */
+    phantomDates: integer('phantom_dates').notNull().default(0),
+
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (table) => [
+    // Una sola fila por bot y hora. El rollup hace upsert contra esta llave, asi
+    // que correrlo dos veces sobre la misma hora no duplica ni suma de mas.
+    uniqueIndex('bot_hourly_bot_hour_idx').on(table.botId, table.hour),
+    index('bot_hourly_hour_idx').on(table.hour),
+  ],
+);
+
+export type BotHourly = typeof botHourly.$inferSelect;
+export type NewBotHourly = typeof botHourly.$inferInsert;
 
 export type BanEpisode = typeof banEpisodes.$inferSelect;
 export type Agency = typeof agencies.$inferSelect;
