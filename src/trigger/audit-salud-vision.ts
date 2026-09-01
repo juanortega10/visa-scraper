@@ -75,23 +75,37 @@ export async function leerEstadoVision(): Promise<EstadoVision> {
   }));
 
   const sql = await invocar(FN_SQL, {
-    sql: [{
-      query:
-        'SELECT COUNT(*) total, SUM(CASE WHEN media_url IS NOT NULL AND media_url != \'\' THEN 1 ELSE 0 END) con_url, ' +
-        "MIN(created_at) mas_viejo FROM image_reads WHERE pending = 1",
-      params: [],
-    }],
+    sql: [
+      {
+        query:
+          'SELECT COUNT(*) total, SUM(CASE WHEN media_url IS NOT NULL AND media_url != \'\' THEN 1 ELSE 0 END) con_url, ' +
+          "MIN(created_at) mas_viejo FROM image_reads WHERE pending = 1",
+        params: [],
+      },
+      {
+        // Lecturas logradas, por cualquier camino: el gateway o el agente nativo.
+        query: "SELECT COUNT(*) n FROM image_reads WHERE pending = 0 AND created_at > datetime('now','-24 hours')",
+        params: [],
+      },
+    ],
   });
-  const r = (sql?.data?.sql_results ?? sql?.data?.data?.sql_results ?? [])[0];
+  const res = sql?.data?.sql_results ?? sql?.data?.data?.sql_results ?? [];
+  const r = res[0];
+  const rl = res[1];
   if (!r || (r.ok === false && r.error)) {
     throw new Error(`la consulta de pendientes fallo: ${String(r?.error ?? 'sin sql_results')}`);
   }
+  if (!rl || (rl.ok === false && rl.error)) {
+    throw new Error(`la consulta de lecturas fallo: ${String(rl?.error ?? 'sin sql_results')}`);
+  }
   const fila = (r.results ?? r.rows ?? [])[0] ?? {};
+  const lecturas24h = Number(((rl.results ?? rl.rows ?? [])[0] ?? {}).n ?? 0);
   const total = Number(fila.total ?? 0);
   const masViejo = fila.mas_viejo ? Date.parse(String(fila.mas_viejo).replace(' ', 'T') + 'Z') : NaN;
 
   return {
     proveedores,
+    lecturas24h,
     pendientes: {
       total,
       conUrl: Number(fila.con_url ?? 0),

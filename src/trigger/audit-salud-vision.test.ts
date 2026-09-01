@@ -31,7 +31,10 @@ const SALUD_OK = { data: { ok: true, salud: true, configurados: 2, proveedores: 
   { nombre: 'openrouter', ok: true, detalle: 'responde' },
   { nombre: 'vercel-gateway', ok: true, detalle: 'responde' },
 ] } };
-const SIN_PENDIENTES = { data: { sql_results: [{ ok: true, results: [{ total: 0, con_url: 0, mas_viejo: null }] }] } };
+const SIN_PENDIENTES = { data: { sql_results: [
+  { ok: true, results: [{ total: 0, con_url: 0, mas_viejo: null }] },
+  { ok: true, results: [{ n: 9 }] },
+] } };
 
 /** Responde segun a que funcion de Kapso le pegue la llamada. */
 function ruta(salud: unknown, sqlRes: unknown, init: Record<string, any> = {}) {
@@ -50,6 +53,8 @@ describe('sonda de vision', () => {
     vi.stubGlobal('fetch', ruta(SALUD_OK, SIN_PENDIENTES));
     const r = await correrAuditSaludVision();
     expect(r).toMatchObject({ alerta: false, arriba: 2, telegram: false });
+    // El conteo de lecturas tiene que llegar de la segunda consulta, no inventado.
+    expect((await leerEstadoVision()).lecturas24h).toBe(9);
     expect(enviados).toHaveLength(0);
   });
 
@@ -85,18 +90,37 @@ describe('sonda de vision', () => {
     await expect(leerEstadoVision()).rejects.toThrow(/sin sql_results/);
   });
 
+  it('si falta el segundo resultado (lecturas) revienta', () => {
+    // Sin ese conteo no se distingue "el gateway es redundante" de "nadie leyo nada".
+    vi.stubGlobal('fetch', ruta(SALUD_OK, { data: { sql_results: [{ ok: true, results: [{ total: 0 }] }] } }));
+    return expect(leerEstadoVision()).rejects.toThrow(/lecturas/);
+  });
+
   it('el proveedor caido dispara Telegram con su HTTP', async () => {
     const caido = { data: { proveedores: [{ nombre: 'vercel-gateway', ok: false, detalle: 'HTTP 402 insufficient_funds' }] } };
-    vi.stubGlobal('fetch', ruta(caido, SIN_PENDIENTES));
+    const sinLecturas = { data: { sql_results: [
+      { ok: true, results: [{ total: 0, con_url: 0, mas_viejo: null }] },
+      { ok: true, results: [{ n: 0 }] },
+    ] } };
+    vi.stubGlobal('fetch', ruta(caido, sinLecturas));
     const r = await correrAuditSaludVision();
     expect(r).toMatchObject({ alerta: true, severidad: 'critico', telegram: true });
     expect(enviados[0]).toContain('402');
   });
 
-  it('lista vacia de proveedores es alerta, no silencio', async () => {
-    vi.stubGlobal('fetch', ruta({ data: { proveedores: [] } }, SIN_PENDIENTES));
+  it('lista vacia de proveedores, sin lecturas, es alerta y no silencio', async () => {
+    const sinLecturas = { data: { sql_results: [
+      { ok: true, results: [{ total: 0, con_url: 0, mas_viejo: null }] },
+      { ok: true, results: [{ n: 0 }] },
+    ] } };
+    vi.stubGlobal('fetch', ruta({ data: { proveedores: [] } }, sinLecturas));
     const r = await correrAuditSaludVision();
     expect(r).toMatchObject({ alerta: true, severidad: 'critico' });
+  });
+
+  it('lista vacia de proveedores CON lecturas no alerta: otro camino lee', async () => {
+    vi.stubGlobal('fetch', ruta({ data: { proveedores: [] } }, SIN_PENDIENTES));
+    expect((await correrAuditSaludVision()).alerta).toBe(false);
   });
 
   it('`ok` que no es exactamente true cuenta como caido', async () => {
@@ -107,7 +131,10 @@ describe('sonda de vision', () => {
 
   it('la antiguedad del pendiente se calcula en horas desde UTC', async () => {
     const hace30h = new Date(Date.now() - 30 * 3_600_000).toISOString().slice(0, 19).replace('T', ' ');
-    const sql = { data: { sql_results: [{ ok: true, results: [{ total: 3, con_url: 2, mas_viejo: hace30h }] }] } };
+    const sql = { data: { sql_results: [
+      { ok: true, results: [{ total: 3, con_url: 2, mas_viejo: hace30h }] },
+      { ok: true, results: [{ n: 0 }] },
+    ] } };
     vi.stubGlobal('fetch', ruta(SALUD_OK, sql));
     const e = await leerEstadoVision();
     expect(e.pendientes.masViejoHoras).toBeGreaterThanOrEqual(29);

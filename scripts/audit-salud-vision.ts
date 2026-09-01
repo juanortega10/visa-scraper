@@ -18,7 +18,8 @@ for (const p of estado.proveedores) {
   console.log(`  ${p.ok ? 'OK   ' : 'CAIDO'} ${p.nombre.padEnd(18)} ${p.detalle.slice(0, 90)}`);
 }
 if (estado.proveedores.length === 0) console.log('  (la sonda no devolvio ningun proveedor configurado)');
-console.log(`\n  pendientes: ${estado.pendientes.total} · ${estado.pendientes.conUrl} reintentables · el mas viejo ${estado.pendientes.masViejoHoras} h`);
+console.log(`\n  lecturas en 24 h: ${estado.lecturas24h}  (cualquier camino: gateway o agente nativo)`);
+console.log(`  pendientes: ${estado.pendientes.total} · ${estado.pendientes.conUrl} reintentables · el mas viejo ${estado.pendientes.masViejoHoras} h`);
 console.log(`\n  veredicto: ${v.severidad} · ${v.motivo}\n`);
 
 if (process.argv.includes('--avisar') && v.alerta) {
