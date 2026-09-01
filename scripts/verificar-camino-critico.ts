@@ -201,25 +201,32 @@ async function main() {
            (SELECT max(p.created_at) FROM poll_logs p
              WHERE p.bot_id = s.bot_id
                AND p.created_at > now() - interval '3 hours'
-               AND p.status IN ('ok', 'filtered_out')) AS ultimo_poll_sano
+               AND p.status IN ('ok', 'filtered_out')) AS ultimo_poll_sano,
+           (SELECT p.status FROM poll_logs p
+             WHERE p.bot_id = s.bot_id
+             ORDER BY p.created_at DESC LIMIT 1) AS estado_ultimo_poll
     FROM sessions s JOIN bots b ON b.id = s.bot_id
     WHERE b.locale = 'es-pe' AND b.status = 'active'
-  `)).rows as Array<{ bot_id: number; tokens_refreshed_at: Date | null; ultimo_poll_sano: Date | null }>;
+  `)).rows as Array<{
+    bot_id: number; tokens_refreshed_at: Date | null;
+    ultimo_poll_sano: Date | null; estado_ultimo_poll: string | null;
+  }>;
   const sello = evaluarSellos(sellos.map((r) => ({
     botId: Number(r.bot_id),
     selloMs: r.tokens_refreshed_at ? new Date(r.tokens_refreshed_at).getTime() : null,
     ultimoPollSanoMs: r.ultimo_poll_sano ? new Date(r.ultimo_poll_sano).getTime() : null,
+    ultimoPollEsSano: r.estado_ultimo_poll === 'ok' || r.estado_ultimo_poll === 'filtered_out',
   })));
   const { activos, frescos, dormidos, sinSello } = sello;
   V({
     id: 'V7', que: 'un bot que pollea mantiene su token caliente',
     ok: activos > 0 && frescos === activos,
     medido: `${frescos}/${activos} bots con el sello fresco al momento de pollear` +
-      (dormidos > 0 ? ` · ${dormidos} sin pollear en 3 h, no se les exige` : ''),
+      (dormidos > 0 ? ` · ${dormidos} bloqueados o dormidos, no se les exige` : ''),
     umbral: 'todos los que pollean', base: 'la columna no existia', n: activos, muestraMin: 1,
     nota: sinSello.length > 0
       ? `bots polleando SIN sello: ${sinSello.join(', ')} — poll-visa no esta escribiendo`
-      : (activos === 0 ? 'ningun bot es-pe polleo en las ultimas 3 h' : undefined),
+      : (activos === 0 ? 'ningun bot es-pe tiene su ultimo poll sano: todos bloqueados o dormidos' : undefined),
   });
 
   // ── V8 · fase del tick contra la ventana de liberacion ──────────────────────
