@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+/** `vi.fn()` sin firma tipa `mock.calls` como `[][]`. Se castea una sola vez, aqui. */
+const llamada = (f: { mock: { calls: unknown[][] } }, i = 0): any[] => (f.mock.calls as any[][])[i]!;
+
 /**
  * Tests del reloj del nudge rápido.
  *
@@ -59,7 +62,9 @@ describe('nudge rápido', () => {
     const f = vi.fn(async () => responder({ data: OK }));
     vi.stubGlobal('fetch', f);
     await correrNudgeRapido();
-    const body = JSON.parse((f.mock.calls[0][1] as any).body);
+    // `!` en las dos posiciones: `mock.calls` es `unknown[][]` y TS no sabe que la
+    // llamada existe. El `expect` de arriba ya la garantiza.
+    const body = JSON.parse((llamada(f)[1]).body);
     expect(body.live).toBe(true);
     expect(body.max_por_corrida).toBeGreaterThan(0);
   });

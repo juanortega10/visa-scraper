@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+/** `vi.fn()` sin firma tipa `mock.calls` como `[][]`. Se castea una sola vez, aqui. */
+const llamada = (f: { mock: { calls: unknown[][] } }, i = 0): any[] => (f.mock.calls as any[][])[i]!;
+
 /**
  * Tests del reloj del reporte diario.
  *
@@ -51,10 +54,10 @@ describe('reporte a Telegram', () => {
     const f = vi.fn(async () => responder({ enviado: true }));
     vi.stubGlobal('fetch', f);
     await correrReporteTelegram();
-    const opts = f.mock.calls[0][1] as any;
+    const opts = llamada(f)[1];
     expect(opts.headers.Authorization).toBe('Bearer test-secret');
     expect(opts.redirect).toBe('error');
-    expect(String(f.mock.calls[0][0])).toContain('www.visagente.com');
+    expect(String(llamada(f)[0])).toContain('www.visagente.com');
   });
 
   it('ya_salio_hoy es un no-op legítimo, no un fallo', async () => {
