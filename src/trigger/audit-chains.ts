@@ -18,7 +18,7 @@ import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { bots } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
-import { evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, type EntradaCadena } from '../services/chain-health.js';
+import { evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, cadenasGestionadasAparte, type EntradaCadena } from '../services/chain-health.js';
 import { sendCadenasDormidasEmail } from '../services/notifications.js';
 import type { RecentBlockRow } from '../services/scheduling.js';
 
@@ -84,6 +84,7 @@ export const auditChainsSchedule = schedules.task({
     const evaluadas = mias.map((c) => evaluarCadena(c, Date.now()));
     const malas = cadenasConProblema(evaluadas);
     const enBackoff = cadenasEnBackoffLargo(evaluadas);
+    const aparte = cadenasGestionadasAparte(evaluadas);
 
     // El backoff largo no pide despertar nada, y aun asi son bots sin servicio.
     // Se deja en el log para que quede el rastro sin mandar correo por eso.
@@ -100,7 +101,7 @@ export const auditChainsSchedule = schedules.task({
       // "corre la version con auto-levantado y no hubo nada que hacer" de "corre una
       // version vieja que no sabe levantar". Ese hueco aparecio al revisar el cron el
       // 2026-08-31: los runs salian sin el campo y no habia forma de saber cual era.
-      return { entorno, revisadas: mias.length, dormidas: 0, levantadas: 0, backoffLargo: enBackoff.length };
+      return { entorno, revisadas: mias.length, dormidas: 0, levantadas: 0, backoffLargo: enBackoff.length, gestionadosAparte: aparte.length };
     }
 
     logger.error('audit-chains: CADENAS DORMIDAS', {
@@ -150,6 +151,6 @@ export const auditChainsSchedule = schedules.task({
       }))).catch((e) => logger.error('audit-chains: fallo el correo', { error: String(e) }));
     }
 
-    return { entorno, revisadas: mias.length, dormidas: malas.length, levantadas: levantados.length, backoffLargo: enBackoff.length };
+    return { entorno, revisadas: mias.length, dormidas: malas.length, levantadas: levantados.length, backoffLargo: enBackoff.length, gestionadosAparte: aparte.length };
   },
 });

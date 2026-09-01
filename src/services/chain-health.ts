@@ -40,7 +40,7 @@ export const GRACIA_ARRANQUE_MS = 30 * 60_000;
  */
 export const BACKOFF_LARGO_MS = 120 * 60_000;
 
-export type Veredicto = 'ok' | 'dormida' | 'nunca_polleo' | 'backoff_largo';
+export type Veredicto = 'ok' | 'dormida' | 'nunca_polleo' | 'backoff_largo' | 'gestionado_aparte';
 
 export interface EntradaCadena {
   botId: number;
@@ -78,6 +78,24 @@ export function evaluarCadena(entrada: EntradaCadena, ahora: number): ResultadoC
   const base = {
     botId, locale, status, entornos, bansSeguidos, blockCls,
   };
+
+  // `pollEnvironments` vacio significa que ningun cron de Trigger.dev toma este bot:
+  // el de cloud pide 'prod' y el del RPi pide 'dev'. Su trabajo lo hace otro proceso, y
+  // la regla de las cadenas no aplica.
+  //
+  // Caso real: el bot 299 (sniper de Peru) corre como servicio systemd `peru-sniper-299`
+  // en el RPi, con 2 disparos por minuto en los segundos 14 y 18. Su silencio en
+  // `poll_logs` es lo esperado, y el detector lo reportaba como cadena dormida cada 15
+  // min. Pausarlo tampoco sirve: `peru-sniper-299.ts:586` exige `status === 'active'`
+  // para disparar, entonces `paused` apagaria el servicio.
+  if (entornos.length === 0) {
+    return {
+      ...base,
+      veredicto: 'gestionado_aparte',
+      minSinPoll: ultimoPoll ? Math.round((ahora - ultimoPoll.getTime()) / 60_000) : null,
+      toleranciaMin: 0,
+    };
+  }
 
   if (!ultimoPoll) {
     // Sin ninguna fila. Solo cuenta si el bot lleva activado mas que la gracia.
@@ -147,6 +165,11 @@ export function cadenasConProblema(resultados: ResultadoCadena[]): ResultadoCade
   return resultados
     .filter((r) => r.veredicto === 'dormida' || r.veredicto === 'nunca_polleo')
     .sort((a, b) => (b.minSinPoll ?? Number.MAX_SAFE_INTEGER) - (a.minSinPoll ?? Number.MAX_SAFE_INTEGER));
+}
+
+/** Bots que otro proceso maneja, fuera de los crons de Trigger.dev. */
+export function cadenasGestionadasAparte(resultados: ResultadoCadena[]): ResultadoCadena[] {
+  return resultados.filter((r) => r.veredicto === 'gestionado_aparte');
 }
 
 /** Cadenas calladas por un backoff largo pero legitimo, de mas callada a menos. */

@@ -21,7 +21,7 @@
 import { db } from '../src/db/client.js';
 import { sql } from 'drizzle-orm';
 import { TECHO_CARRERA_MS } from '../src/services/visa-client.js';
-import { evaluarParalelo, MARGEN_PARALELO_MS } from '../src/services/camino-critico-reglas.js';
+import { evaluarParalelo, MARGEN_PARALELO_MS, evaluarSellos } from '../src/services/camino-critico-reglas.js';
 
 const arg = (n: string, d: number): number => {
   const i = process.argv.indexOf(`--${n}`);
@@ -192,31 +192,34 @@ async function main() {
   // Se mira si el bot tuvo ALGUN poll sano en la ventana, no si el ULTIMO lo fue.
   // Con la version anterior, un bot que alterna `ok` y `error` prendia y apagaba el
   // verificador segun cual poll cayera de ultimo (caso real: bot 7, 2026-08-31).
+  // La ventana de BUSQUEDA es ancha (3 h) a proposito. La frescura del sello NO se mide
+  // contra `now()` sino contra el momento del poll, en `evaluarSellos`. Con la version
+  // anterior las dos cosas compartian los 15 minutos, y cuando los bots es-pe entraban
+  // en backoff de 30 min V7 se quedaba sin muestra y el vigilante temblaba.
   const sellos = (await db.execute(sql`
     SELECT s.bot_id, s.tokens_refreshed_at,
-           (SELECT count(*) FROM poll_logs p
+           (SELECT max(p.created_at) FROM poll_logs p
              WHERE p.bot_id = s.bot_id
-               AND p.created_at > now() - interval '15 minutes'
-               AND p.status IN ('ok', 'filtered_out'))::int AS polls_sanos
+               AND p.created_at > now() - interval '3 hours'
+               AND p.status IN ('ok', 'filtered_out')) AS ultimo_poll_sano
     FROM sessions s JOIN bots b ON b.id = s.bot_id
     WHERE b.locale = 'es-pe' AND b.status = 'active'
-  `)).rows as Array<{ bot_id: number; tokens_refreshed_at: Date | null; polls_sanos: number }>;
-  const VENTANA_MS = 15 * 60_000;
-  const activos = sellos.filter((r) => r.polls_sanos > 0);
-  const dormidos = sellos.length - activos.length;
-  const frescos = activos.filter(
-    (r) => r.tokens_refreshed_at && Date.now() - new Date(r.tokens_refreshed_at).getTime() < VENTANA_MS,
-  );
-  const sinSello = activos.filter((r) => !r.tokens_refreshed_at);
+  `)).rows as Array<{ bot_id: number; tokens_refreshed_at: Date | null; ultimo_poll_sano: Date | null }>;
+  const sello = evaluarSellos(sellos.map((r) => ({
+    botId: Number(r.bot_id),
+    selloMs: r.tokens_refreshed_at ? new Date(r.tokens_refreshed_at).getTime() : null,
+    ultimoPollSanoMs: r.ultimo_poll_sano ? new Date(r.ultimo_poll_sano).getTime() : null,
+  })));
+  const { activos, frescos, dormidos, sinSello } = sello;
   V({
     id: 'V7', que: 'un bot que pollea mantiene su token caliente',
-    ok: activos.length > 0 && frescos.length === activos.length,
-    medido: `${frescos.length}/${activos.length} bots polleando con sello fresco` +
-      (dormidos > 0 ? ` · ${dormidos} en backoff o bloqueados, no se les exige` : ''),
-    umbral: 'todos los que pollean', base: 'la columna no existia', n: activos.length, muestraMin: 1,
+    ok: activos > 0 && frescos === activos,
+    medido: `${frescos}/${activos} bots con el sello fresco al momento de pollear` +
+      (dormidos > 0 ? ` · ${dormidos} sin pollear en 3 h, no se les exige` : ''),
+    umbral: 'todos los que pollean', base: 'la columna no existia', n: activos, muestraMin: 1,
     nota: sinSello.length > 0
-      ? `bots polleando SIN sello: ${sinSello.map((r) => r.bot_id).join(', ')} — poll-visa no esta escribiendo`
-      : (activos.length === 0 ? 'ningun bot es-pe polleo en los ultimos 15 min' : undefined),
+      ? `bots polleando SIN sello: ${sinSello.join(', ')} — poll-visa no esta escribiendo`
+      : (activos === 0 ? 'ningun bot es-pe polleo en las ultimas 3 h' : undefined),
   });
 
   // ── V8 · fase del tick contra la ventana de liberacion ──────────────────────
