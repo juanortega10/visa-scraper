@@ -21,6 +21,7 @@
 import { db } from '../src/db/client.js';
 import { sql } from 'drizzle-orm';
 import { TECHO_CARRERA_MS } from '../src/services/visa-client.js';
+import { evaluarParalelo, MARGEN_PARALELO_MS } from '../src/services/camino-critico-reglas.js';
 
 const arg = (n: string, d: number): number => {
   const i = process.argv.indexOf(`--${n}`);
@@ -126,16 +127,18 @@ async function main() {
   const pares = carreras
     .map((f) => ({ c: num(f.payload.msCarrera), t: num(f.payload.msTimes), a: num(f.payload.msApt) }))
     .filter((x): x is { c: number; t: number; a: number } => x.c !== null && x.t !== null && x.a !== null);
-  const enSerie = pares.filter((x) => x.c > (x.t + x.a) * 0.85).length;
-  const razon = pares.map((x) => x.c / Math.max(1, x.t + x.a));
+  // La regla vive en `src/services/camino-critico-reglas.ts`, con tests. Antes comparaba
+  // contra la SUMA y mandaba regresiones falsas: con una pata rapida, el paralelo
+  // perfecto se acerca a la suma. Ver el comentario de `evaluarParalelo`.
+  const par = evaluarParalelo(pares);
   V({
     id: 'V4', que: 'horas y cita salen en paralelo, no en serie',
-    ok: pares.length >= MIN_MUESTRA && enSerie === 0 && pct(razon, 0.95) < 0.85,
+    ok: pares.length >= MIN_MUESTRA && par.enSerie === 0,
     medido: pares.length
-      ? `carrera/suma p50 ${pct(razon, 0.5).toFixed(2)} · p95 ${pct(razon, 0.95).toFixed(2)} · ${enSerie} en serie`
+      ? `sobrante sobre el maximo p50 ${pct(par.sobrantes, 0.5)} ms · p95 ${pct(par.sobrantes, 0.95)} ms · ${par.enSerie} en serie`
       : 'sin datos',
-    umbral: 'razon p95 < 0,85 y CERO vueltas en serie',
-    base: 'razon 1,00 = serie', n: pares.length, muestraMin: MIN_MUESTRA,
+    umbral: `CERO vueltas con sobrante > ${MARGEN_PARALELO_MS} ms`,
+    base: 'sobrante 0 y 1 ms medidos en 100 vueltas', n: pares.length, muestraMin: MIN_MUESTRA,
   });
 
   // ── V5 · techo por peticion ─────────────────────────────────────────────────
