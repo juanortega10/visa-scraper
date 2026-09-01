@@ -28,7 +28,7 @@
  */
 import { db } from '../src/db/client.js';
 import { sql } from 'drizzle-orm';
-import { evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, type EntradaCadena } from '../src/services/chain-health.js';
+import { evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, cadenasGestionadasAparte, type EntradaCadena } from '../src/services/chain-health.js';
 import type { RecentBlockRow } from '../src/services/scheduling.js';
 
 const args = process.argv.slice(2);
@@ -95,9 +95,10 @@ const alcance = entradas.filter((e) =>
 const resultados = alcance.map((e) => evaluarCadena(e, ahora));
 const malas = cadenasConProblema(resultados);
 const enBackoff = cadenasEnBackoffLargo(resultados);
+const aparte = cadenasGestionadasAparte(resultados);
 
 if (asJson) {
-  console.log(JSON.stringify({ revisados: resultados.length, hallazgos: malas, backoffLargo: enBackoff }, null, 2));
+  console.log(JSON.stringify({ revisados: resultados.length, hallazgos: malas, backoffLargo: enBackoff, gestionadosAparte: aparte }, null, 2));
 } else {
   console.log(`Cadenas revisadas: ${resultados.length} (entorno: ${entornoPedido})`);
   if (malas.length === 0) {
@@ -133,6 +134,16 @@ if (!asJson && enBackoff.length > 0) {
       `${String(m.minSinPoll + ' min').padEnd(13)} ${String(m.toleranciaMin + ' min').padEnd(12)} ` +
       `${m.blockCls} x${m.bansSeguidos}`,
     );
+  }
+}
+
+if (!asJson && aparte.length > 0) {
+  // Sin entornos no hay cron que los tome: otro proceso los maneja. Se listan para que
+  // se vea que existen, y quedan fuera del conteo de problemas.
+  console.log(`\nGESTIONADOS APARTE (otro proceso, sin accion): ${aparte.length}\n`);
+  console.log('bot    locale  sin pollear');
+  for (const m of aparte) {
+    console.log(`${String(m.botId).padEnd(6)} ${m.locale.padEnd(7)} ${m.minSinPoll === null ? 'NUNCA' : m.minSinPoll + ' min'}`);
   }
 }
 

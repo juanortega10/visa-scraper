@@ -65,3 +65,67 @@ export function evaluarParalelo(pares: ParCarrera[]): VeredictoParalelo {
     razonesSuma: pares.map((x) => x.c / Math.max(1, x.t + x.a)),
   };
 }
+
+// ── V7 · el token llega caliente al poll ─────────────────────────────────────
+
+export interface SelloBot {
+  botId: number;
+  /** `sessions.tokens_refreshed_at`, en ms. `null` = poll-visa no escribio el sello. */
+  selloMs: number | null;
+  /** Momento del ultimo poll SANO (`ok` o `filtered_out`), en ms. `null` = no polleo. */
+  ultimoPollSanoMs: number | null;
+}
+
+/**
+ * Cuanto puede tener el sello del token en el momento del poll.
+ *
+ * El sniper refresca cada 30 min (`POLITICA_TOKEN.cadenciaMs`) y el TTL duro del portal
+ * es de ~88 min. 15 min deja el sello holgadamente dentro de la vida util y sigue
+ * detectando el caso que importa: un poll que salio con el token ya vencido.
+ */
+export const VENTANA_SELLO_MS = 15 * 60_000;
+
+export interface VeredictoSello {
+  /** Bots que pollearon en la ventana de lectura. */
+  activos: number;
+  /** De esos, los que tenian el sello fresco AL MOMENTO de pollear. */
+  frescos: number;
+  /** Bots sin ningun poll sano: en backoff o bloqueados. No se les exige nada. */
+  dormidos: number;
+  /** Bots que pollean y NO tienen sello: poll-visa no esta escribiendo. */
+  sinSello: number[];
+}
+
+/**
+ * ¿Los bots que pollean llevan el token caliente?
+ *
+ * ── Por que la frescura se mide contra el POLL y no contra ahora ─────────────
+ *
+ * La version anterior comparaba `tokens_refreshed_at` contra `Date.now()` con la misma
+ * ventana de 15 min que usaba para buscar polls. Eso ataba dos preguntas distintas al
+ * mismo numero y producia un temblor: cuando los bots es-pe entraban en backoff de 30
+ * min, ninguno habia polleado en 15 min, `activos` quedaba en 0 y V7 reportaba "sin
+ * muestra". El 2026-09-01 el vigilante cambio de estado tres veces en una hora por esto,
+ * sin que nada en produccion se moviera.
+ *
+ * Ensanchar solo la busqueda de polls no arregla nada: entonces se le exigiria un sello
+ * de 15 min a un bot que polleo hace 50. La pregunta correcta es si el token estaba
+ * caliente CUANDO el bot polleo, y eso no depende de cuanto tiempo lleve dormido desde
+ * entonces.
+ */
+export function evaluarSellos(filas: SelloBot[]): VeredictoSello {
+  const activos = filas.filter((f) => f.ultimoPollSanoMs !== null);
+  // El guarda de `null` es intencion explicita, no carga: con marcas de epoca,
+  // `ultimoPollSanoMs - 0` ya queda muy por encima de la ventana. Se deja escrito para
+  // que nadie lo borre asumiendo que sobra, porque dejaria la regla dependiendo de que
+  // `null` se convierta en 0.
+  const frescos = activos.filter(
+    (f) => f.selloMs !== null && f.ultimoPollSanoMs! - f.selloMs < VENTANA_SELLO_MS,
+  );
+  return {
+    activos: activos.length,
+    frescos: frescos.length,
+    dormidos: filas.length - activos.length,
+    sinSello: activos.filter((f) => f.selloMs === null).map((f) => f.botId),
+  };
+}

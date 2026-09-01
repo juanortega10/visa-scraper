@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { evaluarParalelo, MARGEN_PARALELO_MS, type ParCarrera } from '../camino-critico-reglas.js';
+import {
+  evaluarParalelo, MARGEN_PARALELO_MS, evaluarSellos, VENTANA_SELLO_MS,
+  type ParCarrera,
+} from '../camino-critico-reglas.js';
 
 describe('V4 · el paralelo es real', () => {
   it('paralelo perfecto: la carrera dura lo que la pata lenta', () => {
@@ -61,5 +64,65 @@ describe('V4 · el paralelo es real', () => {
     const v = evaluarParalelo([{ c: 0, t: 0, a: 0 }]);
     expect(Number.isFinite(v.razones[0]!)).toBe(true);
     expect(v.enSerie).toBe(0);
+  });
+});
+
+describe('V7 · el token llega caliente al poll', () => {
+  const T = Date.parse('2026-09-01T13:00:00Z');
+  const min = (m: number) => T - m * 60_000;
+
+  it('un bot que polleo con el sello reciente pasa', () => {
+    const v = evaluarSellos([{ botId: 7, selloMs: min(5), ultimoPollSanoMs: min(1) }]);
+    expect(v).toMatchObject({ activos: 1, frescos: 1, dormidos: 0 });
+  });
+
+  it('un bot DORMIDO hace 50 min no arruina el veredicto', () => {
+    // Este es el temblor que se arreglo. El bot 7 entra en backoff de 30 min, y con la
+    // regla vieja `activos` caia a 0 y V7 decia "sin muestra" cada vez.
+    const v = evaluarSellos([{ botId: 7, selloMs: min(55), ultimoPollSanoMs: min(50) }]);
+    expect(v).toMatchObject({ activos: 1, frescos: 1 });
+  });
+
+  it('la frescura se mide contra el POLL, no contra ahora', () => {
+    // Sello de hace 3 h, poll de hace 3 h: el token estaba caliente cuando polleo.
+    // Medido contra `ahora` esto fallaria, y no habria nada roto.
+    const v = evaluarSellos([{ botId: 223, selloMs: min(185), ultimoPollSanoMs: min(180) }]);
+    expect(v.frescos).toBe(1);
+  });
+
+  it('un poll con el token ya vencido SI falla', () => {
+    const v = evaluarSellos([{ botId: 7, selloMs: min(60), ultimoPollSanoMs: min(1) }]);
+    expect(v).toMatchObject({ activos: 1, frescos: 0 });
+  });
+
+  it('un bot sin ningun poll sano cuenta como dormido, no como fallo', () => {
+    const v = evaluarSellos([{ botId: 299, selloMs: min(2), ultimoPollSanoMs: null }]);
+    expect(v).toMatchObject({ activos: 0, frescos: 0, dormidos: 1 });
+  });
+
+  it('un bot que pollea SIN sello se nombra: poll-visa no escribe', () => {
+    const v = evaluarSellos([{ botId: 223, selloMs: null, ultimoPollSanoMs: min(1) }]);
+    expect(v.sinSello).toEqual([223]);
+    expect(v.frescos).toBe(0);
+  });
+
+  it('un bot dormido sin sello NO se nombra: no se le exige nada', () => {
+    expect(evaluarSellos([{ botId: 299, selloMs: null, ultimoPollSanoMs: null }]).sinSello).toEqual([]);
+  });
+
+  it('el borde de la ventana se respeta', () => {
+    const justo = evaluarSellos([{ botId: 1, selloMs: T - VENTANA_SELLO_MS, ultimoPollSanoMs: T }]);
+    const antes = evaluarSellos([{ botId: 1, selloMs: T - VENTANA_SELLO_MS + 1, ultimoPollSanoMs: T }]);
+    expect(justo.frescos).toBe(0);
+    expect(antes.frescos).toBe(1);
+  });
+
+  it('un sello POSTERIOR al poll cuenta como fresco', () => {
+    // El refresco pudo caer despues del poll. Eso no es un problema.
+    expect(evaluarSellos([{ botId: 7, selloMs: min(1), ultimoPollSanoMs: min(9) }]).frescos).toBe(1);
+  });
+
+  it('sin filas no hay activos ni dormidos', () => {
+    expect(evaluarSellos([])).toEqual({ activos: 0, frescos: 0, dormidos: 0, sinSello: [] });
   });
 });

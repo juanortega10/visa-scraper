@@ -8,8 +8,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, umbralDespertadorMs,
-  MARGEN_VERIFICADOR_MS, GRACIA_ARRANQUE_MS, BACKOFF_LARGO_MS, type EntradaCadena,
+  evaluarCadena, cadenasConProblema, cadenasEnBackoffLargo, cadenasGestionadasAparte,
+  umbralDespertadorMs, MARGEN_VERIFICADOR_MS, GRACIA_ARRANQUE_MS, BACKOFF_LARGO_MS,
+  type EntradaCadena,
 } from '../chain-health.js';
 import { debeDespertar, TOPE_SIN_BAN_MS, accountBanBackoffMs, scheduleBlockedBackoffMs } from '../scheduling.js';
 
@@ -208,5 +209,46 @@ describe('backoff largo pero legitimo', () => {
   it('cadenasEnBackoffLargo ordena de mas callada a menos', () => {
     const rs = [bloqueado(150, 2), bloqueado(262, 2), bloqueado(200, 2)];
     expect(cadenasEnBackoffLargo(rs).map((r) => r.minSinPoll)).toEqual([262, 200, 150]);
+  });
+});
+
+describe('bots que maneja otro proceso', () => {
+  // `pollEnvironments` vacio significa que ningun cron de Trigger.dev toma el bot. El 299
+  // (sniper de Peru) corre como servicio systemd en el RPi con 2 disparos por minuto, y
+  // su silencio en `poll_logs` es lo esperado. Antes salia como cadena dormida cada 15 min.
+  const sinEntorno = (over: Partial<EntradaCadena> = {}) =>
+    evaluarCadena(base({ entornos: [], ...over }), AHORA);
+
+  it('un bot sin entornos se marca gestionado_aparte, por callado que este', () => {
+    for (const min of [0, 60, 600, 1443, 5000]) {
+      const r = sinEntorno({ ultimoPoll: new Date(AHORA - min * MIN) });
+      expect(r.veredicto, `min=${min}`).toBe('gestionado_aparte');
+    }
+  });
+
+  it('el caso real del bot 299: 1443 min callado no pide accion', () => {
+    const r = sinEntorno({
+      botId: 299,
+      ultimoPoll: new Date(AHORA - 1443 * MIN),
+      ultimas: [{ status: 'tcp_blocked', blockCls: 'account_ban' }],
+    });
+    expect(r.veredicto).toBe('gestionado_aparte');
+    expect(cadenasConProblema([r])).toEqual([]);
+    expect(cadenasEnBackoffLargo([r])).toEqual([]);
+    expect(cadenasGestionadasAparte([r]).map((x) => x.botId)).toEqual([299]);
+  });
+
+  it('sin ningun poll tampoco cuenta como nunca_polleo', () => {
+    const r = sinEntorno({ ultimoPoll: null, ultimas: [] });
+    expect(r.veredicto).toBe('gestionado_aparte');
+    expect(r.minSinPoll).toBeNull();
+  });
+
+  it('un bot CON entorno sigue evaluandose igual que antes', () => {
+    const r = evaluarCadena(base({
+      entornos: ['dev'],
+      ultimoPoll: new Date(AHORA - 1443 * MIN),
+    }), AHORA);
+    expect(r.veredicto).toBe('dormida');
   });
 });
