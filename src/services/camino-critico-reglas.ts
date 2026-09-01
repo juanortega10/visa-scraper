@@ -74,6 +74,15 @@ export interface SelloBot {
   selloMs: number | null;
   /** Momento del ultimo poll SANO (`ok` o `filtered_out`), en ms. `null` = no polleo. */
   ultimoPollSanoMs: number | null;
+  /**
+   * ¿El poll MAS RECIENTE del bot fue sano?
+   *
+   * Cuando no lo fue, el bot esta bloqueado o en error, y ahi el sello nulo es lo
+   * ESPERADO: un re-login con `hasTokens: false` limpia los tokens a proposito, y
+   * `refreshTokens()` los repone en el siguiente ciclo sano. Exigirle un sello fresco a
+   * un bot bloqueado convierte un mecanismo que funciona en una alarma.
+   */
+  ultimoPollEsSano: boolean;
 }
 
 /**
@@ -99,6 +108,16 @@ export interface VeredictoSello {
 /**
  * ¿Los bots que pollean llevan el token caliente?
  *
+ * ── Por que solo se juzga a un bot cuyo ULTIMO poll fue sano ────────────────
+ *
+ * El 2026-09-01 17:31 UTC el bot 7 quedo bloqueado, el re-login volvio con
+ * `hasTokens: false` y limpio el sello. Dos minutos despues otro login lo repuso. Con la
+ * regla que solo pedia "algun poll sano en la ventana", ese hueco de dos minutos salio
+ * como REGRESION, y lo unico que pasaba era el mecanismo funcionando.
+ *
+ * Un bot bloqueado no tiene nada que demostrar sobre su token. Queda fuera del recuento
+ * y V7 se queda sin muestra, que es la verdad.
+ *
  * ── Por que la frescura se mide contra el POLL y no contra ahora ─────────────
  *
  * La version anterior comparaba `tokens_refreshed_at` contra `Date.now()` con la misma
@@ -114,7 +133,7 @@ export interface VeredictoSello {
  * entonces.
  */
 export function evaluarSellos(filas: SelloBot[]): VeredictoSello {
-  const activos = filas.filter((f) => f.ultimoPollSanoMs !== null);
+  const activos = filas.filter((f) => f.ultimoPollSanoMs !== null && f.ultimoPollEsSano);
   // El guarda de `null` es intencion explicita, no carga: con marcas de epoca,
   // `ultimoPollSanoMs - 0` ya queda muy por encima de la ventana. Se deja escrito para
   // que nadie lo borre asumiendo que sobra, porque dejaria la regla dependiendo de que

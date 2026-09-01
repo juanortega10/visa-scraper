@@ -21,6 +21,7 @@
 cd /Users/juanortega/visa-scraper || exit 1
 HUECO_MIN=8          # escanea 10-17 veces por hora: 8 min sin nada es un hueco de verdad
 ANTERIOR=""
+SOSPECHA=0     # una regresion se confirma en dos vueltas antes de hablar
 while true; do
   MIN=$(npx tsx --env-file=.env scripts/_edad-sniper.ts 2>/dev/null | tail -1)
   if ! [ "$MIN" -ge 0 ] 2>/dev/null; then
@@ -30,11 +31,24 @@ while true; do
   else
     SAL=$(npx tsx --env-file=.env scripts/verificar-camino-critico.ts 2>&1); COD=$?
     case $COD in
-      0) ESTADO="verde"; DET="10 de 10 · ultimo escaneo hace $MIN min" ;;
-      2) ESTADO="sin-veredicto"
-         DET="$(echo "$SAL" | grep -o 'SIN VEREDICTO en [0-9]*: .*' | head -1) · el sniper SI escanea (hace $MIN min)" ;;
-      *) ESTADO="regresion"
-         DET="$(echo "$SAL" | grep -o 'REGRESION en [0-9]*: .*' | head -1)$(echo "$SAL" | grep '\[FALLA\]' | sed 's/  */ /g' | cut -c1-120 | tr '\n' ' ')" ;;
+      0) ESTADO="ok"; DET="10 de 10 · ultimo escaneo hace $MIN min"; SOSPECHA=0 ;;
+      # "Sin veredicto" NO es un problema: quiere decir que a algun verificador le falta
+      # muestra. Pasa cada vez que los tres bots es-pe estan en backoff a la vez, o sea
+      # varias veces al dia. Se informa dentro del estado `ok` en vez de despertar a
+      # nadie.
+      2) ESTADO="ok"
+         DET="$(echo "$SAL" | grep -o 'SIN VEREDICTO en [0-9]*: .*' | head -1) · el sniper escanea (hace $MIN min)"
+         SOSPECHA=0 ;;
+      # Una regresion se CONFIRMA antes de hablar. El 2026-09-01 dos alarmas salieron por
+      # baches de 2 minutos: un `HTTP 502` del portal, y un re-login con `hasTokens:false`
+      # que limpio el sello del token y otro login repuso enseguida. Las dos veces el
+      # mecanismo estaba funcionando. Una regresion de verdad aguanta cinco minutos.
+      *) if [ "${SOSPECHA:-0}" -eq 0 ]; then
+           SOSPECHA=1; ESTADO="$ANTERIOR"
+         else
+           ESTADO="regresion"
+           DET="confirmada en dos vueltas · $(echo "$SAL" | grep '\[FALLA\]' | sed 's/  */ /g' | cut -c1-120 | tr '\n' ' ')"
+         fi ;;
     esac
   fi
   if [ "$ESTADO" != "$ANTERIOR" ]; then
