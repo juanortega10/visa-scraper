@@ -44,6 +44,15 @@ export interface PendientesVision {
 export interface EstadoVision {
   proveedores: ProveedorVision[];
   pendientes: PendientesVision;
+  /**
+   * Lecturas de imagen logradas en las ultimas 24 h, por CUALQUIER camino.
+   *
+   * Desde el 2026-09-01 hay dos: `analyze-payment-image` con el Vercel AI Gateway, y el
+   * agente nativo de Kapso con `ask_about_file`, que corre con creditos de Kapso y llama
+   * a `registrar-lectura-imagen`. El gateway paso a ser redundante, entonces que este
+   * caido ya NO es un incidente por si solo. Lo que importa es si algo se leyo.
+   */
+  lecturas24h: number;
 }
 
 export type SeveridadVision = 'critico' | 'alto' | 'ninguna';
@@ -69,27 +78,31 @@ export function evaluarVision(e: EstadoVision): VeredictoVision {
   const caidos = e.proveedores.filter((p) => !p.ok);
   const arriba = e.proveedores.length - caidos.length;
 
-  // Lista vacia y lista con todos caidos son el MISMO caso: no hay con que leer.
-  // Separarlos seria dejar pasar el silencio, que es justo la falla de agosto.
-  if (arriba === 0) {
+  // Un medio viejo sin leer es plata quieta, y no depende de que camino fallo. Es la
+  // señal mas fuerte y va primero.
+  if (e.pendientes.total > 0 && e.pendientes.masViejoHoras >= HORAS_PENDIENTE_VIEJO) {
     return {
       alerta: true,
       severidad: 'critico',
-      motivo: e.proveedores.length === 0
-        ? 'la sonda no pudo probar ningun proveedor'
-        : e.proveedores.length === 1
-          ? `el unico proveedor (${e.proveedores[0]!.nombre}) esta caido`
-          : `los ${e.proveedores.length} proveedores estan caidos`,
+      motivo: `${e.pendientes.total} medios sin leer, el mas viejo de ${e.pendientes.masViejoHoras} h`,
       arriba,
       caidos,
     };
   }
 
-  if (e.pendientes.total > 0 && e.pendientes.masViejoHoras >= HORAS_PENDIENTE_VIEJO) {
+  // Los proveedores caidos solo son incidente cuando el OTRO camino tampoco leyo nada.
+  // El gateway lleva caido desde el 2026-08-17 y el agente nativo cubre la lectura: si
+  // esto alertara solo por el gateway, sonaria todos los dias y se dejaria de leer.
+  //
+  // Lista vacia y lista con todos caidos son el MISMO caso. Separarlos seria dejar pasar
+  // el silencio, que es justo la falla de agosto.
+  if (arriba === 0 && e.lecturas24h === 0) {
     return {
       alerta: true,
-      severidad: 'alto',
-      motivo: `${e.pendientes.total} medios sin leer, el mas viejo de ${e.pendientes.masViejoHoras} h`,
+      severidad: 'critico',
+      motivo: e.proveedores.length === 0
+        ? 'la sonda no pudo probar ningun proveedor y no hubo ninguna lectura en 24 h'
+        : `sin proveedores y sin ninguna lectura en 24 h`,
       arriba,
       caidos,
     };
@@ -103,6 +116,7 @@ export function evaluarVision(e: EstadoVision): VeredictoVision {
  * habla todos los dias deja de leerse.
  */
 export function textoVision(v: VeredictoVision, e: EstadoVision): string {
+  const arriba = e.proveedores.filter((p) => p.ok).length;
   const titulo = v.severidad === 'critico'
     ? '🔴 *Vision caida: ninguna imagen se puede leer*'
     : '🟠 *Medios sin leer esperando*';
@@ -122,14 +136,11 @@ export function textoVision(v: VeredictoVision, e: EstadoVision): string {
   if (e.pendientes.total > e.pendientes.conUrl) {
     lineas.push(`${e.pendientes.total - e.pendientes.conUrl} sin URL: hay que bajarlos a mano de Kapso.`);
   }
-  if (arribaHayUnoSolo(e)) {
-    lineas.push('Queda UN solo proveedor. Sin respaldo, la proxima caida vuelve a perder imagenes.');
+  lineas.push(`lecturas en 24 h: ${e.lecturas24h}`);
+  if (arriba === 0 && e.lecturas24h > 0) {
+    lineas.push('El gateway esta caido y el agente nativo de Kapso si lee (`ask_about_file`).');
   }
   lineas.push('');
   lineas.push('`node scripts/recuperar-medios-perdidos.mjs --reintentar`');
   return lineas.join('\n');
-}
-
-function arribaHayUnoSolo(e: EstadoVision): boolean {
-  return e.proveedores.filter((p) => p.ok).length === 1;
 }
