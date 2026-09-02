@@ -36,7 +36,7 @@ const CERC = `(SELECT count(*) FROM jsonb_array_elements_text(COALESCE(p.date_ch
 
 const filas = (await db.execute<any>(sql`
   SELECT p.bot_id,
-         extract(second FROM (p.created_at - COALESCE(p.response_time_ms, 0) * interval '1 millisecond'))::int AS seg,
+         floor(extract(second FROM (p.created_at - COALESCE(p.response_time_ms, 0) * interval '1 millisecond')))::int AS seg,
          extract(epoch FROM date_trunc('minute', p.created_at)) * 1000 AS minuto_ms,
          extract(epoch FROM date_trunc('hour', p.created_at)) * 1000 AS hora_ms,
          p.polls_since_prev AS polls,

@@ -19,13 +19,26 @@ import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   curvaPorSegundo, mejorVentana, analizar, textoTelegramFase, huecosComparables,
+  fraccionEnRejilla, periodoDesdeIntervalo,
   type FilaSegundo, type BloqueExperimento, type ReporteFase,
 } from '../services/experimento-estadistica.js';
 import { VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
+import { DEFAULT_POLL_INTERVAL_S } from '../services/scheduling.js';
 import { sendTelegram } from '../services/notifications.js';
 
 /** Dias hacia atras que mira el reporte. El experimento es acumulativo. */
 export const DIAS_REPORTE = 14;
+
+/**
+ * Momento en que la fase por REJILLA entro en produccion (version 20260902.1, RPi
+ * reiniciado a las 20:47:50 -05 del 2026-09-01).
+ *
+ * Nada anterior entra en el analisis. Antes de este instante el mecanismo ESPERABA para
+ * entrar a la ventana, y esa espera dejaba los huecos al doble dentro de la ventana
+ * (182 s contra 84 s): mezclar los dos mecanismos en una misma cuenta es exactamente la
+ * contaminacion que la rejilla viene a quitar.
+ */
+export const REJILLA_DESDE = '2026-09-02T01:47:50Z';
 /** Ancho de la ventana que se busca, en segundos. El mismo que la configurada. */
 export const ANCHO_VENTANA = 10;
 
@@ -60,9 +73,10 @@ export async function leerFilasFase(dias = DIAS_REPORTE): Promise<FilaFase[]> {
       FROM poll_logs p JOIN bots b ON b.id = p.bot_id
       WHERE b.phase_experiment = true
         AND p.created_at > now() - make_interval(days => ${dias})
+        AND p.created_at >= ${REJILLA_DESDE}::timestamp
     )
     SELECT bot_id,
-           extract(second FROM t_fetch)::int AS segundo,
+           floor(extract(second FROM t_fetch))::int AS segundo,
            extract(epoch FROM date_trunc('hour', created_at)) * 1000 AS hora_ms,
            polls, eventos, hueco
     FROM x
@@ -122,9 +136,15 @@ export function armarReporte(filas: FilaFase[], dias = DIAS_REPORTE): ReporteFas
   const curva = curvaPorSegundo(porSeg);
   const mv = mejorVentana(curva, ANCHO_VENTANA);
   const h = huecoP50(filas, cfg);
+  // Los bots del experimento son es-co, entonces el periodo sale del intervalo por
+  // defecto. Si alguno llevara un intervalo propio, el numero de abajo lo subestimaria.
+  const periodoSec = periodoDesdeIntervalo(DEFAULT_POLL_INTERVAL_S);
+  const huecos = filas.map((f) => f.huecoSec).filter((x): x is number => x !== null);
 
   return {
     dias, curva,
+    enRejilla: fraccionEnRejilla(huecos, periodoSec),
+    periodoSec,
     configurada: { ventana: cfg, analisis: analizar(bloquesPorVentana(filas, cfg)) },
     mejor: mv
       ? { ventana: { startSec: mv.startSec, endSec: mv.endSec }, analisis: analizar(bloquesPorVentana(filas, { startSec: mv.startSec, endSec: mv.endSec })) }

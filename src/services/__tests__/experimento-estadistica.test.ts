@@ -4,7 +4,7 @@ import {
   EFECTO_OBJETIVO, BLOQUES_MINIMOS,
   siguienteEnRejilla, periodoValido, periodoDesdeIntervalo, faseAleatoria,
   curvaPorSegundo, mejorVentana, type FilaSegundo,
-  textoTelegramFase, huecosComparables, type ReporteFase,
+  textoTelegramFase, huecosComparables, fraccionEnRejilla, type ReporteFase,
   type BloqueExperimento,
 } from '../experimento-estadistica.js';
 
@@ -483,6 +483,7 @@ describe('mensaje diario de fase', () => {
     configurada: { ventana: { startSec: 22, endSec: 32 }, analisis: anal(30, 10) },
     mejor: null,
     huecoDentroSec: 90, huecoFueraSec: 85,
+    enRejilla: 0.7, periodoSec: 20,
     ...o,
   });
 
@@ -507,6 +508,15 @@ describe('mensaje diario de fase', () => {
     expect(huecosComparables(90, 0)).toBe(false);
     expect(huecosComparables(NaN, 85)).toBe(false);
     expect(huecosComparables(90, NaN)).toBe(false);
+  });
+
+  it('con huecos sucios se reporta cuanta rejilla hay: dice si esperar sirve', () => {
+    const t = textoTelegramFase(rep({ huecoDentroSec: 177, huecoFueraSec: 85, enRejilla: 0.62, periodoSec: 20 }));
+    expect(t).toMatch(/Rejilla de 20 s: 62%/);
+  });
+
+  it('con huecos limpios NO habla de la rejilla: ya no hace falta', () => {
+    expect(textoTelegramFase(rep())).not.toMatch(/Rejilla de/);
   });
 
   it('con huecos sucios el titulo AVISA y pide no decidir', () => {
@@ -544,5 +554,47 @@ describe('mensaje diario de fase', () => {
   it('cabe en una notificacion', () => {
     const t = textoTelegramFase(rep({ huecoDentroSec: 177, huecoFueraSec: 85, mejor: { ventana: { startSec: 21, endSec: 31 }, analisis: anal(30, 10) } }));
     expect(t.split('\n').length).toBeLessThanOrEqual(16);
+  });
+});
+
+describe('fraccion en rejilla', () => {
+  it('huecos exactos al periodo dan 1', () => {
+    expect(fraccionEnRejilla([20, 20, 40, 60], 20)).toBe(1);
+  });
+
+  it('la firma real del bot 301 se reconoce', () => {
+    // Medida despues del despliegue: 20, 20, 20, 21 encadenados.
+    expect(fraccionEnRejilla([20, 20, 20, 21], 20)).toBe(1);
+  });
+
+  it('huecos ajenos a la rejilla no cuentan', () => {
+    // 127, 242 y 233 son del cron de 2 minutos y de los backoffs.
+    expect(fraccionEnRejilla([127, 242, 233], 20)).toBeLessThan(0.4);
+  });
+
+  it('mezcla real: cuenta solo los de la rejilla', () => {
+    const f = fraccionEnRejilla([20, 20, 20, 21, 127, 242], 20);
+    expect(f).toBeGreaterThan(0.6);
+    expect(f).toBeLessThan(0.75);
+  });
+
+  it('la tolerancia funciona en los DOS sentidos del multiplo', () => {
+    expect(fraccionEnRejilla([19], 20)).toBe(1);   // un poco por debajo
+    expect(fraccionEnRejilla([21], 20)).toBe(1);   // un poco por encima
+    expect(fraccionEnRejilla([25], 20)).toBe(0);   // a mitad de camino
+  });
+
+  it('los huecos absurdos se descartan', () => {
+    expect(fraccionEnRejilla([0, -5, 9999, 20], 20)).toBe(1);
+  });
+
+  it('sin huecos utiles devuelve 0, no NaN', () => {
+    expect(fraccionEnRejilla([], 20)).toBe(0);
+    expect(fraccionEnRejilla([0, -1], 20)).toBe(0);
+  });
+
+  it('un periodo de 30 no confunde un hueco de 20', () => {
+    expect(fraccionEnRejilla([20], 30)).toBe(0);
+    expect(fraccionEnRejilla([30, 60], 30)).toBe(1);
   });
 });

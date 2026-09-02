@@ -390,6 +390,10 @@ export interface ReporteFase {
   /** Hueco p50 antes del poll, dentro y fuera de la ventana configurada, en segundos. */
   huecoDentroSec: number;
   huecoFueraSec: number;
+  /** Fraccion de huecos que cae sobre la rejilla. Dice si el mecanismo esta puesto. */
+  enRejilla: number;
+  /** Periodo de la rejilla que se esta usando, en segundos. */
+  periodoSec: number;
 }
 
 /** Los huecos tienen que parecerse para que la razon signifique algo. */
@@ -440,6 +444,9 @@ export function textoTelegramFase(r: ReporteFase): string {
     lineas.push('');
     lineas.push(`Hueco antes del poll: dentro ${Math.round(r.huecoDentroSec)} s, fuera ${Math.round(r.huecoFueraSec)} s.`);
     lineas.push('Con huecos distintos, la razon mide el hueco y no la fase. No decidas con esto.');
+    // La fraccion en rejilla dice si esperar sirve. Si la rejilla esta puesta, los huecos
+    // se van limpiando solos; si no lo esta, esperar no arregla nada.
+    lineas.push(`Rejilla de ${r.periodoSec} s: ${Math.round(100 * r.enRejilla)}% de los huecos.`);
   } else if (a.veredicto === 'sin-muestra') {
     lineas.push('');
     lineas.push(`Faltan eventos: ${Math.max(0, a.eventosNecesarios - a.alineado.eventos)} dentro y ` +
@@ -456,4 +463,36 @@ export function textoTelegramFase(r: ReporteFase): string {
     lineas.push('(elegida mirando estos datos: sirve para proponer, no para concluir)');
   }
   return lineas.join('\n');
+}
+
+/**
+ * ¿Que fraccion de los huecos cae sobre la rejilla?
+ *
+ * ── Por que hace falta medirlo ──────────────────────────────────────────────
+ *
+ * El 2026-09-02 dí por hecho que la rejilla no estaba funcionando porque no aparecia su
+ * linea en `journalctl`. Estaba equivocado: journalctl muestra `console.log`, y esa linea
+ * es un `logger.info`, que va a la plataforma de Trigger.dev. La ausencia de un log no
+ * prueba nada.
+ *
+ * Lo que si prueba es el DATO. Con la rejilla puesta, los huecos entre polls encadenados
+ * caen en multiplos del periodo. Medido despues del despliegue, el bot 301 encadeno
+ * `20, 20, 20, 21` con la fase estable: la firma es inconfundible.
+ *
+ * Los huecos que NO caen en la rejilla son del cron de 2 minutos y de los backoffs, que
+ * la rejilla no controla. Entonces la fraccion nunca llega a 1 y no tiene que llegar.
+ *
+ * `tolerancia` en segundos absorbe el tiempo que tarda el propio poll.
+ */
+export function fraccionEnRejilla(huecosSec: number[], periodoSec: number, tolerancia = 1.5): number {
+  const utiles = huecosSec.filter((h) => Number.isFinite(h) && h > 0 && h <= 600);
+  if (utiles.length === 0) return 0;
+  const p = Math.max(1, periodoSec);
+  let dentro = 0;
+  for (const h of utiles) {
+    const resto = h % p;
+    // Cerca de un multiplo por arriba o por abajo: `resto` chico o casi igual al periodo.
+    if (Math.min(resto, p - resto) <= tolerancia) dentro += 1;
+  }
+  return Math.round((dentro / utiles.length) * 1000) / 1000;
 }
