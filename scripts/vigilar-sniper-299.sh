@@ -23,9 +23,17 @@ HUECO_MIN=8          # escanea 10-17 veces por hora: 8 min sin nada es un hueco 
 ANTERIOR=""
 SOSPECHA=0     # una regresion se confirma en dos vueltas antes de hablar
 while true; do
-  MIN=$(npx tsx --env-file=.env scripts/_edad-sniper.ts 2>/dev/null | tail -1)
+  LEC=$(npx tsx --env-file=.env scripts/_edad-sniper.ts 2>/dev/null | tail -1)
+  MIN=$(echo "$LEC" | awk '{print $1}')
+  FASE=$(echo "$LEC" | awk '{print $2}')
   if ! [ "$MIN" -ge 0 ] 2>/dev/null; then
     ESTADO="sonda-caida"; DET="no pude leer sniper_scans"
+  elif [ "$FASE" = "ruta_cerrada" ]; then
+    # El sniper esta VIVO y la ruta del portal esta cerrada. Se calla a proposito, y cada
+    # vez mas: su cadencia crece con los errores seguidos. Llamar a esto "sniper parado"
+    # manda a revisar el RPi cuando el problema esta en el portal.
+    ESTADO="ruta-cerrada"
+    DET="la ruta del schedule no responde · el sniper vive y espera · ultimo aviso hace $MIN min"
   elif [ "$MIN" -ge "$HUECO_MIN" ]; then
     ESTADO="sniper-parado"; DET="sin escanear desde hace $MIN min · revisar peru-sniper-299 en el RPi"
   else
