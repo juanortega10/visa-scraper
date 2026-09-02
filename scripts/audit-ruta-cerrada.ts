@@ -7,11 +7,13 @@
  *   npx tsx --env-file=.env scripts/audit-ruta-cerrada.ts --avisar
  */
 import { detectarRutasCerradas, textoRutaCerrada } from '../src/services/ruta-cerrada.js';
-import { leerFilasBloqueo, HORAS_VENTANA } from '../src/trigger/audit-ruta-cerrada.js';
+import { leerFilasBloqueo, leerFilasSniper, HORAS_VENTANA } from '../src/trigger/audit-ruta-cerrada.js';
 import { sendTelegram } from '../src/services/notifications.js';
 
-const filas = await leerFilasBloqueo();
+const [dePoll, deSniper] = await Promise.all([leerFilasBloqueo(), leerFilasSniper()]);
+const filas = [...dePoll, ...deSniper];
 const rutas = detectarRutasCerradas(filas, Date.now());
+console.log(`\nfuentes: ${dePoll.length} filas de poll_logs · ${deSniper.length} de sniper_scans`);
 
 console.log(`\nRUTAS CERRADAS · ${filas.length} filas de las ultimas ${HORAS_VENTANA} h · ${rutas.length} hallazgos\n`);
 if (rutas.length === 0) {

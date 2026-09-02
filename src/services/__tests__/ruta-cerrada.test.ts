@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   detectarRutasCerradas, textoRutaCerrada, MINUTOS_ALERTA, MINUTOS_CRITICO,
-  type FilaBloqueo,
+  botIdDeScanKey, filasDesdeSniper, FASE_RUTA_CERRADA,
+  type FilaBloqueo, type FilaSniper,
 } from '../ruta-cerrada.js';
 
 /**
@@ -154,5 +155,72 @@ describe('texto de Telegram', () => {
     const filas = Array.from({ length: 9 }, (_, i) =>
       fila({ botId: i + 1, scheduleId: `S${i}`, enMs: haceMin(100 + i) }));
     expect(textoRutaCerrada(detectarRutasCerradas(filas, AHORA))).toContain('y 3 mas');
+  });
+});
+
+describe('segunda fuente: el sniper', () => {
+  const sn = (o: Partial<FilaSniper> & { enMs: number }): FilaSniper => ({
+    scanKey: 'peru-299', fase: 'buscando', locale: 'es-pe', scheduleId: '75610929', ...o,
+  });
+
+  it('el botId sale de los digitos FINALES, no del primer numero que aparezca', () => {
+    expect(botIdDeScanKey('peru-299')).toBe(299);
+    expect(botIdDeScanKey('victoria-alvarez-141')).toBe(141);
+    // Con un numero antes, tomar el primero atribuiria el corte al bot 2.
+    expect(botIdDeScanKey('peru2-299')).toBe(299);
+    expect(botIdDeScanKey('v2-alvarez-141')).toBe(141);
+  });
+
+  it('un scan_key sin digitos se ignora en vez de adivinar', () => {
+    // Atribuir un corte al bot equivocado es peor que no verlo.
+    expect(botIdDeScanKey('victoria-alvarez')).toBeNull();
+    expect(botIdDeScanKey('peru-0')).toBeNull();
+    expect(botIdDeScanKey('')).toBeNull();
+  });
+
+  it('una fila `ruta_cerrada` se traduce a bloqueo de ruta', () => {
+    const [f] = filasDesdeSniper([sn({ enMs: 1000, fase: FASE_RUTA_CERRADA })]);
+    expect(f).toMatchObject({ botId: 299, status: 'tcp_blocked', cls: 'schedule_blocked' });
+  });
+
+  it('una fila `buscando` se traduce a poll sano: corta el episodio', () => {
+    const [f] = filasDesdeSniper([sn({ enMs: 1000 })]);
+    expect(f).toMatchObject({ status: 'ok', cls: null });
+  });
+
+  it('las filas sin botId se descartan', () => {
+    expect(filasDesdeSniper([sn({ enMs: 1, scanKey: 'sin-numero-aqui' })])).toHaveLength(0);
+  });
+
+  it('EL CASO REAL: el corte del sniper se detecta con la regla de siempre', () => {
+    // 2026-09-02: la ruta se cerro, el bot 299 no escribia poll_logs, y el detector
+    // devolvia `ninguna`. Con la segunda fuente, la MISMA regla lo agarra.
+    const AHORA = Date.parse('2026-09-02T15:10:00Z');
+    const filas = filasDesdeSniper([
+      sn({ enMs: AHORA - 200 * 60_000 }),                                  // sano
+      sn({ enMs: AHORA - 100 * 60_000, fase: FASE_RUTA_CERRADA }),         // cae la ruta
+      sn({ enMs: AHORA - 20 * 60_000, fase: FASE_RUTA_CERRADA }),          // sigue caida
+    ]);
+    const r = detectarRutasCerradas(filas, AHORA);
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({ scheduleId: '75610929', bots: [299], severidad: 'alto' });
+    expect(r[0]!.minutos).toBe(100);
+  });
+
+  it('el sniper vuelto a la vida NO deja alerta', () => {
+    const AHORA = Date.parse('2026-09-02T15:10:00Z');
+    const filas = filasDesdeSniper([
+      sn({ enMs: AHORA - 100 * 60_000, fase: FASE_RUTA_CERRADA }),
+      sn({ enMs: AHORA - 2 * 60_000 }),   // volvio a escanear
+    ]);
+    expect(detectarRutasCerradas(filas, AHORA)).toHaveLength(0);
+  });
+
+  it('las dos fuentes se pueden juntar en una sola llamada', () => {
+    const AHORA = Date.parse('2026-09-02T15:10:00Z');
+    const dePoll = [fila({ botId: 7, scheduleId: 'OTRO', enMs: AHORA - 90 * 60_000 })];
+    const deSniper = filasDesdeSniper([sn({ enMs: AHORA - 300 * 60_000, fase: FASE_RUTA_CERRADA })]);
+    const r = detectarRutasCerradas([...dePoll, ...deSniper], AHORA);
+    expect(r.map((x) => x.scheduleId)).toEqual(['75610929', 'OTRO']);
   });
 });

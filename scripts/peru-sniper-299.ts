@@ -396,6 +396,25 @@ async function sesionLista(row: FilaBot): Promise<Sesion> {
       // El refresco fallo. Antes de gastar un login, se pregunta QUE murio.
       if (await cookieSigueViva(sesion)) {
         log(`  [token] sin token, pero /groups responde. Es la ruta del schedule, no la sesion. NO se hace login. Proximo intento en ${minutosEntreDisparos(fallosTokenSeguidos)} min.`);
+        // Se DEJA CONSTANCIA en la base, y no solo en el log.
+        //
+        // El 2026-09-02 la ruta se cerro otra vez y `audit-ruta-cerrada` no la vio: ese
+        // detector lee `poll_logs`, y el bot 299 dejo de pollear cuando se le puso
+        // `pollEnvironments: []` para sacarle carga a esta misma ruta. O sea el detector
+        // era ciego justo para el bot que lo motivo. El unico que sabe la verdad es este
+        // sniper, que ya distingue "la ruta murio" de "la sesion murio". Ahora lo escribe.
+        await registrarEscaneo({
+          fase: 'ruta_cerrada',
+          masTemprana: null,
+          dias: 0,
+          siempre: true,
+          metricas: {
+            motivo: 'sin_token_pero_groups_responde',
+            fallosTokenSeguidos,
+            scheduleId: row.scheduleId,
+            proximoIntentoMin: minutosEntreDisparos(fallosTokenSeguidos),
+          },
+        });
       } else {
         log('  [token] sin token y /groups tampoco responde. Re-login completo.');
         sesion = await abrirSesion(row);

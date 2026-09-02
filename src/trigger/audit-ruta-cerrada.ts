@@ -17,7 +17,10 @@
 import { schedules, logger } from '@trigger.dev/sdk/v3';
 import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { detectarRutasCerradas, textoRutaCerrada, type FilaBloqueo } from '../services/ruta-cerrada.js';
+import {
+  detectarRutasCerradas, textoRutaCerrada, filasDesdeSniper,
+  type FilaBloqueo, type FilaSniper,
+} from '../services/ruta-cerrada.js';
 import { sendTelegram } from '../services/notifications.js';
 
 /**
@@ -47,6 +50,34 @@ export async function leerFilasBloqueo(): Promise<FilaBloqueo[]> {
   }));
 }
 
+/**
+ * Segunda fuente: `sniper_scans`.
+ *
+ * Un bot con `pollEnvironments: []` no escribe `poll_logs`, entonces la primera fuente no
+ * lo ve. Eso le paso al bot 299 el 2026-09-02: la ruta llevaba 40 min cerrada y este
+ * detector devolvia `ninguna`, porque el bot dejo de pollear justo para aliviar esa ruta.
+ *
+ * El sniper si lo sabe: pide `/groups` y la ruta del schedule por separado, y escribe
+ * `ruta_cerrada` cuando la primera responde y la segunda no.
+ */
+export async function leerFilasSniper(): Promise<FilaBloqueo[]> {
+  const filas = await db.execute<Record<string, unknown>>(sql`
+    SELECT s.scan_key, s.phase, s.scanned_at,
+           b.locale, b.schedule_id
+    FROM sniper_scans s
+    LEFT JOIN bots b ON b.id = NULLIF(regexp_replace(s.scan_key, '^.*-', ''), '')::int
+    WHERE s.scanned_at > now() - make_interval(hours => ${HORAS_VENTANA})
+  `);
+  const crudas: FilaSniper[] = filas.rows.map((f) => ({
+    scanKey: String(f.scan_key ?? ''),
+    fase: String(f.phase ?? ''),
+    enMs: new Date(String(f.scanned_at)).getTime(),
+    locale: String(f.locale ?? ''),
+    scheduleId: f.schedule_id === null || f.schedule_id === undefined ? null : String(f.schedule_id),
+  }));
+  return filasDesdeSniper(crudas);
+}
+
 export const auditRutaCerrada = schedules.task({
   id: 'audit-ruta-cerrada',
   cron: {
@@ -58,7 +89,9 @@ export const auditRutaCerrada = schedules.task({
   maxDuration: 120,
 
   run: async () => {
-    const rutas = detectarRutasCerradas(await leerFilasBloqueo(), Date.now());
+    // Las dos fuentes van a la MISMA regla. Ver `filasDesdeSniper`.
+    const [dePoll, deSniper] = await Promise.all([leerFilasBloqueo(), leerFilasSniper()]);
+    const rutas = detectarRutasCerradas([...dePoll, ...deSniper], Date.now());
     if (rutas.length === 0) {
       logger.info('audit-ruta-cerrada: ninguna');
       return { rutas: 0, telegram: false };

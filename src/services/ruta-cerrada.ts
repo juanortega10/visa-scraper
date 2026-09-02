@@ -153,3 +153,59 @@ export function textoRutaCerrada(rutas: RutaCerrada[]): string {
   lineas.push('Cambiar de IP o de proxy NO sirve. Se espera, o se mueve el schedule.');
   return lineas.join('\n');
 }
+
+// ── Segunda fuente: el sniper ────────────────────────────────────────────────
+
+/**
+ * Bot al que pertenece un `scan_key` de `sniper_scans`.
+ *
+ * La convencion es `<locale-corto>-<botId>`, por ejemplo `peru-299`. Se leen los digitos
+ * finales. Un `scan_key` sin digitos finales devuelve `null` y se ignora, porque atribuir
+ * un corte al bot equivocado es peor que no verlo.
+ */
+export function botIdDeScanKey(scanKey: string): number | null {
+  const m = /-(\d+)$/.exec(scanKey.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** Fase que el sniper escribe cuando `/groups` responde y la ruta del schedule no. */
+export const FASE_RUTA_CERRADA = 'ruta_cerrada';
+
+export interface FilaSniper {
+  scanKey: string;
+  fase: string;
+  enMs: number;
+  locale: string;
+  scheduleId: string | null;
+}
+
+/**
+ * Traduce filas del sniper a la MISMA forma que las de `poll_logs`, para que la regla de
+ * arriba se aplique sin cambios. Una regla, dos fuentes.
+ *
+ * ── Por que hace falta la segunda fuente ────────────────────────────────────
+ *
+ * `audit-ruta-cerrada` lee `poll_logs`. El bot 299 dejo de escribir ahi cuando se le puso
+ * `pollEnvironments: []` para sacarle carga a la ruta bloqueada. El 2026-09-02 la ruta se
+ * cerro otra vez y el detector devolvio `ninguna`: era ciego justo para el bot que lo
+ * motivo. El sniper si lo sabe, porque distingue "la ruta murio" de "la sesion murio".
+ */
+export function filasDesdeSniper(filas: FilaSniper[]): FilaBloqueo[] {
+  const out: FilaBloqueo[] = [];
+  for (const f of filas) {
+    const botId = botIdDeScanKey(f.scanKey);
+    if (botId === null) continue;
+    const cerrada = f.fase === FASE_RUTA_CERRADA;
+    out.push({
+      botId,
+      locale: f.locale,
+      scheduleId: f.scheduleId,
+      status: cerrada ? 'tcp_blocked' : 'ok',
+      cls: cerrada ? 'schedule_blocked' : null,
+      enMs: f.enMs,
+    });
+  }
+  return out;
+}
