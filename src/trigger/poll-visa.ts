@@ -7,7 +7,7 @@ import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
 import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
-import { asignadoAlineado, VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
+import { periodoDesdeIntervalo, faseAleatoria, siguienteEnRejilla } from '../services/experimento-estadistica.js';
 import { executeReschedule, MAX_EDAD_TOKEN_MS, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -1799,15 +1799,36 @@ export const pollVisaTask = task({
       // El experimento manda sobre `phaseAligned`: cuando esta prendido, el brazo lo
       // decide la hora y el botId, y el bot alterna solo. Ver `experimento-fase.ts`.
       const enExperimento = bot.phaseExperiment === true;
-      const alinearAhora = enExperimento
-        ? asignadoAlineado(botId, Date.now())
-        : bot.phaseAligned === true;
-      if (alinearAhora) {
+      if (enExperimento) {
+        // ── Fase por REJILLA, sorteada cada minuto ──────────────────────────────
+        //
+        // Antes el brazo alineado ESPERABA a que llegara la ventana s22-32. Medido el
+        // 2026-09-01, esa espera le costo throughput: hueco p50 de 98,2 s contra 75,9 s
+        // del control. Un brazo con menos polls por hora tiene menos oportunidades, y
+        // entonces el experimento dejaba de medir la fase y media el throughput.
+        //
+        // Una rejilla no espera: el intervalo es SIEMPRE el periodo y la fase es libre.
+        // La fase se sortea por (bot, minuto), que hace dos cosas de una vez: cubre todo
+        // el minuto a lo largo del dia, y convierte el minuto en un bloque. Comparar
+        // segundos dentro del mismo minuto baja la sobredispersion de 6,52 a 2,89.
+        //
+        // El brazo ya no se decide de antemano: al analizar se mira EN QUE SEGUNDO
+        // aterrizo cada poll. La aleatorizacion sigue siendo real porque la fase se
+        // sorteo antes de conocer el resultado.
+        const periodo = periodoDesdeIntervalo(baseInterval);
+        const fase = faseAleatoria(botId, Date.now(), periodo);
+        const seg = siguienteEnRejilla({
+          nowMs: Date.now(), periodoSec: periodo, faseSec: fase,
+          // Piso: lo que falte del intervalo natural, para no adelantar un poll.
+          minSec: Math.max(0, baseInterval - elapsedMs / 1000 - periodo),
+        });
+        logger.info('Fase por rejilla (experimento)', {
+          botId, locale: bot.locale, periodo, fase, delaySeconds: Math.round(seg),
+        });
+        normalDelay = `${Math.round(seg)}s`;
+      } else if (bot.phaseAligned === true) {
         const startToStart = Math.max(1, baseInterval - elapsedMs / 1000);
-        // En el experimento la ventana es la APRETADA (s22-32 para es-co), que es la
-        // que se quiere probar. Fuera del experimento se usa la de siempre.
-        const ventana = enExperimento ? VENTANA_EXPERIMENTO[bot.locale ?? ''] : undefined;
-        const al = alignToReleaseWindow({ locale: bot.locale ?? undefined, baseSeconds: startToStart, nowMs: Date.now(), ventana });
+        const al = alignToReleaseWindow({ locale: bot.locale ?? undefined, baseSeconds: startToStart, nowMs: Date.now() });
         if (al.aligned) {
           logger.info('Fase alineada a la ventana de liberacion', {
             botId, locale: bot.locale, naturalSeconds: Math.round(startToStart), alignedSeconds: Math.round(al.seconds),
