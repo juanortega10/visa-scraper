@@ -1,43 +1,137 @@
 /**
- * Reporte diario del A/B de alineacion de fase, a Telegram.
+ * Reporte diario de la fase, a Telegram.
  *
- * El experimento y su porque viven en `src/services/experimento-fase.ts`. Aqui solo
- * se lee la base y se manda el mensaje.
+ * ── Que cambio el 2026-09-01 ────────────────────────────────────────────────
  *
- * La asignacion NO se guarda: se recalcula para cada fila con su propia hora, con la
- * misma funcion que decidio el brazo en el momento del poll. Asi el registro y la
- * realidad no se pueden separar.
+ * Antes este reporte comparaba dos brazos asignados por `(hora + botId) % 2` y contaba la
+ * muestra en polls. Eso daba un veredicto falso: `p = 0,005` calculado sobre 20.445 polls
+ * que en realidad eran 159 bloques bot-hora.
+ *
+ * Ahora el brazo sale del segundo en que REALMENTE aterrizo cada poll, la muestra se
+ * cuenta en eventos, y el intervalo sale de un bootstrap por bloque. Ver
+ * `src/services/experimento-estadistica.ts`.
+ *
+ * El mensaje lleva SIEMPRE el hueco antes del poll junto a la razon. Si los huecos de los
+ * dos grupos no se parecen, la razon mide el hueco y el mensaje lo dice antes del numero.
  */
 import { schedules, logger } from '@trigger.dev/sdk/v3';
 import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { resumirExperimento, textoTelegramExperimento, type FilaPoll } from '../services/experimento-fase.js';
+import {
+  curvaPorSegundo, mejorVentana, analizar, textoTelegramFase, huecosComparables,
+  type FilaSegundo, type BloqueExperimento, type ReporteFase,
+} from '../services/experimento-estadistica.js';
+import { VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
 import { sendTelegram } from '../services/notifications.js';
 
 /** Dias hacia atras que mira el reporte. El experimento es acumulativo. */
 export const DIAS_REPORTE = 14;
+/** Ancho de la ventana que se busca, en segundos. El mismo que la configurada. */
+export const ANCHO_VENTANA = 10;
 
-export async function leerFilasExperimento(dias = DIAS_REPORTE): Promise<FilaPoll[]> {
-  const r = await db.execute<{ bot_id: number; t: string; polls: string; cercanos: string }>(sql`
-    SELECT p.bot_id,
-           p.created_at
-             - make_interval(secs => COALESCE(p.response_time_ms,0)/1000.0)
-             + make_interval(secs => (COALESCE((p.phase_timings->>'load')::int,0)
-                                    + COALESCE((p.phase_timings->>'fetch')::int,0))/1000.0) AS t,
-           COALESCE(p.polls_since_prev, 1) AS polls,
-           (SELECT count(*) FROM jsonb_array_elements_text(COALESCE(p.date_changes->'appeared','[]'::jsonb)) d
-             WHERE d.value ~ '^\\d{4}-\\d{2}-\\d{2}$'
-               AND d.value::date < (now() + interval '6 months')::date) AS cercanos
-    FROM poll_logs p JOIN bots b ON b.id = p.bot_id
-    WHERE b.phase_experiment = true
-      AND p.created_at > now() - (${dias} || ' days')::interval
+export interface FilaFase {
+  botId: number;
+  /** Segundo del minuto en que arranco el fetch. */
+  segundo: number;
+  horaMs: number;
+  polls: number;
+  eventos: number;
+  /** Segundos desde el poll anterior del mismo bot. `null` si es el primero. */
+  huecoSec: number | null;
+}
+
+export async function leerFilasFase(dias = DIAS_REPORTE): Promise<FilaFase[]> {
+  // El instante del fetch se reconstruye quitando el tiempo de respuesta y sumando lo que
+  // se gasto ANTES de pedir (`load` y `fetch` de `phase_timings`). Es la misma expresion
+  // que usaba `analyze-release-clock`.
+  const r = await db.execute<Record<string, unknown>>(sql`
+    WITH x AS (
+      SELECT p.bot_id, p.created_at,
+             p.created_at
+               - make_interval(secs => COALESCE(p.response_time_ms,0)/1000.0)
+               + make_interval(secs => (COALESCE((p.phase_timings->>'load')::int,0)
+                                      + COALESCE((p.phase_timings->>'fetch')::int,0))/1000.0) AS t_fetch,
+             COALESCE(p.polls_since_prev, 1) AS polls,
+             (SELECT count(*) FROM jsonb_array_elements_text(COALESCE(p.date_changes->'appeared','[]'::jsonb)) d
+               WHERE d.value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                 AND d.value::date < (now() + interval '6 months')::date) AS eventos,
+             extract(epoch FROM (p.created_at
+               - lag(p.created_at) OVER (PARTITION BY p.bot_id ORDER BY p.created_at))) AS hueco
+      FROM poll_logs p JOIN bots b ON b.id = p.bot_id
+      WHERE b.phase_experiment = true
+        AND p.created_at > now() - make_interval(days => ${dias})
+    )
+    SELECT bot_id,
+           extract(second FROM t_fetch)::int AS segundo,
+           extract(epoch FROM date_trunc('hour', created_at)) * 1000 AS hora_ms,
+           polls, eventos, hueco
+    FROM x
   `);
   return r.rows.map((f) => ({
     botId: Number(f.bot_id),
-    enMs: Date.parse(String(f.t).replace(' ', 'T') + (String(f.t).endsWith('Z') ? '' : 'Z')),
+    segundo: Number(f.segundo),
+    horaMs: Number(f.hora_ms),
     polls: Number(f.polls ?? 1),
-    cercanos: Number(f.cercanos ?? 0),
+    eventos: Number(f.eventos ?? 0),
+    huecoSec: f.hueco === null || f.hueco === undefined ? null : Number(f.hueco),
   }));
+}
+
+/** ¿Cae `seg` dentro de la ventana? Sirve tambien para una ventana que cruza el minuto. */
+export function dentroDeVentana(seg: number, w: { startSec: number; endSec: number }): boolean {
+  return w.endSec > w.startSec
+    ? seg >= w.startSec && seg < w.endSec
+    : seg >= w.startSec || seg < w.endSec;
+}
+
+/** Bloques bot-hora, separados por si el poll aterrizo dentro de la ventana. */
+export function bloquesPorVentana(filas: FilaFase[], w: { startSec: number; endSec: number }): BloqueExperimento[] {
+  const mapa = new Map<string, BloqueExperimento>();
+  for (const f of filas) {
+    const alineado = dentroDeVentana(f.segundo, w);
+    const k = `${f.botId}|${f.horaMs}|${alineado}`;
+    const b = mapa.get(k) ?? { botId: f.botId, horaMs: f.horaMs, polls: 0, eventos: 0, alineado };
+    b.polls += f.polls;
+    b.eventos += f.eventos;
+    mapa.set(k, b);
+  }
+  return [...mapa.values()];
+}
+
+/** Hueco p50 antes del poll, dentro y fuera de la ventana. Se descartan los absurdos. */
+export function huecoP50(filas: FilaFase[], w: { startSec: number; endSec: number }): { dentro: number; fuera: number } {
+  const d: number[] = [], f: number[] = [];
+  for (const x of filas) {
+    const h = x.huecoSec;
+    if (h === null || !Number.isFinite(h) || h <= 0 || h > 600) continue;
+    (dentroDeVentana(x.segundo, w) ? d : f).push(h);
+  }
+  const p50 = (xs: number[]) => {
+    if (xs.length === 0) return NaN;
+    const y = [...xs].sort((a, b) => a - b);
+    return y[Math.floor(y.length / 2)]!;
+  };
+  return { dentro: p50(d), fuera: p50(f) };
+}
+
+export function armarReporte(filas: FilaFase[], dias = DIAS_REPORTE): ReporteFase | null {
+  const cfg = VENTANA_EXPERIMENTO['es-co'];
+  if (!cfg || filas.length === 0) return null;
+
+  const porSeg: FilaSegundo[] = filas.map((f) => ({ segundo: f.segundo, polls: f.polls, eventos: f.eventos }));
+  const curva = curvaPorSegundo(porSeg);
+  const mv = mejorVentana(curva, ANCHO_VENTANA);
+  const h = huecoP50(filas, cfg);
+
+  return {
+    dias, curva,
+    configurada: { ventana: cfg, analisis: analizar(bloquesPorVentana(filas, cfg)) },
+    mejor: mv
+      ? { ventana: { startSec: mv.startSec, endSec: mv.endSec }, analisis: analizar(bloquesPorVentana(filas, { startSec: mv.startSec, endSec: mv.endSec })) }
+      : null,
+    huecoDentroSec: h.dentro,
+    huecoFueraSec: h.fuera,
+  };
 }
 
 export const reporteExperimentoFaseSchedule = schedules.task({
@@ -51,21 +145,24 @@ export const reporteExperimentoFaseSchedule = schedules.task({
   maxDuration: 120,
 
   run: async () => {
-    const filas = await leerFilasExperimento();
-    if (filas.length === 0) {
-      logger.info('experimento-fase: ningun bot con phase_experiment');
-      return { bots: 0, enviado: false };
+    const filas = await leerFilasFase();
+    const rep = armarReporte(filas);
+    if (!rep) {
+      logger.info('experimento-fase: sin filas o sin ventana configurada');
+      return { filas: filas.length, enviado: false };
     }
-    const r = resumirExperimento(filas);
+    const a = rep.configurada.analisis;
+    const limpio = huecosComparables(rep.huecoDentroSec, rep.huecoFueraSec);
     logger.info('experimento-fase', {
-      alineadoPolls: r.alineado.polls, alineadoPorMil: r.alineado.porMil,
-      controlPolls: r.control.polls, controlPorMil: r.control.porMil,
-      mejora: r.mejora, hayMuestra: r.hayMuestra,
+      dentroPorMil: a.alineado.porMil, fueraPorMil: a.control.porMil,
+      razon: a.razon, ic95: a.ic95, phi: a.sobredispersion,
+      veredicto: a.veredicto, huecosComparables: limpio,
+      huecoDentro: rep.huecoDentroSec, huecoFuera: rep.huecoFueraSec,
     });
-    const enviado = await sendTelegram(textoTelegramExperimento(r, DIAS_REPORTE));
+    const enviado = await sendTelegram(textoTelegramFase(rep));
     return {
-      filas: filas.length, alineado: r.alineado, control: r.control,
-      mejora: r.mejora, hayMuestra: r.hayMuestra, enviado,
+      filas: filas.length, razon: a.razon, ic95: a.ic95,
+      veredicto: a.veredicto, huecosComparables: limpio, enviado,
     };
   },
 });

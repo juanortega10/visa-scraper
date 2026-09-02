@@ -1,6 +1,24 @@
 /**
- * Experimento de alineacion de fase: ¿sirve mover el poll al segundo donde el portal
- * libera cupos?
+ * Ventana de liberacion del portal para el experimento de fase.
+ *
+ * ── Lo que queda aqui, y lo que se fue ──────────────────────────────────────
+ *
+ * El 2026-09-01 este archivo tenia el diseño de dos brazos por hora (`asignadoAlineado`)
+ * y su lectura por poll (`resumirExperimento`). Los dos se retiraron:
+ *
+ *   - Los brazos por hora hacian que el bot ENTERO cayera en un brazo durante una hora,
+ *     entonces la unidad aleatorizada era el bot-hora. Leer por poll fingia 20.445
+ *     observaciones donde habia 159 bloques, y producia `p = 0,005` sobre un empate.
+ *   - Ademas el brazo alineado ESPERABA para entrar a la ventana, y esa espera le costaba
+ *     throughput: hueco p50 de 98,2 s contra 75,9 s. El experimento medía el hueco.
+ *
+ * El reemplazo vive en `src/services/experimento-estadistica.ts`: fase por rejilla
+ * sorteada cada minuto, brazo tomado del segundo en que REALMENTE aterrizo el poll,
+ * muestra contada en eventos, e intervalo por bootstrap de bloques.
+ *
+ * Esta constante se queda porque sigue siendo la ventana que se esta probando.
+ *
+ * ── El experimento original: ¿sirve mover el poll al segundo de la liberacion? ──
  *
  * ── Lo que se sabe, medido ──────────────────────────────────────────────────
  *
@@ -35,136 +53,9 @@
  *
  * No se aprieta mas: con es-co en 20-30 s de intervalo caben 2 o 3 polls por minuto,
  * y una ventana de 6 s no deja lugar para el jitter ni para que el poll se corra.
- *
- * ── El diseno del experimento ───────────────────────────────────────────────
- *
- * Comparar unos bots contra otros NO sirve: quedan 5 bots es-co activos y cada uno
- * tiene su cita, su ciudad y su ritmo. Cinco contra cero no da senal.
- *
- * Por eso cada bot es su PROPIO control y alterna por hora. En cualquier hora
- * aproximadamente la mitad de la flota esta alineada, y a lo largo de un dia cada
- * bot pasa por las dos condiciones en todas las horas. Eso controla la identidad del
- * bot y la hora del dia a la vez, que son los dos factores que mas mueven la tasa.
- *
- * La asignacion es DETERMINISTA a partir de (hora, botId). No se guarda en ninguna
- * parte: al reportar se recalcula para cada fila de `poll_logs` con su propia hora.
- * Sin tabla nueva y sin riesgo de que el registro y la realidad se separen.
  */
 
-/** Ventana apretada que usa el brazo ALINEADO. Ver la tabla de arriba. */
+/** Ventana que se esta probando. Ver la tabla de arriba. */
 export const VENTANA_EXPERIMENTO: Record<string, { startSec: number; endSec: number }> = {
   'es-co': { startSec: 22, endSec: 32 },
 };
-
-/** Horas UTC completas desde la epoca. Es la unidad de alternancia. */
-export function horaEpoca(ahoraMs: number): number {
-  return Math.floor(ahoraMs / 3_600_000);
-}
-
-/**
- * ¿Le toca alinearse a este bot en esta hora?
- *
- * `(hora + botId) % 2` y no `hora % 2` a proposito: con `hora % 2` toda la flota
- * cambiaria de brazo al mismo tiempo, y cualquier cosa que le pase al portal en una
- * hora concreta caeria entera sobre un solo brazo. Sumando el `botId` los dos brazos
- * coexisten en cada hora y el efecto del portal se reparte.
- */
-export function asignadoAlineado(botId: number, ahoraMs: number): boolean {
-  return (horaEpoca(ahoraMs) + botId) % 2 === 0;
-}
-
-// ── Lectura de resultados ────────────────────────────────────────────────────
-
-export interface FilaPoll {
-  botId: number;
-  /** Momento del poll. Se usa su hora para recalcular el brazo. */
-  enMs: number;
-  /** Polls REALES que representa la fila (`polls_since_prev`). */
-  polls: number;
-  /** Cupos a menos de 6 meses que aparecieron en ese poll. */
-  cercanos: number;
-}
-
-export interface BrazoResumen {
-  polls: number;
-  cercanos: number;
-  /** Cupos cercanos por cada 1.000 polls reales. Es la unica cifra comparable. */
-  porMil: number;
-}
-
-export interface ResumenExperimento {
-  alineado: BrazoResumen;
-  control: BrazoResumen;
-  /** `alineado.porMil / control.porMil`. 1 = no hay diferencia. */
-  mejora: number;
-  /** true cuando los DOS brazos tienen suficiente para que la cifra signifique algo. */
-  hayMuestra: boolean;
-  /** Polls minimos por brazo que exige `hayMuestra`. */
-  minimoPorBrazo: number;
-}
-
-/**
- * Muestra minima por brazo antes de creerle al numero.
- *
- * Con la tasa base de es-co (unos 66 cupos cercanos por cada 1.000 polls), 20.000
- * polls por brazo dan del orden de 1.300 eventos, y ahi una diferencia de 20% ya se
- * distingue del ruido. Por debajo de eso el cociente salta de un dia a otro y lleva
- * a concluir cualquier cosa.
- */
-export const MIN_POLLS_POR_BRAZO = 20_000;
-
-export function resumirExperimento(filas: FilaPoll[]): ResumenExperimento {
-  const vacio = (): { polls: number; cercanos: number } => ({ polls: 0, cercanos: 0 });
-  const a = vacio();
-  const c = vacio();
-  for (const f of filas) {
-    const dest = asignadoAlineado(f.botId, f.enMs) ? a : c;
-    dest.polls += f.polls;
-    dest.cercanos += f.cercanos;
-  }
-  const porMil = (x: { polls: number; cercanos: number }) =>
-    x.polls > 0 ? Math.round((10_000 * x.cercanos) / x.polls) / 10 : 0;
-  const alineado: BrazoResumen = { ...a, porMil: porMil(a) };
-  const control: BrazoResumen = { ...c, porMil: porMil(c) };
-  return {
-    alineado,
-    control,
-    mejora: control.porMil > 0 ? Math.round((100 * alineado.porMil) / control.porMil) / 100 : 0,
-    hayMuestra: a.polls >= MIN_POLLS_POR_BRAZO && c.polls >= MIN_POLLS_POR_BRAZO,
-    minimoPorBrazo: MIN_POLLS_POR_BRAZO,
-  };
-}
-
-/**
- * Mensaje diario para Telegram.
- *
- * Dice el veredicto en la primera linea, porque es lo unico que se lee en una
- * notificacion. Y cuando NO hay muestra lo dice en vez de mostrar un cociente que
- * todavia no significa nada: un experimento que reporta un ganador demasiado pronto
- * es peor que uno que calla.
- */
-export function textoTelegramExperimento(r: ResumenExperimento, dias: number): string {
-  const pct = (r.mejora - 1) * 100;
-  const titulo = !r.hayMuestra
-    ? '⏳ *Fase alineada: sin veredicto todavia*'
-    : r.mejora >= 1.15 ? '🟢 *Fase alineada: GANA*'
-    : r.mejora <= 0.9 ? '🔴 *Fase alineada: PIERDE*'
-    : '⚪ *Fase alineada: empata*';
-
-  const falta = r.hayMuestra
-    ? ''
-    : `\nFalta muestra: ${Math.max(0, r.minimoPorBrazo - r.alineado.polls).toLocaleString('es-CO')} polls alineados y ` +
-      `${Math.max(0, r.minimoPorBrazo - r.control.polls).toLocaleString('es-CO')} de control.`;
-
-  return [
-    titulo,
-    `${dias} d · s${VENTANA_EXPERIMENTO['es-co']!.startSec}-${VENTANA_EXPERIMENTO['es-co']!.endSec - 1}`,
-    '',
-    `alineado  ${r.alineado.porMil} cupos/1.000 polls  (${r.alineado.polls.toLocaleString('es-CO')} polls)`,
-    `control   ${r.control.porMil} cupos/1.000 polls  (${r.control.polls.toLocaleString('es-CO')} polls)`,
-    '',
-    r.hayMuestra
-      ? `diferencia ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%`
-      : 'la diferencia se reporta cuando los dos brazos lleguen a la muestra minima.',
-  ].join('\n') + falta;
-}

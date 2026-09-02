@@ -130,7 +130,7 @@ export const bots = pgTable(
     phaseAligned: boolean('phase_aligned').notNull().default(false),
     /**
      * A/B de la alineacion de fase. Cuando es true, `phaseAligned` deja de mandar y
-     * el brazo lo decide `asignadoAlineado(botId, ahora)`: el bot alterna por hora y
+     * la fase se sortea cada minuto (`faseAleatoria`) y el brazo sale del segundo en que
      * es su propio control. Ver `src/services/experimento-fase.ts`.
      */
     phaseExperiment: boolean('phase_experiment').notNull().default(false),
