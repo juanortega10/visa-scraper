@@ -19,8 +19,9 @@ import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   curvaPorSegundo, mejorVentana, analizar, textoTelegramFase, huecosComparables,
-  fraccionEnRejilla, periodoDesdeIntervalo,
-  type FilaSegundo, type BloqueExperimento, type ReporteFase,
+  veredictoEstratificado,
+  fraccionEnRejilla, periodoDesdeIntervalo, ESTRATOS_HUECO,
+  type FilaSegundo, type BloqueExperimento, type ReporteFase, type EstratoResultado,
 } from '../services/experimento-estadistica.js';
 import { VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
 import { DEFAULT_POLL_INTERVAL_S } from '../services/scheduling.js';
@@ -141,8 +142,20 @@ export function armarReporte(filas: FilaFase[], dias = DIAS_REPORTE): ReporteFas
   const periodoSec = periodoDesdeIntervalo(DEFAULT_POLL_INTERVAL_S);
   const huecos = filas.map((f) => f.huecoSec).filter((x): x is number => x !== null);
 
+  // Un estrato por mecanismo. Ver `ESTRATOS_HUECO`.
+  const estratos: EstratoResultado[] = ESTRATOS_HUECO.map((e) => {
+    const dentro = filas.filter((f) => f.huecoSec !== null && f.huecoSec >= e.minSec && f.huecoSec <= e.maxSec);
+    const hh = huecoP50(dentro, cfg);
+    return {
+      nombre: e.nombre, minSec: e.minSec, maxSec: e.maxSec, filas: dentro.length,
+      analisis: analizar(bloquesPorVentana(dentro, cfg)),
+      huecoDentroSec: hh.dentro, huecoFueraSec: hh.fuera,
+      comparable: huecosComparables(hh.dentro, hh.fuera),
+    };
+  });
+
   return {
-    dias, curva,
+    dias, curva, estratos,
     enRejilla: fraccionEnRejilla(huecos, periodoSec),
     periodoSec,
     configurada: { ventana: cfg, analisis: analizar(bloquesPorVentana(filas, cfg)) },
@@ -172,17 +185,22 @@ export const reporteExperimentoFaseSchedule = schedules.task({
       return { filas: filas.length, enviado: false };
     }
     const a = rep.configurada.analisis;
-    const limpio = huecosComparables(rep.huecoDentroSec, rep.huecoFueraSec);
+    const est = veredictoEstratificado(rep.estratos);
     logger.info('experimento-fase', {
-      dentroPorMil: a.alineado.porMil, fueraPorMil: a.control.porMil,
-      razon: a.razon, ic95: a.ic95, phi: a.sobredispersion,
-      veredicto: a.veredicto, huecosComparables: limpio,
+      veredicto: est.veredicto,
+      estratosLimpios: est.usables.length,
+      estratos: rep.estratos.map((e) => ({
+        nombre: e.nombre, razon: e.analisis.razon, ic95: e.analisis.ic95,
+        phi: e.analisis.sobredispersion, comparable: e.comparable, filas: e.filas,
+      })),
+      agrupado: { razon: a.razon, phi: a.sobredispersion },
       huecoDentro: rep.huecoDentroSec, huecoFuera: rep.huecoFueraSec,
+      enRejilla: rep.enRejilla,
     });
     const enviado = await sendTelegram(textoTelegramFase(rep));
     return {
-      filas: filas.length, razon: a.razon, ic95: a.ic95,
-      veredicto: a.veredicto, huecosComparables: limpio, enviado,
+      filas: filas.length, veredicto: est.veredicto,
+      estratosLimpios: est.usables.length, agrupado: a.razon, enviado,
     };
   },
 });

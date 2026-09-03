@@ -394,6 +394,8 @@ export interface ReporteFase {
   enRejilla: number;
   /** Periodo de la rejilla que se esta usando, en segundos. */
   periodoSec: number;
+  /** Analisis por estrato de hueco. Es de donde sale el veredicto. */
+  estratos: EstratoResultado[];
 }
 
 /** Los huecos tienen que parecerse para que la razon signifique algo. */
@@ -422,44 +424,44 @@ export function huecosComparables(dentro: number, fuera: number): boolean {
 export function textoTelegramFase(r: ReporteFase): string {
   const a = r.configurada.analisis;
   const w = r.configurada.ventana;
-  const limpio = huecosComparables(r.huecoDentroSec, r.huecoFueraSec);
+  const { veredicto, usables } = veredictoEstratificado(r.estratos);
 
-  const titulo = !limpio
-    ? '⚠️ *Fase: la muestra esta contaminada*'
-    : a.veredicto === 'gana' ? '🟢 *Fase: la ventana GANA*'
-    : a.veredicto === 'pierde' ? '🔴 *Fase: la ventana PIERDE*'
-    : a.veredicto === 'empata' ? '⚪ *Fase: empate, con muestra suficiente*'
+  const titulo =
+    veredicto === 'gana' ? '🟢 *Fase: la ventana GANA*'
+    : veredicto === 'pierde' ? '🔴 *Fase: la ventana PIERDE*'
+    : veredicto === 'empata' ? '⚪ *Fase: empate*'
     : '⏳ *Fase: sin veredicto todavia*';
 
   const lineas = [
     titulo,
     `${r.dias} d · ventana s${w.startSec}-${(w.endSec + 59) % 60}`,
     '',
-    `dentro  ${a.alineado.porMil} por mil  (${a.alineado.eventos} eventos)`,
-    `fuera   ${a.control.porMil} por mil  (${a.control.eventos} eventos)`,
-    `razon ${a.razon}  IC95 [${a.ic95[0]}, ${a.ic95[1]}]`,
   ];
 
-  if (!limpio) {
-    lineas.push('');
-    lineas.push(`Hueco antes del poll: dentro ${Math.round(r.huecoDentroSec)} s, fuera ${Math.round(r.huecoFueraSec)} s.`);
-    lineas.push('Con huecos distintos, la razon mide el hueco y no la fase. No decidas con esto.');
-    // La fraccion en rejilla dice si esperar sirve. Si la rejilla esta puesta, los huecos
-    // se van limpiando solos; si no lo esta, esperar no arregla nada.
-    lineas.push(`Rejilla de ${r.periodoSec} s: ${Math.round(100 * r.enRejilla)}% de los huecos.`);
-  } else if (a.veredicto === 'sin-muestra') {
-    lineas.push('');
-    lineas.push(`Faltan eventos: ${Math.max(0, a.eventosNecesarios - a.alineado.eventos)} dentro y ` +
-      `${Math.max(0, a.eventosNecesarios - a.control.eventos)} fuera.`);
+  // Los ESTRATOS van primero, porque son los que deciden. El hueco confunde la
+  // comparacion agrupada, y condicionar en el hueco la limpia: medido el 2026-09-03, la
+  // sobredispersion dentro de un estrato es 1,0 contra 6,97 en el agrupado.
+  for (const e of r.estratos) {
+    const ea = e.analisis;
+    lineas.push(
+      `${e.comparable ? '·' : '✕'} ${e.nombre} (${e.minSec}-${e.maxSec} s)  ` +
+      `razon ${ea.razon}  IC [${ea.ic95[0]}, ${ea.ic95[1]}]`,
+    );
+    if (!e.comparable) {
+      lineas.push(`   descartado: huecos ${Math.round(e.huecoDentroSec)} s contra ${Math.round(e.huecoFueraSec)} s`);
+    }
   }
+
+  lineas.push('');
+  lineas.push(usables.length < 2
+    ? `Solo ${usables.length} estrato limpio. Hacen falta 2 que concuerden.`
+    : `${usables.length} estratos limpios y de acuerdo.`);
+  lineas.push(`agrupado (contaminado): razon ${a.razon}, huecos ${Math.round(r.huecoDentroSec)} s contra ${Math.round(r.huecoFueraSec)} s`);
 
   if (r.mejor) {
     const m = r.mejor;
     lineas.push('');
-    lineas.push(`mejor ventana medida s${m.ventana.startSec}-${(m.ventana.endSec + 59) % 60} · ` +
-      `${m.analisis.alineado.porMil} por mil · razon ${m.analisis.razon}`);
-    // La ventana se eligio mirando estos mismos datos, entonces su cifra viene inflada.
-    // Sirve para proponer la ventana siguiente, nunca para declarar un hallazgo.
+    lineas.push(`mejor ventana medida s${m.ventana.startSec}-${(m.ventana.endSec + 59) % 60} · razon ${m.analisis.razon}`);
     lineas.push('(elegida mirando estos datos: sirve para proponer, no para concluir)');
   }
   return lineas.join('\n');
@@ -495,4 +497,71 @@ export function fraccionEnRejilla(huecosSec: number[], periodoSec: number, toler
     if (Math.min(resto, p - resto) <= tolerancia) dentro += 1;
   }
   return Math.round((dentro / utiles.length) * 1000) / 1000;
+}
+
+// ── Estratos por hueco ──────────────────────────────────────────────────────
+
+/**
+ * El hueco antes del poll confundia la comparacion. La salida es ESTRATIFICAR.
+ *
+ * ── Por que estratificar y no esperar ───────────────────────────────────────
+ *
+ * Medido el 2026-09-03 con 21 h de rejilla: el sesgo del hueco NO cedio (112 s dentro
+ * contra 59 s fuera) y la rejilla se quedo en el 31% de los huecos, porque el cron de 2
+ * minutos aporta el resto. Esperar mas no lo arregla.
+ *
+ * Pero el hueco es una variable PREVIA al poll: lo fija el planificador antes de pedir
+ * nada, entonces condicionar en el no puede estar contaminado por el resultado. Es el
+ * arreglo de libro para un confusor, y funciona de inmediato:
+ *
+ *     estrato          hueco D/F   cociente   razon   IC95            phi
+ *     15 a 30 s        21/20 s       1,04      2,741  [1,60 a 4,45]   1,0
+ *     100 a 140 s     121/118 s      1,03      3,646  [2,12 a 6,49]   1,0
+ *     todo junto      112/59 s       1,89      2,445  [1,82 a 3,27]   6,97
+ *
+ * Y el dato que cierra el caso: dentro de un estrato la SOBREDISPERSION ES 1,0. O sea el
+ * 6,97 del analisis agrupado era entero la mezcla de huecos. Condicionado, el dato es
+ * Poisson puro.
+ *
+ * ── Los dos estratos, y por que estos ──────────────────────────────────────
+ *
+ * No se eligieron mirando el resultado: corresponden a los DOS mecanismos que existen.
+ * La rejilla encadena cada 20 s, y el cron de respaldo cae cada 2 min. Las bandas se
+ * abren un poco a cada lado para absorber lo que tarda el propio poll.
+ */
+export const ESTRATOS_HUECO: Array<{ nombre: string; minSec: number; maxSec: number }> = [
+  { nombre: 'cadena de 20 s', minSec: 15, maxSec: 30 },
+  { nombre: 'cron de 2 min', minSec: 100, maxSec: 140 },
+];
+
+export interface EstratoResultado {
+  nombre: string;
+  minSec: number;
+  maxSec: number;
+  filas: number;
+  analisis: AnalisisExperimento;
+  huecoDentroSec: number;
+  huecoFueraSec: number;
+  comparable: boolean;
+}
+
+/**
+ * Veredicto del conjunto de estratos.
+ *
+ * Solo cuentan los estratos COMPARABLES: en los demas el hueco sigue mandando y su razon
+ * no significa nada. Y hacen falta al menos dos que concuerden, porque un solo estrato
+ * limpio puede ser una casualidad de ese mecanismo.
+ */
+export function veredictoEstratificado(estratos: EstratoResultado[]): {
+  veredicto: Veredicto;
+  usables: EstratoResultado[];
+} {
+  const usables = estratos.filter((e) => e.comparable && e.analisis.veredicto !== 'sin-muestra');
+  if (usables.length < 2) return { veredicto: 'sin-muestra', usables };
+  const ganan = usables.filter((e) => e.analisis.veredicto === 'gana').length;
+  const pierden = usables.filter((e) => e.analisis.veredicto === 'pierde').length;
+  if (ganan === usables.length) return { veredicto: 'gana', usables };
+  if (pierden === usables.length) return { veredicto: 'pierde', usables };
+  // Estratos que se contradicen. No es un empate: es una señal de que falta algo.
+  return { veredicto: 'sin-muestra', usables };
 }

@@ -5,6 +5,8 @@ import {
   siguienteEnRejilla, periodoValido, periodoDesdeIntervalo, faseAleatoria,
   curvaPorSegundo, mejorVentana, type FilaSegundo,
   textoTelegramFase, huecosComparables, fraccionEnRejilla, type ReporteFase,
+  veredictoEstratificado, ESTRATOS_HUECO,
+  type EstratoResultado, type AnalisisExperimento,
   type BloqueExperimento,
 } from '../experimento-estadistica.js';
 
@@ -68,6 +70,16 @@ describe('sobredispersion', () => {
   it('datos con rafagas dan mucho mas que 1', () => {
     const b = bloques(60, { evAlineado: 20, evControl: 20, ruido: 4 });
     expect(sobredispersion(b)).toBeGreaterThan(2);
+  });
+
+  it('con UN solo bloque usable devuelve 1: no hay dispersion que medir', () => {
+    // Con un bloque, la tasa global ES la del bloque y el chi2 sale 0. Devolver eso
+    // apagaria la inflacion del error justo cuando menos se sabe.
+    const b: BloqueExperimento[] = [
+      { botId: 1, horaMs: 0, polls: 500, eventos: 40, alineado: true },
+      { botId: 1, horaMs: HORA, polls: 3, eventos: 0, alineado: false },
+    ];
+    expect(sobredispersion(b)).toBe(1);
   });
 
   it('los bloques con pocos polls se excluyen: su esperanza no significa nada', () => {
@@ -467,23 +479,26 @@ describe('curva por segundo', () => {
 });
 
 describe('mensaje diario de fase', () => {
-  const anal = (evD: number, evF: number, pollsD = 300, pollsF = 300, ruido = 2) => {
+  const anal2 = (evD: number, evF: number, n = 120): AnalisisExperimento => {
     const b: BloqueExperimento[] = [];
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < n; i++) {
       const al = i % 2 === 0;
-      const r = Math.round(ruido * ((i * 7919) % 11 - 5));
-      b.push({ botId: 1, horaMs: i * 3_600_000, polls: al ? pollsD : pollsF,
-        eventos: Math.max(0, (al ? evD : evF) + r), alineado: al });
+      b.push({ botId: 1, horaMs: i * 3_600_000, polls: 300, eventos: al ? evD : evF, alineado: al });
     }
     return analizar(b);
   };
+  const estr = (o: Partial<EstratoResultado> = {}): EstratoResultado => ({
+    nombre: 'cadena de 20 s', minSec: 15, maxSec: 30, filas: 900,
+    analisis: anal2(30, 10), huecoDentroSec: 21, huecoFueraSec: 20, comparable: true, ...o,
+  });
   const rep = (o: Partial<ReporteFase> = {}): ReporteFase => ({
     dias: 14,
-    curva: curvaPorSegundo(Array.from({ length: 60 }, (_, s) => ({ segundo: s, polls: 200, eventos: 4 }))),
-    configurada: { ventana: { startSec: 22, endSec: 32 }, analisis: anal(30, 10) },
+    curva: curvaPorSegundo(Array.from({ length: 60 }, (_, s2) => ({ segundo: s2, polls: 200, eventos: 4 }))),
+    configurada: { ventana: { startSec: 22, endSec: 32 }, analisis: anal2(30, 10) },
     mejor: null,
-    huecoDentroSec: 90, huecoFueraSec: 85,
-    enRejilla: 0.7, periodoSec: 20,
+    huecoDentroSec: 112, huecoFueraSec: 59,
+    enRejilla: 0.31, periodoSec: 20,
+    estratos: [estr(), estr({ nombre: 'cron de 2 min', minSec: 100, maxSec: 140, huecoDentroSec: 121, huecoFueraSec: 118 })],
     ...o,
   });
 
@@ -493,13 +508,10 @@ describe('mensaje diario de fase', () => {
   });
 
   it('huecos al doble NO son comparables', () => {
-    // El caso real: 177 s dentro contra 85 s fuera.
     expect(huecosComparables(177, 85)).toBe(false);
   });
 
   it('el sesgo se detecta en LOS DOS sentidos', () => {
-    // Huecos de dentro mas CORTOS enmascaran el efecto en vez de inflarlo, y tambien
-    // invalidan la comparacion.
     expect(huecosComparables(40, 90)).toBe(false);
     expect(huecosComparables(90, 40)).toBe(false);
   });
@@ -510,49 +522,43 @@ describe('mensaje diario de fase', () => {
     expect(huecosComparables(90, NaN)).toBe(false);
   });
 
-  it('con huecos sucios se reporta cuanta rejilla hay: dice si esperar sirve', () => {
-    const t = textoTelegramFase(rep({ huecoDentroSec: 177, huecoFueraSec: 85, enRejilla: 0.62, periodoSec: 20 }));
-    expect(t).toMatch(/Rejilla de 20 s: 62%/);
+  it('el veredicto sale de los ESTRATOS, no del agrupado', () => {
+    // El agrupado esta contaminado (huecos 112 s contra 59 s) y los dos estratos estan
+    // limpios y de acuerdo. El titulo tiene que salir de los estratos.
+    const t = textoTelegramFase(rep());
+    expect(t).toMatch(/GANA/);
+    expect(t).toMatch(/2 estratos limpios y de acuerdo/);
   });
 
-  it('con huecos limpios NO habla de la rejilla: ya no hace falta', () => {
-    expect(textoTelegramFase(rep())).not.toMatch(/Rejilla de/);
+  it('el agrupado se reporta MARCADO como contaminado', () => {
+    // Se muestra para poder comparar, y con su etiqueta para que nadie lo lea solo.
+    expect(textoTelegramFase(rep())).toMatch(/agrupado \(contaminado\): razon/);
   });
 
-  it('con huecos sucios el titulo AVISA y pide no decidir', () => {
-    // Aunque el veredicto diga "gana". Es lo que faltaba el 2026-09-01.
-    const t = textoTelegramFase(rep({ huecoDentroSec: 177, huecoFueraSec: 85 }));
-    expect(t).toMatch(/contaminada/);
-    expect(t).toMatch(/No decidas/);
+  it('un estrato sucio se marca y se dice por que', () => {
+    const t = textoTelegramFase(rep({
+      estratos: [estr(), estr({ nombre: 'cron de 2 min', comparable: false, huecoDentroSec: 150, huecoFueraSec: 50 })],
+    }));
+    expect(t).toMatch(/✕ cron de 2 min/);
+    expect(t).toMatch(/descartado: huecos 150 s contra 50 s/);
+    expect(t).toMatch(/Solo 1 estrato limpio/);
     expect(t).not.toMatch(/GANA/);
   });
 
-  it('con huecos limpios y un IC que excluye 1, dice que gana', () => {
+  it('cada estrato lleva su razon y su intervalo', () => {
     const t = textoTelegramFase(rep());
-    expect(t).toMatch(/GANA/);
-    expect(t).not.toMatch(/contaminada/);
-  });
-
-  it('siempre lleva la razon Y su intervalo', () => {
-    const t = textoTelegramFase(rep());
-    expect(t).toMatch(/razon [\d.]+  IC95 \[/);
-  });
-
-  it('sin muestra dice cuantos eventos faltan de cada lado', () => {
-    const t = textoTelegramFase(rep({ configurada: { ventana: { startSec: 22, endSec: 32 }, analisis: anal(2, 2, 100, 100, 1) } }));
-    expect(t).toMatch(/sin veredicto/);
-    expect(t).toMatch(/Faltan eventos/);
+    expect(t).toMatch(/cadena de 20 s \(15-30 s\)  razon [\d.]+  IC \[/);
+    expect(t).toMatch(/cron de 2 min \(100-140 s\)  razon/);
   });
 
   it('la mejor ventana se marca como elegida mirando los datos', () => {
-    // Sin esa marca, una cifra inflada por la busqueda parece un hallazgo.
-    const t = textoTelegramFase(rep({ mejor: { ventana: { startSec: 21, endSec: 31 }, analisis: anal(30, 10) } }));
+    const t = textoTelegramFase(rep({ mejor: { ventana: { startSec: 21, endSec: 31 }, analisis: anal2(30, 10) } }));
     expect(t).toMatch(/mejor ventana medida s21-30/);
     expect(t).toMatch(/sirve para proponer, no para concluir/);
   });
 
   it('cabe en una notificacion', () => {
-    const t = textoTelegramFase(rep({ huecoDentroSec: 177, huecoFueraSec: 85, mejor: { ventana: { startSec: 21, endSec: 31 }, analisis: anal(30, 10) } }));
+    const t = textoTelegramFase(rep({ mejor: { ventana: { startSec: 21, endSec: 31 }, analisis: anal2(30, 10) } }));
     expect(t.split('\n').length).toBeLessThanOrEqual(16);
   });
 });
@@ -596,5 +602,87 @@ describe('fraccion en rejilla', () => {
   it('un periodo de 30 no confunde un hueco de 20', () => {
     expect(fraccionEnRejilla([20], 30)).toBe(0);
     expect(fraccionEnRejilla([30, 60], 30)).toBe(1);
+  });
+});
+
+describe('veredicto estratificado', () => {
+  const anal = (evD: number, evF: number, n = 120): AnalisisExperimento => {
+    const b: BloqueExperimento[] = [];
+    for (let i = 0; i < n; i++) {
+      const al = i % 2 === 0;
+      b.push({ botId: 1, horaMs: i * 3_600_000, polls: 300, eventos: al ? evD : evF, alineado: al });
+    }
+    return analizar(b);
+  };
+  const est = (o: Partial<EstratoResultado> = {}): EstratoResultado => ({
+    nombre: 'x', minSec: 15, maxSec: 30, filas: 900,
+    analisis: anal(30, 10),
+    huecoDentroSec: 21, huecoFueraSec: 20, comparable: true,
+    ...o,
+  });
+
+  it('dos estratos comparables que ganan dan GANA', () => {
+    // El caso real del 2026-09-03: cadena de 20 s y cron de 2 min, los dos limpios.
+    const r = veredictoEstratificado([est(), est({ nombre: 'cron', minSec: 100, maxSec: 140 })]);
+    expect(r.veredicto).toBe('gana');
+    expect(r.usables).toHaveLength(2);
+  });
+
+  it('UN solo estrato limpio no alcanza', () => {
+    // Un mecanismo solo puede tener su propia rareza. Hacen falta dos que concuerden.
+    const r = veredictoEstratificado([est(), est({ comparable: false })]);
+    expect(r.veredicto).toBe('sin-muestra');
+    expect(r.usables).toHaveLength(1);
+  });
+
+  it('los estratos NO comparables se descartan, aunque digan que gana', () => {
+    // En ellos el hueco sigue mandando: su razon no significa nada.
+    const r = veredictoEstratificado([
+      est({ comparable: false, huecoDentroSec: 112, huecoFueraSec: 59 }),
+      est({ comparable: false }),
+      est({ comparable: false }),
+    ]);
+    expect(r.veredicto).toBe('sin-muestra');
+    expect(r.usables).toHaveLength(0);
+  });
+
+  it('dos estratos que se contradicen NO dan empate: dan sin-muestra', () => {
+    // Si un mecanismo dice que gana y el otro que pierde, falta algo por entender.
+    const r = veredictoEstratificado([est(), est({ analisis: anal(10, 30) })]);
+    expect(r.veredicto).toBe('sin-muestra');
+  });
+
+  it('una MAYORIA no basta: hacen falta todos de acuerdo', () => {
+    // Dos que ganan y uno que pierde. Con mayoria seria "gana"; con unanimidad es una
+    // contradiccion, y una contradiccion entre mecanismos quiere decir que falta algo.
+    const r = veredictoEstratificado([est(), est(), est({ analisis: anal(10, 30) })]);
+    expect(r.usables).toHaveLength(3);
+    expect(r.veredicto).toBe('sin-muestra');
+  });
+
+  it('dos estratos comparables que pierden dan PIERDE', () => {
+    const r = veredictoEstratificado([est({ analisis: anal(10, 30) }), est({ analisis: anal(10, 30) })]);
+    expect(r.veredicto).toBe('pierde');
+  });
+
+  it('un estrato sin muestra no cuenta como voto', () => {
+    const r = veredictoEstratificado([est(), est({ analisis: anal(1, 1, 44) })]);
+    expect(r.veredicto).toBe('sin-muestra');
+    expect(r.usables).toHaveLength(1);
+  });
+
+  it('sin estratos no revienta', () => {
+    expect(veredictoEstratificado([]).veredicto).toBe('sin-muestra');
+  });
+
+  it('los estratos corresponden a los dos mecanismos reales', () => {
+    // 20 s es la cadena de la rejilla, 120 s es el cron de respaldo. Si alguien cambia
+    // uno de los dos relojes, estas bandas dejan de servir.
+    expect(ESTRATOS_HUECO).toHaveLength(2);
+    const [cadena, cron] = ESTRATOS_HUECO;
+    expect(cadena!.minSec).toBeLessThan(20);
+    expect(cadena!.maxSec).toBeGreaterThan(20);
+    expect(cron!.minSec).toBeLessThan(120);
+    expect(cron!.maxSec).toBeGreaterThan(120);
   });
 });
