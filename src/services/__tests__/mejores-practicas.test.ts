@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   RAFAGA_LIBERACION, pollsPorMinuto, planRafaga, siguienteEnRafaga, peorLatenciaSec,
+  bordeDeSubida, bordeSeMovio,
 } from '../mejores-practicas.js';
 
 /**
@@ -168,5 +169,83 @@ describe('la ventana sale del borde, no de la meseta', () => {
     const w = RAFAGA_LIBERACION['es-co']!;
     expect(w.anchoSec).toBeGreaterThanOrEqual(6);
     expect(w.anchoSec).toBeLessThanOrEqual(14);
+  });
+});
+
+describe('el centinela: donde esta el borde', () => {
+  const curva = (alt: (s: number) => number, polls = 40) =>
+    Array.from({ length: 60 }, (_, s) => ({ segundo: s, suave: alt(s), polls }));
+  /** Meseta de `ancho` segundos que arranca en `inicio`. Es la forma real. */
+  const meseta = (inicio: number, ancho = 21, alto = 110, bajo = 6) =>
+    curva((s) => {
+      const d = (s - inicio + 60) % 60;
+      return d < ancho ? alto : bajo;
+    });
+
+  it('encuentra el borde donde arranca la meseta', () => {
+    expect(bordeDeSubida(meseta(11))).toBe(11);
+    expect(bordeDeSubida(meseta(25))).toBe(25);
+  });
+
+  it('el borde a caballo del cambio de minuto no se parte', () => {
+    expect(bordeDeSubida(meseta(58))).toBe(58);
+  });
+
+  it('la busqueda DA LA VUELTA al minuto', () => {
+    // Con el borde en s0 el valle empieza en s21, entonces hay que recorrer hasta s59 y
+    // SEGUIR por s0. Una busqueda recortada en s59 devuelve null y el centinela se queda
+    // mudo justo cuando el portal libera en el cambio de minuto.
+    expect(bordeDeSubida(meseta(0))).toBe(0);
+  });
+
+  it('devuelve el BORDE y no el pico, con la forma real de la curva', () => {
+    // La curva de verdad no es un escalon: sube de s09 a s19, hace meseta hasta s33 y
+    // baja. El pico esta en la meseta, a 8 s del borde. Apuntar al pico es llegar tarde,
+    // que es exactamente el error que traia la ventana s22-31.
+    const real = curva((s) => {
+      if (s >= 9 && s < 19) return 6 + (110 - 6) * ((s - 9) / 10);   // rampa
+      if (s >= 19 && s <= 33) return 110 + (s === 26 ? 8 : 0);        // meseta con su pico
+      if (s > 33 && s <= 41) return 110 - (110 - 13) * ((s - 33) / 8); // bajada
+      return 6;
+    });
+    const b = bordeDeSubida(real);
+    expect(b).not.toBeNull();
+    expect(b!).toBeGreaterThanOrEqual(12);
+    expect(b!).toBeLessThanOrEqual(16);   // el pico esta en s26: muy lejos de aqui
+  });
+
+  it('una curva PLANA no tiene borde: no se inventa uno', () => {
+    // Un borde inventado sobre ruido moveria la flota entera al lugar equivocado.
+    expect(bordeDeSubida(curva(() => 50))).toBeNull();
+    expect(bordeDeSubida(curva((s) => 50 + (s % 3)))).toBeNull();
+  });
+
+  it('sin polls suficientes no hay borde', () => {
+    expect(bordeDeSubida(meseta(11, 21, 110, 6).map((c) => ({ ...c, polls: 1 })))).toBeNull();
+  });
+
+  it('una curva incompleta no da borde', () => {
+    expect(bordeDeSubida(meseta(11).slice(0, 40))).toBeNull();
+  });
+
+  it('el borde medido concuerda con la rafaga configurada', () => {
+    const w = RAFAGA_LIBERACION['es-co']!;
+    expect(bordeSeMovio(11, w)).toBe(false);
+    expect(bordeSeMovio(13, w)).toBe(false);
+  });
+
+  it('un corrimiento de mas de media anchura SI se reporta', () => {
+    const w = RAFAGA_LIBERACION['es-co']!;
+    expect(bordeSeMovio(25, w)).toBe(true);
+    expect(bordeSeMovio(40, w)).toBe(true);
+  });
+
+  it('el corrimiento se mide circularmente', () => {
+    // s58 esta a 8 s de s11 dando la vuelta, no a 47.
+    expect(bordeSeMovio(58, { inicioSec: 2, anchoSec: 10 })).toBe(false);
+  });
+
+  it('sin borde no se reporta corrimiento', () => {
+    expect(bordeSeMovio(null, RAFAGA_LIBERACION['es-co']!)).toBe(false);
   });
 });

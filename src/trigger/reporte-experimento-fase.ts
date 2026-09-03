@@ -24,6 +24,7 @@ import {
   type FilaSegundo, type BloqueExperimento, type ReporteFase, type EstratoResultado,
 } from '../services/experimento-estadistica.js';
 import { VENTANA_EXPERIMENTO } from '../services/experimento-fase.js';
+import { RAFAGA_LIBERACION, bordeDeSubida, bordeSeMovio } from '../services/mejores-practicas.js';
 import { DEFAULT_POLL_INTERVAL_S } from '../services/scheduling.js';
 import { sendTelegram } from '../services/notifications.js';
 
@@ -197,10 +198,24 @@ export const reporteExperimentoFaseSchedule = schedules.task({
       huecoDentro: rep.huecoDentroSec, huecoFuera: rep.huecoFueraSec,
       enRejilla: rep.enRejilla,
     });
-    const enviado = await sendTelegram(textoTelegramFase(rep));
+    // EL TRABAJO DEL CENTINELA: ¿el portal movio su hora de liberacion? Ver
+    // `bordeDeSubida`. Si se movio, la rafaga de toda la flota apunta al lugar
+    // equivocado y hay que reconfigurar `RAFAGA_LIBERACION`.
+    const borde = bordeDeSubida(rep.curva);
+    const cfgBorde = RAFAGA_LIBERACION['es-co'];
+    const movido = cfgBorde ? bordeSeMovio(borde, cfgBorde) : false;
+    logger.info('centinela del borde', { borde, configurado: cfgBorde?.inicioSec, movido });
+
+    const aviso = movido
+      ? `\n\n🚨 EL PORTAL MOVIO LA LIBERACION: borde medido s${borde}, la rafaga apunta a ` +
+        `s${cfgBorde!.inicioSec}. Toda la flota es-co esta pollando tarde. ` +
+        `Ajustar RAFAGA_LIBERACION.`
+      : borde !== null ? `\n\nborde medido s${borde} (rafaga apunta a s${cfgBorde?.inicioSec})` : '';
+    const enviado = await sendTelegram(textoTelegramFase(rep) + aviso);
     return {
       filas: filas.length, veredicto: est.veredicto,
-      estratosLimpios: est.usables.length, agrupado: a.razon, enviado,
+      estratosLimpios: est.usables.length, agrupado: a.razon,
+      borde, bordeMovido: movido, enviado,
     };
   },
 });

@@ -156,3 +156,51 @@ export function peorLatenciaSec(plan: number[], inicioSec: number, anchoSec: num
   }
   return peor;
 }
+
+/**
+ * Borde de subida de la curva: donde cruza la mitad de su altura.
+ *
+ * Es LO QUE EL CENTINELA VIGILA. La tasa por segundo es una meseta que arranca en la
+ * liberacion y dura lo que el hueco entre polls, entonces el pico no dice la hora: el
+ * borde si.
+ *
+ * Se busca circularmente desde el minimo de la curva, para que un borde a caballo del
+ * cambio de minuto no se parta en dos.
+ *
+ * Devuelve `null` cuando la curva es plana (no hay meseta que encontrar) o cuando no hay
+ * polls suficientes. Un borde inventado sobre ruido moveria la flota entera al lugar
+ * equivocado.
+ */
+export function bordeDeSubida(
+  curva: Array<{ segundo: number; suave: number; polls: number }>,
+  minPolls = 600,
+): number | null {
+  if (curva.length !== 60) return null;
+  if (curva.reduce((a, c) => a + c.polls, 0) < minPolls) return null;
+
+  const alt = curva.map((c) => c.suave);
+  const max = Math.max(...alt);
+  const min = Math.min(...alt);
+  // Una curva plana no tiene borde. El 1,8 sale del dato: la meseta medida esta a 1,7x de
+  // la media y a mas de 8x del valle, entonces un contraste por debajo de 1,8 es ruido.
+  if (max < min * 1.8 || max <= 0) return null;
+
+  const mitad = (max + min) / 2;
+  // Se arranca en el valle y se avanza circularmente hasta el primer cruce hacia arriba.
+  const valle = alt.indexOf(min);
+  for (let i = 1; i <= 60; i++) {
+    const s = (valle + i) % 60;
+    const prev = (s + 59) % 60;
+    if (alt[prev]! < mitad && alt[s]! >= mitad) return s;
+  }
+  return null;
+}
+
+/** ¿El borde medido se corrio de donde apunta la rafaga? */
+export function bordeSeMovio(bordeSec: number | null, config: { inicioSec: number; anchoSec: number }): boolean {
+  if (bordeSec === null) return false;
+  // La distancia se mide circularmente: s59 y s01 estan a 2 s, no a 58.
+  const d = Math.min(Math.abs(bordeSec - config.inicioSec), 60 - Math.abs(bordeSec - config.inicioSec));
+  // Media anchura de tolerancia: mas que eso y la rafaga ya no tapa la liberacion.
+  return d > config.anchoSec / 2;
+}

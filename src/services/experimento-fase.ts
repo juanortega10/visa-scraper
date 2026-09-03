@@ -1,3 +1,5 @@
+import { RAFAGA_LIBERACION } from './mejores-practicas.js';
+
 /**
  * Ventana de liberacion del portal para el experimento de fase.
  *
@@ -55,7 +57,18 @@
  * y una ventana de 6 s no deja lugar para el jitter ni para que el poll se corra.
  */
 
-/** Ventana que se esta probando. Ver la tabla de arriba. */
-export const VENTANA_EXPERIMENTO: Record<string, { startSec: number; endSec: number }> = {
-  'es-co': { startSec: 22, endSec: 32 },
-};
+/**
+ * Ventana contra la que reporta el centinela. Se DERIVA de la rafaga, para que no puedan
+ * separarse: el 2026-09-03 el reporte seguia midiendo contra s22-31 mientras la flota ya
+ * polleaba en s14-s21, y esa cifra no decia nada sobre lo que estaba pasando.
+ *
+ * OJO con la tabla de arriba: sus tramos vienen de datos con huecos largos, donde la
+ * meseta de `appeared` es muy ancha. Por eso el pico aparente cae en s24-s25 y el borde
+ * real esta en s11-s13. Ver `mejores-practicas.ts`.
+ */
+export const VENTANA_EXPERIMENTO: Record<string, { startSec: number; endSec: number }> =
+  Object.fromEntries(
+    Object.entries(RAFAGA_LIBERACION).map(([loc, r]) => [
+      loc, { startSec: r.inicioSec, endSec: (r.inicioSec + r.anchoSec + 1) % 60 },
+    ]),
+  );
