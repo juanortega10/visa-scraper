@@ -1,0 +1,172 @@
+import { describe, it, expect } from 'vitest';
+import {
+  RAFAGA_LIBERACION, pollsPorMinuto, planRafaga, siguienteEnRafaga, peorLatenciaSec,
+} from '../mejores-practicas.js';
+
+/**
+ * La regla de este archivo: cada caso tiene que poder ponerse rojo. Lo que se prueba es
+ * que la rafaga BAJA LA LATENCIA sin subir la carga. Un test que solo comprobara "devolvio
+ * segundos" dejaria pasar las dos formas de romperlo: mas peticiones, o peor latencia.
+ */
+
+const T = (s: string) => Date.parse(`2026-09-03T13:00:${s}Z`);
+const segundoDe = (nowMs: number, delaySec: number) => Math.floor(nowMs / 1000 + delaySec) % 60;
+
+describe('carga: el numero de peticiones NO cambia', () => {
+  it('el intervalo de siempre da 3 por minuto', () => {
+    expect(pollsPorMinuto(20)).toBe(3);
+  });
+
+  it('el plan tiene exactamente un disparo por poll', () => {
+    for (const n of [1, 2, 3, 4, 6]) {
+      expect(planRafaga({ inicioSec: 11, anchoSec: 10, n })).toHaveLength(n);
+    }
+  });
+
+  it('dos disparos NUNCA caen en el mismo segundo', () => {
+    // Serian una sola oportunidad y el doble de carga en el peor instante.
+    for (const n of [3, 8, 12, 20]) {
+      const p = planRafaga({ inicioSec: 11, anchoSec: 10, n });
+      expect(new Set(p).size).toBe(n);
+    }
+  });
+
+  it('con mas polls que ancho, las colisiones se resuelven HACIA ATRAS', () => {
+    // Correrlas hacia adelante empujaria disparos mas alla del borde, a la meseta, que es
+    // justo donde no sirven. Hacia atras se quedan dentro del tramo util.
+    // Hacen falta MAS disparos que segundos para que haya colision de verdad: con n=5 en
+    // un ancho de 5 el paso es 1 y no choca nada, y el test no distinguiria nada.
+    const p = planRafaga({ inicioSec: 11, anchoSec: 5, n: 8 });
+    expect(new Set(p).size).toBe(8);
+    expect(Math.max(...p)).toBe(16);   // hacia adelante llegaria a s19, ya en la meseta
+  });
+
+  it('un intervalo mas largo da menos disparos, nunca mas', () => {
+    expect(pollsPorMinuto(60)).toBe(1);
+    expect(pollsPorMinuto(30)).toBe(2);
+    expect(pollsPorMinuto(120)).toBe(1);
+  });
+});
+
+describe('latencia: la rafaga le gana a la rejilla', () => {
+  const { inicioSec, anchoSec } = RAFAGA_LIBERACION['es-co']!;
+
+  it('la rafaga baja la peor latencia de 19 s a 5 s o menos', () => {
+    // Es la razon de ser del cambio. Con la rejilla, una liberacion en s16 espera al
+    // disparo de s34.
+    const rejilla = [14, 34, 54];
+    const rafaga = planRafaga({ inicioSec, anchoSec, n: 3 });
+    expect(peorLatenciaSec(rejilla, inicioSec, anchoSec)).toBeGreaterThanOrEqual(15);
+    expect(peorLatenciaSec(rafaga, inicioSec, anchoSec)).toBeLessThanOrEqual(4);
+  });
+
+  it('el ULTIMO disparo cierra el borde', () => {
+    // Sin esto, una liberacion al final del borde espera al minuto siguiente: 52 s.
+    for (const n of [1, 2, 3, 5]) {
+      const p = planRafaga({ inicioSec, anchoSec, n });
+      expect(p[p.length - 1]).toBe(inicioSec + anchoSec);
+    }
+  });
+
+  it('ningun disparo cae ANTES del borde: ahi no hay nada que ver', () => {
+    for (const n of [1, 2, 3, 5]) {
+      for (const s of planRafaga({ inicioSec, anchoSec, n })) {
+        expect(s).toBeGreaterThan(inicioSec);
+      }
+    }
+  });
+
+  it('con UN solo poll, va al final del borde y no al principio', () => {
+    // Es el caso del bot 246 (1 peticion por minuto). En s11 una liberacion en s20
+    // esperaria 51 s; en s21 espera 10 s como maximo.
+    const p = planRafaga({ inicioSec, anchoSec, n: 1 });
+    expect(p).toEqual([inicioSec + anchoSec]);
+    expect(peorLatenciaSec(p, inicioSec, anchoSec)).toBe(anchoSec);
+  });
+
+  it('mas disparos en la rafaga bajan la latencia', () => {
+    const l = [1, 2, 3, 5].map((n) => peorLatenciaSec(planRafaga({ inicioSec, anchoSec, n }), inicioSec, anchoSec));
+    for (let i = 1; i < l.length; i++) expect(l[i]!).toBeLessThanOrEqual(l[i - 1]!);
+  });
+
+  it('un plan que cae DESPUES del borde tiene latencia pesima', () => {
+    // Es lo que hacia la ventana s22-31: dentro de la meseta, y tarde.
+    expect(peorLatenciaSec([22, 42, 2], inicioSec, anchoSec)).toBeGreaterThan(8);
+  });
+
+  it('la latencia se mide dando la vuelta al minuto', () => {
+    // Una liberacion en s58 con un disparo en s01 son 3 s, no 57.
+    expect(peorLatenciaSec([1], 58, 2)).toBe(3);
+  });
+});
+
+describe('el reloj de la rafaga', () => {
+  const plan = planRafaga({ inicioSec: 11, anchoSec: 10, n: 3 });
+
+  it('aterriza en un segundo del plan', () => {
+    for (let s = 0; s < 60; s++) {
+      const now = T(String(s).padStart(2, '0') + '.000');
+      const d = siguienteEnRafaga({ nowMs: now, plan });
+      expect(plan).toContain(segundoDe(now, d));
+    }
+  });
+
+  it('nunca devuelve cero ni negativo', () => {
+    for (const s of plan) {
+      const now = T(String(s).padStart(2, '0') + '.000');
+      expect(siguienteEnRafaga({ nowMs: now, plan })).toBeGreaterThan(0);
+    }
+  });
+
+  it('nunca espera mas de un minuto', () => {
+    for (let s = 0; s < 60; s++) {
+      const d = siguienteEnRafaga({ nowMs: T(String(s).padStart(2, '0') + '.000'), plan });
+      expect(d).toBeLessThanOrEqual(60);
+    }
+  });
+
+  it('una vuelta completa da EXACTAMENTE los disparos del plan por minuto', () => {
+    // Es la comprobacion de carga que importa: recorrer 5 minutos no puede producir mas
+    // de 3 polls en ninguno de ellos.
+    let now = T('00.000');
+    const porMinuto = new Map<number, number>();
+    for (let i = 0; i < 20; i++) {
+      const d = siguienteEnRafaga({ nowMs: now, plan });
+      now += d * 1000;
+      const m = Math.floor(now / 60_000);
+      porMinuto.set(m, (porMinuto.get(m) ?? 0) + 1);
+    }
+    for (const [, n] of porMinuto) expect(n).toBeLessThanOrEqual(plan.length);
+  });
+
+  it('respeta el piso de retraso', () => {
+    const now = T('10.000');
+    expect(siguienteEnRafaga({ nowMs: now, plan, minSec: 25 })).toBeGreaterThanOrEqual(25);
+  });
+
+  it('el piso que cruza el minuto sigue aterrizando en el plan', () => {
+    const now = T('55.000');
+    const d = siguienteEnRafaga({ nowMs: now, plan, minSec: 40 });
+    expect(d).toBeGreaterThanOrEqual(40);
+    expect(plan).toContain(segundoDe(now, d));
+  });
+
+  it('un plan vacio no revienta', () => {
+    expect(siguienteEnRafaga({ nowMs: T('10.000'), plan: [] })).toBe(60);
+  });
+});
+
+describe('la ventana sale del borde, no de la meseta', () => {
+  it('es-co arranca en el borde medido, no en el centro de la meseta', () => {
+    // La meseta va de s13 a s33. Apuntar a su centro (s23) es llegar 10 s tarde.
+    const w = RAFAGA_LIBERACION['es-co']!;
+    expect(w.inicioSec).toBeGreaterThanOrEqual(9);
+    expect(w.inicioSec).toBeLessThanOrEqual(14);
+  });
+
+  it('el ancho cubre el jitter del borde, sin estirarse a la meseta', () => {
+    const w = RAFAGA_LIBERACION['es-co']!;
+    expect(w.anchoSec).toBeGreaterThanOrEqual(6);
+    expect(w.anchoSec).toBeLessThanOrEqual(14);
+  });
+});

@@ -6,8 +6,9 @@ import { eq, and, desc, gte, sql, isNotNull } from 'drizzle-orm';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { VisaClient, SessionExpiredError, type DaySlot } from '../services/visa-client.js';
 import { filterDates, isAtLeastNDaysEarlier, isActionableDate, computeDaysImprovement, computeMinDate, isSniperActive, isWithinWindow } from '../utils/date-helpers.js';
-import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, alignToReleaseWindow, debeDespertar } from '../services/scheduling.js';
+import { getPollingDelay, calculatePriority, isInSuperCriticalWindow, getEffectiveInterval, accountBanBackoffDelay, scheduleBlockedBackoffDelay, countSustainedAccountBans, debeDespertar } from '../services/scheduling.js';
 import { periodoDesdeIntervalo, faseAleatoria, siguienteEnRejilla } from '../services/experimento-estadistica.js';
+import { RAFAGA_LIBERACION, planRafaga, pollsPorMinuto, siguienteEnRafaga } from '../services/mejores-practicas.js';
 import { executeReschedule, MAX_EDAD_TOKEN_MS, type RescheduleResult } from '../services/reschedule-logic.js';
 import { loginVisaTask } from './login-visa.js';
 import { notifyUserTask } from './notify-user.js';
@@ -1798,43 +1799,47 @@ export const pollVisaTask = task({
       // libera cupos. Ver `analyze-release-clock.ts` para la medicion.
       // El experimento manda sobre `phaseAligned`: cuando esta prendido, el brazo lo
       // decide la hora y el botId, y el bot alterna solo. Ver `experimento-fase.ts`.
-      const enExperimento = bot.phaseExperiment === true;
-      if (enExperimento) {
-        // ── Fase por REJILLA, sorteada cada minuto ──────────────────────────────
-        //
-        // Antes el brazo alineado ESPERABA a que llegara la ventana s22-32. Medido el
-        // 2026-09-01, esa espera le costo throughput: hueco p50 de 98,2 s contra 75,9 s
-        // del control. Un brazo con menos polls por hora tiene menos oportunidades, y
-        // entonces el experimento dejaba de medir la fase y media el throughput.
-        //
-        // Una rejilla no espera: el intervalo es SIEMPRE el periodo y la fase es libre.
-        // La fase se sortea por (bot, minuto), que hace dos cosas de una vez: cubre todo
-        // el minuto a lo largo del dia, y convierte el minuto en un bloque. Comparar
-        // segundos dentro del mismo minuto baja la sobredispersion de 6,52 a 2,89.
-        //
-        // El brazo ya no se decide de antemano: al analizar se mira EN QUE SEGUNDO
-        // aterrizo cada poll. La aleatorizacion sigue siendo real porque la fase se
-        // sorteo antes de conocer el resultado.
+      // ── Fase dentro del minuto ─────────────────────────────────────────────
+      //
+      // DOS papeles, y son distintos a proposito:
+      //
+      //   phaseAligned      RAFAGA. Es la mejor practica. Agrupa los polls en el borde de
+      //                     subida de la liberacion (s11-s21 en es-co), donde la latencia
+      //                     es minima. Mismo numero de peticiones que sin alinear.
+      //   phaseExperiment   CENTINELA. Rejilla con fase sorteada cada minuto, que barre
+      //                     los 60 segundos. Mantiene la curva viva para detectar si el
+      //                     portal mueve su hora de liberacion. Sin al menos un bot asi,
+      //                     la flota entera queda ciega a ese cambio: la rafaga seguiria
+      //                     contando cupos, pero tarde y sin que nada lo diga.
+      //
+      // Ver `src/services/mejores-practicas.ts` para por que el objetivo es el BORDE y no
+      // el centro de la meseta.
+      if (bot.phaseExperiment === true) {
         const periodo = periodoDesdeIntervalo(baseInterval);
         const fase = faseAleatoria(botId, Date.now(), periodo);
         const seg = siguienteEnRejilla({
           nowMs: Date.now(), periodoSec: periodo, faseSec: fase,
-          // Piso: lo que falte del intervalo natural, para no adelantar un poll.
           minSec: Math.max(0, baseInterval - elapsedMs / 1000 - periodo),
         });
-        logger.info('Fase por rejilla (experimento)', {
+        logger.info('Fase centinela: rejilla sorteada', {
           botId, locale: bot.locale, periodo, fase, delaySeconds: Math.round(seg),
         });
         normalDelay = `${Math.round(seg)}s`;
       } else if (bot.phaseAligned === true) {
-        const startToStart = Math.max(1, baseInterval - elapsedMs / 1000);
-        const al = alignToReleaseWindow({ locale: bot.locale ?? undefined, baseSeconds: startToStart, nowMs: Date.now() });
-        if (al.aligned) {
-          logger.info('Fase alineada a la ventana de liberacion', {
-            botId, locale: bot.locale, naturalSeconds: Math.round(startToStart), alignedSeconds: Math.round(al.seconds),
+        const borde = RAFAGA_LIBERACION[bot.locale ?? ''];
+        if (borde) {
+          const plan = planRafaga({ ...borde, n: pollsPorMinuto(baseInterval) });
+          const seg = siguienteEnRafaga({
+            nowMs: Date.now(), plan,
+            // Piso: lo que falte del intervalo natural. Sin el, una vuelta rapida podria
+            // adelantar el poll y subir la carga por encima de lo pactado.
+            minSec: Math.max(0, baseInterval - elapsedMs / 1000 - 60),
           });
+          logger.info('Fase alineada: rafaga en el borde de liberacion', {
+            botId, locale: bot.locale, plan, delaySeconds: Math.round(seg),
+          });
+          normalDelay = `${Math.round(seg)}s`;
         }
-        normalDelay = `${Math.round(al.seconds)}s`;
       }
       // Recompute backoff escalation counters here (shared path) so they are correct
       // regardless of how the TCP block was detected. The in-catch recompute only runs when an
