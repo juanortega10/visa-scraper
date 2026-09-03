@@ -62,7 +62,13 @@ export async function leerFilasBloqueo(): Promise<FilaBloqueo[]> {
  */
 export async function leerFilasSniper(): Promise<FilaBloqueo[]> {
   const filas = await db.execute<Record<string, unknown>>(sql`
-    SELECT s.scan_key, s.phase, s.scanned_at,
+    SELECT s.scan_key, s.phase,
+           -- extract(epoch) y NO el texto de la marca: sniper_scans.scanned_at es
+           -- timestamp sin zona, y new Date de ese texto lo lee como hora LOCAL. En
+           -- Bogota eso corre la fila 5 horas al futuro, los minutos salen negativos y
+           -- la segunda fuente se apaga en silencio. Medido el 2026-09-03: una fila de
+           -- las 15:14 UTC se leia como 20:14 UTC.
+           extract(epoch from s.scanned_at) * 1000 AS en_ms,
            b.locale, b.schedule_id
     FROM sniper_scans s
     LEFT JOIN bots b ON b.id = NULLIF(regexp_replace(s.scan_key, '^.*-', ''), '')::int
@@ -71,7 +77,7 @@ export async function leerFilasSniper(): Promise<FilaBloqueo[]> {
   const crudas: FilaSniper[] = filas.rows.map((f) => ({
     scanKey: String(f.scan_key ?? ''),
     fase: String(f.phase ?? ''),
-    enMs: new Date(String(f.scanned_at)).getTime(),
+    enMs: Number(f.en_ms),
     locale: String(f.locale ?? ''),
     scheduleId: f.schedule_id === null || f.schedule_id === undefined ? null : String(f.schedule_id),
   }));

@@ -88,9 +88,21 @@ function episodioEnCurso(filas: FilaBloqueo[]): { desdeMs: number; polls: number
   return { desdeMs, polls };
 }
 
+/**
+ * Margen de reloj. Una fila mas nueva que esto NO es evidencia sobre el presente: es una
+ * marca mal leida.
+ *
+ * El 2026-09-03 `leerFilasSniper` parseaba `timestamp` sin zona como hora local y corria
+ * cada fila 5 horas al futuro. Con eso `minutos` salia negativo, quedaba por debajo del
+ * umbral, y la segunda fuente se apagaba sin decir nada. El lector ya esta arreglado; este
+ * filtro es la red para la proxima vez que alguien lea una marca sin zona.
+ */
+export const MARGEN_FUTURO_MS = 60_000;
+
 export function detectarRutasCerradas(filas: FilaBloqueo[], ahoraMs: number): RutaCerrada[] {
   const porBot = new Map<number, FilaBloqueo[]>();
   for (const f of filas) {
+    if (f.enMs > ahoraMs + MARGEN_FUTURO_MS) continue;
     const l = porBot.get(f.botId);
     if (l) l.push(f); else porBot.set(f.botId, [f]);
   }

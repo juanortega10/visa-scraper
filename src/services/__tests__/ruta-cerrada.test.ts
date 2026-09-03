@@ -224,3 +224,39 @@ describe('segunda fuente: el sniper', () => {
     expect(r.map((x) => x.scheduleId)).toEqual(['75610929', 'OTRO']);
   });
 });
+
+describe('filas del futuro', () => {
+  it('una fila del futuro no produce minutos negativos ni silencio', () => {
+    // El error de zona del 2026-09-03 corria las filas 5 h al futuro. La fila mas nueva
+    // quedaba adelantada, `minutos` salia negativo y no llegaba al umbral: la fuente se
+    // apagaba sin avisar. Aqui la fila del futuro se descarta y el episodio real se ve.
+    const r = detectarRutasCerradas([
+      fila({ botId: 299, enMs: haceMin(200) }),
+      fila({ botId: 299, enMs: haceMin(-300) }),   // 5 h en el futuro
+    ], AHORA);
+    expect(r).toHaveLength(1);
+    expect(r[0]!.minutos).toBe(200);
+  });
+
+  it('una fila del futuro no puede tapar un episodio abierto', () => {
+    // Si contara como la mas nueva y no fuera bloqueo, cortaria el episodio.
+    const r = detectarRutasCerradas([
+      fila({ botId: 299, enMs: haceMin(120) }),
+      fila({ botId: 299, enMs: haceMin(-60), status: 'ok', cls: null }),
+    ], AHORA);
+    expect(r).toHaveLength(1);
+    expect(r[0]!.minutos).toBe(120);
+  });
+
+  it('el margen de reloj deja pasar un desfase de segundos', () => {
+    // Un reloj adelantado medio minuto es normal y no debe descartar la fila.
+    const r = detectarRutasCerradas([fila({ botId: 299, enMs: AHORA + 30_000 })], AHORA);
+    expect(r).toHaveLength(0);   // 0 minutos de episodio, por debajo del umbral
+    const r2 = detectarRutasCerradas([
+      fila({ botId: 299, enMs: haceMin(90) }),
+      fila({ botId: 299, enMs: AHORA + 30_000 }),
+    ], AHORA);
+    expect(r2).toHaveLength(1);
+    expect(r2[0]!.polls).toBe(2);   // la fila con desfase chico SI cuenta
+  });
+});
