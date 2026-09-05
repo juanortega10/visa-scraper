@@ -111,7 +111,7 @@ describe('nudge rápido', () => {
       // La banda de la función es de 55 minutos. Con un reloj horario, un lead que entra a la
       // banda justo después de una corrida puede perdérsela entera.
       expect(nudgeRapido.id).toBe('nudge-rapido');
-      expect(capturado.def.cron.pattern).toBe('*/15 13-23,0 * * *');
+      expect(capturado.def.cron.pattern).toBe('*/3 * * * *');
       expect(capturado.def.cron.environments).toEqual(['PRODUCTION']);
     });
 

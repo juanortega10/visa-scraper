@@ -32,7 +32,7 @@ import { schedules, logger } from '@trigger.dev/sdk/v3';
  */
 
 const NUDGE_FN = '6306721f-693a-48d4-9970-55177495c09a'; // nudge-rapido
-const MAX_POR_CORRIDA = 15; // el mismo tope que trae la función; explícito para poder bajarlo
+const MAX_POR_CORRIDA = 25; // modo intenso 2026-09-05: mismo tope que trae la función
 const MAX_DURATION_S = 120;
 
 export type ResultadoNudge = {
@@ -122,9 +122,11 @@ function contarAcciones(plan: any[]): Record<string, number> {
 export const nudgeRapido = schedules.task({
   id: 'nudge-rapido',
   cron: {
-    // Cada 15 min entre 13:00 y 00:45 UTC = 08:00-19:45 Bogotá, o sea la franja de envío.
-    // No se gastan corridas de madrugada: ahí la función es un no-op de todos modos.
-    pattern: '*/15 13-23,0 * * *',
+    // Modo intenso 2026-09-05: cada 3 min, 24/7. La función ya no tiene ventana
+    // horaria propia (VENTANA_INICIO=0, VENTANA_FIN=24) y su primer toque cae
+    // en el minuto 5, así que un reloj a 15 min pierde el 66% de los leads que
+    // entran justo después de una corrida.
+    pattern: '*/3 * * * *',
     environments: ['PRODUCTION'],
   },
   machine: { preset: 'micro' },
