@@ -25,7 +25,10 @@ export const rollupHourlySchedule = schedules.task({
   id: 'rollup-hourly',
   cron: {
     pattern: '7 * * * *',
-    environments: ['PRODUCTION'],
+    // 2026-09-07: se mueve a RPi (DEV) para bajar factura Trigger. El rollup
+    // solo lee poll_logs y escribe bot_hourly; el RPi tiene la misma conexion
+    // a Neon que usa audit-chains, asi que corre igual.
+    environments: ['DEVELOPMENT'],
   },
   machine: { preset: 'micro' },
   maxDuration: 300,

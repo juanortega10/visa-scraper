@@ -72,7 +72,9 @@ export const auditChainsSchedule = schedules.task({
   id: 'audit-chains',
   cron: {
     pattern: '*/15 * * * *',
-    environments: ['DEVELOPMENT', 'PRODUCTION'],
+    // 2026-09-07: sale de PROD para bajar factura Trigger; el RPi ya corria
+    // esta task en DEV, y una segunda copia en PROD era pura duplicacion.
+    environments: ['DEVELOPMENT'],
   },
   machine: { preset: 'micro' },
   maxDuration: 120,
