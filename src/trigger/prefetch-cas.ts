@@ -38,7 +38,10 @@ export const prefetchCasSchedule = schedules.task({
   id: 'prefetch-cas',
   cron: {
     pattern: '*/30 * * * *',
-    environments: ['PRODUCTION'],
+    // 2026-09-07: pasa a RPi (DEV) para bajar factura Trigger. Juan lo aprobo.
+    // Era PROD original para "no consumir el budget del RPi/dev"; ese trade-off
+    // se invierte ahora que Trigger cobra por run y el RPi es compute pagado.
+    environments: ['DEVELOPMENT'],
   },
   machine: { preset: 'micro' },
   maxDuration: 240,
