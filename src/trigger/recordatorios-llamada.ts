@@ -109,3 +109,22 @@ export const barredorRecordatorios = schedules.task({
     return r;
   },
 });
+
+/**
+ * El mismo barredor, disparado por el webhook de Cal.com (visa_frontend) al crear, reagendar
+ * o cancelar una cita. Baja la confirmación de hasta 60 s a pocos segundos. Si el webhook no
+ * llega a dispararla, el cron de cada minuto hace lo mismo: esto solo adelanta.
+ * Correr dos barredores a la vez es seguro: el claim evita dobles envíos y la
+ * idempotencyKey evita runs duplicados.
+ */
+export const recordatoriosAhora = task({
+  id: 'recordatorios-ahora',
+  queue: recordatoriosQueue,
+  maxDuration: 55,
+  retry: { maxAttempts: 1 },
+  run: async (payload: { bookingId?: string; evento?: string }) => {
+    const r = await correrBarredor();
+    logger.info('recordatorios-ahora', { ...payload, ...r });
+    return r;
+  },
+});
