@@ -19,7 +19,8 @@ const TZ = 'America/Bogota';
 
 export const PLANTILLAS: Record<TipoLead, string> = {
   confirmacion: 'recordatorio_llamada_confirmacion',
-  t24h: 'recordatorio_llamada_24h',
+  // v2: la v1 decía "15 minutos" y la llamada dura 20. Borrada el 2026-09-25; Meta no deja reusar el nombre.
+  t24h: 'recordatorio_llamada_24h_v2',
   t2h: 'recordatorio_llamada_2h',
   t10m: 'recordatorio_llamada_10m',
 };
@@ -72,7 +73,7 @@ export const CUERPOS: Record<TipoLead, string> = {
     'Es por Google Meet: {{3}}\n\nSi no puedes asistir, respóndenos aquí y la movemos a otro horario.',
   t24h:
     'Hola {{1}}, te recordamos tu llamada con Erika {{2}} (hora Colombia). ' +
-    'Son 15 minutos por Google Meet: {{3}}\n\nSi ya no puedes, respóndenos aquí y buscamos otro horario.',
+    'Es por Google Meet: {{3}}\n\nSi ya no puedes, respóndenos aquí y buscamos otro horario.',
   t2h:
     'Hola {{1}}, tu llamada con Erika es {{2}} (hora Colombia). Link de Google Meet: {{3}}\n\nTe esperamos.',
   t10m:
@@ -91,7 +92,7 @@ export function rellenar(cuerpo: string, params: string[]): string {
  */
 export const CONFIRMACION_LIBRE =
   'Hola {{1}}, quedó agendada tu llamada con Erika {{2}} (hora Colombia).\n\n' +
-  'En 15 minutos Erika revisa tu caso y te dice cuál es el mejor camino para tu cita. ' +
+  'En la llamada Erika revisa tu caso y te dice cuál es el mejor camino para tu cita. ' +
   'Ella reserva ese espacio solo para ti.\n\n' +
   'Ten a la mano tu cita actual o tu DS-160, si ya lo tienes. Link de Google Meet: {{3}}\n\n' +
   'Si no puedes asistir, respóndeme aquí y la movemos.';

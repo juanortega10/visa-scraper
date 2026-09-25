@@ -216,11 +216,11 @@ describe('ejecutar: la decisión de envío de una fila', () => {
   });
 
   it('con plantilla aprobada sale por plantilla, con los parámetros en orden', async () => {
-    process.env.RECORDATORIOS_PLANTILLAS_OK = 'recordatorio_llamada_24h';
+    process.env.RECORDATORIOS_PLANTILLAS_OK = 'recordatorio_llamada_24h_v2';
     const r = await ejecutar(base, ahora, envios, 'vivo');
-    expect(r).toMatchObject({ estado: 'enviado', via: 'plantilla:recordatorio_llamada_24h' });
+    expect(r).toMatchObject({ estado: 'enviado', via: 'plantilla:recordatorio_llamada_24h_v2' });
     const [, nombre, params] = envios.whatsappPlantilla.mock.calls[0];
-    expect(nombre).toBe('recordatorio_llamada_24h');
+    expect(nombre).toBe('recordatorio_llamada_24h_v2');
     expect(params[0]).toBe('Juan');
     expect(params[1]).toMatch(/^mañana/);
     expect(params[2]).toBe('https://meet.google.com/abc');
@@ -296,6 +296,8 @@ describe('confirmación por texto libre', () => {
     expect(CONFIRMACION_LIBRE).toContain('DS-160');
     expect(CONFIRMACION_LIBRE).toContain('respóndeme aquí');
     expect(CONFIRMACION_LIBRE).not.toContain('—');
+    // La duración vive en Cal.com (hoy 20 min). Un número aquí se desactualiza en silencio.
+    for (const t of [CONFIRMACION_LIBRE, ...Object.values(CUERPOS)]) expect(t).not.toMatch(/\d+ minutos por|En \d+ minutos/);
     const d = { nombre: 'Ana', startsAt: bog('2026-09-30T15:00:00'), meetUrl: 'https://meet.google.com/x' };
     expect(textoLibre('confirmacion', d, bog('2026-09-29T15:00:00'))).toContain('Erika revisa tu caso');
     expect(textoLibre('t24h', d, bog('2026-09-29T15:00:00'))).not.toContain('Erika revisa tu caso');
@@ -319,7 +321,7 @@ describe('ejecutar: asistencia y orden texto/plantilla', () => {
       whatsappPlantilla: vi.fn(async () => ({ ok: true, messageId: 'wamid.p' })),
       email: vi.fn(async () => ({ ok: true, id: 're_2' })),
     };
-    process.env.RECORDATORIOS_PLANTILLAS_OK = 'recordatorio_llamada_confirmacion,recordatorio_llamada_24h';
+    process.env.RECORDATORIOS_PLANTILLAS_OK = 'recordatorio_llamada_confirmacion,recordatorio_llamada_24h_v2';
   });
   afterEach(() => {
     for (const k of ['RECORDATORIOS_PLANTILLAS_OK', 'RECORDATORIOS_HOST_EMAIL', 'ASISTENCIA_BASE_URL', 'ASISTENCIA_SECRET']) delete process.env[k];
@@ -339,7 +341,7 @@ describe('ejecutar: asistencia y orden texto/plantilla', () => {
 
   it('el t24h con plantilla aprobada va directo por plantilla', async () => {
     const r = await ejecutar({ ...base, tipo: 't24h' }, ahora, envios, 'vivo');
-    expect(r).toMatchObject({ via: 'plantilla:recordatorio_llamada_24h' });
+    expect(r).toMatchObject({ via: 'plantilla:recordatorio_llamada_24h_v2' });
     expect(envios.whatsappTexto).not.toHaveBeenCalled();
   });
 
