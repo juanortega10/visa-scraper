@@ -36,9 +36,38 @@ export async function sendWhatsAppText(
   target: SendTarget,
   text: string,
 ): Promise<SendResult> {
+  if (!text.trim()) return { ok: false, error: 'mensaje vacío' };
+  return enviar(target, { type: 'text', text: { body: text, preview_url: false } });
+}
+
+/**
+ * Plantilla aprobada con parámetros posicionales en el cuerpo. Es la única vía fuera de la
+ * ventana de 24 h desde el último mensaje entrante.
+ */
+export async function sendWhatsAppTemplate(
+  target: SendTarget,
+  name: string,
+  bodyParams: string[],
+  languageCode = 'es',
+): Promise<SendResult> {
+  return enviar(target, {
+    type: 'template',
+    template: {
+      name,
+      language: { code: languageCode },
+      components: bodyParams.length
+        ? [{ type: 'body', parameters: bodyParams.map((text) => ({ type: 'text', text })) }]
+        : [],
+    },
+  });
+}
+
+async function enviar(
+  target: SendTarget,
+  contenido: Record<string, unknown>,
+): Promise<SendResult> {
   const apiKey = process.env.KAPSO_API_KEY;
   if (!apiKey) return { ok: false, error: 'KAPSO_API_KEY no está configurada' };
-  if (!text.trim()) return { ok: false, error: 'mensaje vacío' };
 
   const picked = pickTarget(target);
   if (!picked) {
@@ -49,8 +78,7 @@ export async function sendWhatsAppText(
   // precedencia al teléfono, así que mandamos solo uno.
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
-    type: 'text',
-    text: { body: text, preview_url: false },
+    ...contenido,
     ...(picked.via === 'bsuid'
       ? { recipient: picked.value }
       : { to: picked.value }),
@@ -68,9 +96,11 @@ export async function sendWhatsAppText(
       // teléfono si todavía lo tenemos, en vez de perder el cobro.
       const code = data?.error?.code;
       if (code === 131062 && picked.via === 'bsuid' && target.phone) {
-        return sendWhatsAppText({ phone: target.phone }, text);
+        return enviar({ phone: target.phone }, contenido);
       }
-      return { ok: false, error: data?.error?.message || `Kapso respondió ${res.status}` };
+      // Kapso responde `{ error: { message } }` (Meta) o `{ error: "texto" }` (sus validaciones).
+      const mensaje = data?.error?.message || (typeof data?.error === 'string' ? data.error : null);
+      return { ok: false, error: mensaje ? `${res.status}: ${mensaje}` : `Kapso respondió ${res.status}` };
     }
     return { ok: true, via: picked.via, messageId: data?.messages?.[0]?.id };
   } catch (e) {

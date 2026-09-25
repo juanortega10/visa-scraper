@@ -153,7 +153,10 @@ export const pollCronCloud = schedules.task({
   id: 'poll-cron-cloud',
   cron: {
     pattern: '*/2 * * * *',
-    environments: ['PRODUCTION'],
+    // 2026-09-07: pasa a RPi (DEV) para bajar la factura Trigger. Juan lo aprobo.
+    // Es el task de mayor volumen (~720 runs/dia) y el RPi ya corre poll-cron-local
+    // en los minutos impares; ahora tambien corre los pares para los bots de "prod".
+    environments: ['DEVELOPMENT'],
   },
   machine: { preset: 'micro' },
   maxDuration: 30,

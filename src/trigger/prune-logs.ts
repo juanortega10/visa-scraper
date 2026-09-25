@@ -46,7 +46,9 @@ export const pruneLogsSchedule = schedules.task({
   id: 'prune-logs',
   cron: {
     pattern: '0 8 * * *', // 08:00 UTC = 03:00 Bogota
-    environments: ['PRODUCTION'],
+    // 2026-09-07: pasa a RPi (DEV). Es una limpieza diaria en Neon, no necesita
+    // el compute de PROD y baja 1 run/dia del budget.
+    environments: ['DEVELOPMENT'],
   },
   machine: { preset: 'micro' },
   maxDuration: 600,
