@@ -2,7 +2,7 @@ import { task, schedules, logger, queue } from '@trigger.dev/sdk/v3';
 import { Resend } from 'resend';
 import { sendWhatsAppText, sendWhatsAppTemplate } from '../services/whatsapp-send.js';
 import {
-  modo, sincronizar, porProgramar, marcarProgramado, vencidos, enviarUno, cerrarAtascados,
+  modo, sincronizar, porProgramar, marcarProgramado, vencidos, enviarUno, cerrarAtascados, actualizarEntregas,
   type Envios,
 } from '../services/recordatorios/core.js';
 
@@ -32,6 +32,16 @@ export const enviosReales: Envios = {
     return r.error ? { ok: false, error: r.error.message } : { ok: true, id: r.data?.id };
   },
 };
+
+async function consultarMensaje(wamid: string): Promise<unknown> {
+  const base = process.env.KAPSO_API_BASE_URL ?? 'https://app.kapso.ai';
+  const r = await fetch(`${base}/platform/v1/whatsapp/messages/${encodeURIComponent(wamid)}`, {
+    headers: { 'X-API-Key': process.env.KAPSO_API_KEY || '' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!r.ok) throw new Error(`Kapso ${r.status}`);
+  return r.json();
+}
 
 const dormir = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -83,7 +93,9 @@ export async function correrBarredor(ahora = new Date()) {
     resultados.push(...lote.map((r) => r.estado));
   }
 
-  return { modo: m, ...sync, atascados, programados, atrasados: atrasados.length, resultados };
+  const entregas = await actualizarEntregas(consultarMensaje);
+
+  return { modo: m, ...sync, atascados, programados, atrasados: atrasados.length, resultados, entregas };
 }
 
 export const barredorRecordatorios = schedules.task({

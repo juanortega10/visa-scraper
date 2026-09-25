@@ -143,6 +143,9 @@ export async function ejecutar(f: Fila, ahora: Date, envios: Envios, m: Modo = m
 
 const MAX_INTENTOS = 3;
 
+/** Event type de Cal.com de la llamada con Erika. Cualquier otro evento no recibe recordatorios. */
+export const EVENT_TYPE_ID = (process.env.RECORDATORIOS_EVENT_TYPE_ID || '7009432').trim();
+
 /**
  * Citas vivas: no canceladas, en el futuro cercano, y sin una cita posterior de la misma
  * persona. La última regla cubre el reagendamiento de Cal.com, que crea un booking nuevo y
@@ -156,6 +159,10 @@ const CITAS_VIVAS = sql`
          b.raw_payload->'payload'->'metadata'->>'videoCallUrl' AS meet
   FROM calcom_bookings b
   WHERE b.event_type <> 'BOOKING_CANCELLED'
+    -- Solo la llamada con Erika. El event type vive en tres lugares según el origen de la fila:
+    -- webhook (payload.eventTypeId o payload.eventType.id) y reconciliación (eventTypeId).
+    AND coalesce(b.raw_payload->'payload'->>'eventTypeId', b.raw_payload->'payload'->'eventType'->>'id',
+                 b.raw_payload->>'eventTypeId', b.raw_payload->'eventType'->>'id') = ${EVENT_TYPE_ID}
     AND b.cancelled_at IS NULL
     AND b.starts_at IS NOT NULL
     -- 2 h hacia atrás: la pregunta de asistencia sale 20 min después de la llamada.
@@ -351,4 +358,63 @@ export async function cerrarAtascados(): Promise<number> {
     WHERE status = 'enviando' AND claimed_at < now() - interval '5 minutes'
   `);
   return r.rowCount ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Entrega de WhatsApp
+// ---------------------------------------------------------------------------
+
+export type Entrega = { estado: string; error: string | null };
+
+/**
+ * Lee el estado de un mensaje de `GET /platform/v1/whatsapp/messages/{wamid}`. `kapso.status`
+ * es el último estado; el error de un rebote viene dentro de `kapso.statuses[].errors`.
+ */
+export function leerEntrega(json: unknown): Entrega | null {
+  const d = (json as any)?.data ?? json;
+  const k = d?.kapso;
+  const estado = typeof k?.status === 'string' ? k.status : null;
+  if (!estado) return null;
+  let error: string | null = null;
+  for (const st of Array.isArray(k.statuses) ? k.statuses : []) {
+    const e = Array.isArray(st?.errors) ? st.errors[0] : null;
+    if (e) error = [e.code, e.title || e.message, e.error_data?.details].filter(Boolean).join(': ');
+  }
+  return { estado, error };
+}
+
+/** Estados finales: después de estos no se vuelve a preguntar. */
+const ENTREGA_FINAL = ['read', 'failed'];
+
+/**
+ * Revisa la entrega de los WhatsApp enviados en las últimas 2 h. Cada mensaje se consulta como
+ * máximo cada 5 min y deja de consultarse al llegar a `read` o `failed`.
+ */
+export async function actualizarEntregas(
+  consultar: (wamid: string) => Promise<unknown>,
+): Promise<{ revisados: number; fallidos: number }> {
+  const r = await db.execute<{ id: string; external_id: string }>(sql`
+    SELECT id, external_id FROM call_reminders
+    WHERE canal = 'whatsapp' AND status = 'enviado' AND external_id IS NOT NULL
+      AND sent_at < now() - interval '30 seconds' AND sent_at > now() - interval '2 hours'
+      AND (entrega IS NULL OR NOT (entrega = ANY(string_to_array(${ENTREGA_FINAL.join(',')}, ','))))
+      AND (entrega_revisada_at IS NULL OR entrega_revisada_at < now() - interval '5 minutes')
+    ORDER BY sent_at LIMIT 30
+  `);
+  let fallidos = 0;
+  for (const f of r.rows) {
+    let e: Entrega | null = null;
+    try {
+      e = leerEntrega(await consultar(f.external_id));
+    } catch {
+      // Sin respuesta de Kapso: se marca revisado y se reintenta en 5 min.
+    }
+    if (e?.estado === 'failed') fallidos++;
+    await db.execute(sql`
+      UPDATE call_reminders SET entrega = coalesce(${e?.estado ?? null}, entrega),
+        entrega_error = coalesce(${e?.error ?? null}, entrega_error), entrega_revisada_at = now()
+      WHERE id = ${Number(f.id)}
+    `);
+  }
+  return { revisados: r.rows.length, fallidos };
 }

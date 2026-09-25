@@ -73,7 +73,7 @@ async function reporte(bookingId: string) {
     SELECT tipo, canal, status,
            to_char(send_at AT TIME ZONE 'America/Bogota', 'HH24:MI:SS') AS planeado,
            to_char(sent_at AT TIME ZONE 'America/Bogota', 'HH24:MI:SS.MS') AS enviado,
-           lag_ms, via, motivo, run_id IS NOT NULL AS con_run
+           lag_ms, via, entrega, left(entrega_error, 60) AS entrega_error, motivo
     FROM call_reminders WHERE booking_id = ${bookingId} ORDER BY send_at, canal
   `);
   console.table(r.rows);

@@ -8,7 +8,7 @@ vi.mock('../../db/client.js', () => ({ db: {} }));
 
 const { planear, salirDelSilencio, enSilencio, vigente } = await import('./plan.js');
 const { cuando, parametros, textoLibre, CUERPOS, correo, CONFIRMACION_LIBRE, firmaAsistencia, correoAsistencia } = await import('./mensajes.js');
-const { ejecutar } = await import('./core.js');
+const { ejecutar, leerEntrega, EVENT_TYPE_ID } = await import('./core.js');
 type Fila = import('./core.js').Fila;
 
 /** Hora de Bogotá (UTC-5) a Date. */
@@ -363,5 +363,31 @@ describe('ejecutar: asistencia y orden texto/plantilla', () => {
     expect(to).toBe('erika@visagente.com');
     expect(asunto).toContain('¿Se conectó Juan?');
     expect(texto).toContain(`s=${firmaAsistencia('b2', '1', 'k')}`);
+  });
+});
+
+describe('leerEntrega: el estado real del WhatsApp', () => {
+  it('lee el último estado de kapso.status, con o sin envoltura data', () => {
+    expect(leerEntrega({ data: { kapso: { status: 'delivered', statuses: [] } } })).toEqual({ estado: 'delivered', error: null });
+    expect(leerEntrega({ kapso: { status: 'read' } })).toEqual({ estado: 'read', error: null });
+  });
+
+  it('un rebote de Meta trae el código y el motivo', () => {
+    const j = { data: { kapso: { status: 'failed', statuses: [
+      { status: 'sent' },
+      { status: 'failed', errors: [{ code: 131026, title: 'Message undeliverable', error_data: { details: 'no WA' } }] },
+    ] } } };
+    expect(leerEntrega(j)).toEqual({ estado: 'failed', error: '131026: Message undeliverable: no WA' });
+  });
+
+  it('una respuesta sin estado no se lee como entregado', () => {
+    expect(leerEntrega({ data: {} })).toBeNull();
+    expect(leerEntrega(null)).toBeNull();
+  });
+});
+
+describe('event type', () => {
+  it('por defecto solo la llamada con Erika (7009432)', () => {
+    expect(EVENT_TYPE_ID).toBe('7009432');
   });
 });
