@@ -195,8 +195,20 @@ function telefonoEnviable(p: string | null): string | null {
   return d.length >= 10 && d.length <= 15 ? d : null;
 }
 
-export async function sincronizar(ahora: Date, m: Modo = modo()): Promise<{ citas: number; filas: number; saltadas: number }> {
-  const res = await db.execute<CitaViva>(CITAS_VIVAS);
+/**
+ * @param soloBooking sincroniza una sola cita (la que acaba de llegar por el webhook). En ese
+ *   modo NO corre la limpieza global de citas no vigentes: con una sola cita en la lista, esa
+ *   limpieza marcaría como `saltado` los pendientes de todas las demás. La limpieza global
+ *   queda para el cron de cada minuto.
+ */
+export async function sincronizar(
+  ahora: Date,
+  m: Modo = modo(),
+  soloBooking?: string,
+): Promise<{ citas: number; filas: number; saltadas: number }> {
+  const res = await db.execute<CitaViva>(
+    soloBooking ? sql`SELECT * FROM (${CITAS_VIVAS}) v WHERE v.booking_id = ${soloBooking}` : CITAS_VIVAS,
+  );
   let citas = res.rows;
   if (m === 'prueba') {
     const { emails, telefonos } = listaPrueba();
@@ -241,6 +253,18 @@ export async function sincronizar(ahora: Date, m: Modo = modo()): Promise<{ cita
     saltadas += r.rowCount ?? 0;
   }
 
+  // Una sola cita que ya no está viva (el webhook de una cancelación): sus pendientes no salen.
+  if (soloBooking) {
+    if (!citas.length) {
+      const r = await db.execute(sql`
+        UPDATE call_reminders SET status = 'saltado', motivo = 'cita_no_vigente', updated_at = now()
+        WHERE booking_id = ${soloBooking} AND status = 'pendiente' AND NOT es_prueba
+      `);
+      saltadas += r.rowCount ?? 0;
+    }
+    return { citas: citas.length, filas, saltadas };
+  }
+
   // Citas canceladas o reemplazadas: sus pendientes no salen. Las filas de prueba no tienen cita.
   const vivas = citas.map((c) => c.booking_id);
   if (m === 'vivo') {
@@ -268,6 +292,15 @@ export async function porProgramar(): Promise<{ id: number; send_at: Date }[]> {
 
 export async function marcarProgramado(id: number, runId: string): Promise<void> {
   await db.execute(sql`UPDATE call_reminders SET run_id = ${runId}, updated_at = now() WHERE id = ${id} AND status = 'pendiente'`);
+}
+
+/** Pendientes de una cita cuya hora ya llegó (la confirmación recién planeada). */
+export async function yaVencidos(bookingId: string): Promise<{ id: number }[]> {
+  const r = await db.execute<{ id: string }>(sql`
+    SELECT id FROM call_reminders
+    WHERE booking_id = ${bookingId} AND status = 'pendiente' AND send_at <= now()
+  `);
+  return r.rows.map((x) => ({ id: Number(x.id) }));
 }
 
 /** Pendientes con más de 60 s de atraso: su run no llegó o falló. El barredor los envía. */
