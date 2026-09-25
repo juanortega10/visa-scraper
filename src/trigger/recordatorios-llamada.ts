@@ -2,7 +2,7 @@ import { task, schedules, logger, queue } from '@trigger.dev/sdk/v3';
 import { Resend } from 'resend';
 import { sendWhatsAppText, sendWhatsAppTemplate } from '../services/whatsapp-send.js';
 import {
-  modo, sincronizar, porProgramar, marcarProgramado, vencidos, enviarUno, cerrarAtascados, actualizarEntregas,
+  modo, sincronizar, porProgramar, marcarProgramado, vencidos, yaVencidos, enviarUno, cerrarAtascados, actualizarEntregas,
   type Envios,
 } from '../services/recordatorios/core.js';
 
@@ -61,6 +61,19 @@ export const enviarRecordatorio = task({
     return r;
   },
 });
+
+/**
+ * Camino rápido del webhook: sincroniza solo esa cita y envía en este mismo run lo que ya
+ * venció (la confirmación). Sin segundo run ni barrido completo: eso le quitaba ~6 s.
+ */
+export async function correrUnaCita(bookingId: string, ahora = new Date()) {
+  const m = modo();
+  if (m === 'apagado') return { modo: m };
+  const sync = await sincronizar(ahora, m, bookingId);
+  const inmediatos = await yaVencidos(bookingId);
+  const resultados = await Promise.all(inmediatos.map((f) => enviarUno(f.id, enviosReales)));
+  return { modo: m, bookingId, ...sync, enviados: resultados.map((r) => r.estado) };
+}
 
 /** El cuerpo del barredor, fuera de `schedules.task` para poder probarlo. */
 export async function correrBarredor(ahora = new Date()) {
@@ -123,7 +136,7 @@ export const recordatoriosAhora = task({
   maxDuration: 55,
   retry: { maxAttempts: 1 },
   run: async (payload: { bookingId?: string; evento?: string }) => {
-    const r = await correrBarredor();
+    const r = payload.bookingId ? await correrUnaCita(payload.bookingId) : await correrBarredor();
     logger.info('recordatorios-ahora', { ...payload, ...r });
     return r;
   },
