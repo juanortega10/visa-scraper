@@ -161,7 +161,8 @@ const CITAS_VIVAS = sql`
     -- 2 h hacia atrás: la pregunta de asistencia sale 20 min después de la llamada.
     AND b.starts_at > now() - interval '2 hours'
     -- Citas de prueba e2e: alias de Juan, test@, dominio .local y nombres de prueba.
-    AND NOT (lower(b.attendee_email) LIKE 'juanalbertoortega456+%'
+    AND NOT (b.booking_id LIKE 'TEST-%'
+          OR lower(b.attendee_email) LIKE 'juanalbertoortega456+%'
           OR lower(b.attendee_email) LIKE 'test+%'
           OR lower(b.attendee_email) LIKE '%@visagente.local'
           OR coalesce(b.attendee_name, '') ILIKE '[test]%'
