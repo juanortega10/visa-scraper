@@ -8,7 +8,7 @@ vi.mock('../../db/client.js', () => ({ db: {} }));
 
 const { planear, salirDelSilencio, enSilencio, vigente } = await import('./plan.js');
 const { cuando, parametros, textoLibre, CUERPOS, correo, CONFIRMACION_LIBRE, firmaAsistencia, correoAsistencia } = await import('./mensajes.js');
-const { ejecutar, leerEntrega, EVENT_TYPE_ID } = await import('./core.js');
+const { ejecutar, leerEntrega, EVENT_TYPE_ID, debeReintentarPorPlantilla } = await import('./core.js');
 type Fila = import('./core.js').Fila;
 
 /** Hora de Bogotá (UTC-5) a Date. */
@@ -389,5 +389,42 @@ describe('leerEntrega: el estado real del WhatsApp', () => {
 describe('event type', () => {
   it('por defecto solo la llamada con Erika (7009432)', () => {
     expect(EVENT_TYPE_ID).toBe('7009432');
+  });
+});
+
+describe('reintento por plantilla tras un 131047', () => {
+  const rechazo = { estado: 'failed', error: '131047: Re-engagement message: more than 24 hours' };
+
+  it('un texto libre rechazado por ventana se reintenta', () => {
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: false }, rechazo)).toBe(true);
+  });
+
+  it('nunca dos veces, nunca una plantilla, nunca otro error, nunca lo entregado', () => {
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: true }, rechazo)).toBe(false);
+    expect(debeReintentarPorPlantilla({ via: 'plantilla:x', forzar_plantilla: false }, rechazo)).toBe(false);
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: false }, { estado: 'failed', error: '131026: undeliverable' })).toBe(false);
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: false }, { estado: 'delivered', error: null })).toBe(false);
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: false }, null)).toBe(false);
+    // leerEntrega junta errores de todos los estados: uno entregado puede traer un error viejo.
+    expect(debeReintentarPorPlantilla({ via: 'texto', forzar_plantilla: false }, { estado: 'delivered', error: '131047: viejo' })).toBe(false);
+  });
+
+  it('una fila marcada va directo por plantilla, sin intentar texto', async () => {
+    process.env.RECORDATORIOS_PLANTILLAS_OK = 'recordatorio_llamada_confirmacion';
+    const envios = {
+      whatsappTexto: vi.fn(async () => ({ ok: true, messageId: 't' })),
+      whatsappPlantilla: vi.fn(async () => ({ ok: true, messageId: 'p' })),
+      email: vi.fn(async () => ({ ok: true, id: 'e' })),
+    };
+    const f: Fila = {
+      id: 3, booking_id: 'b3', tipo: 'confirmacion', canal: 'whatsapp',
+      send_at: bog('2026-09-29T15:00:00'), starts_at: bog('2026-09-30T15:00:00'),
+      dest_email: null, dest_phone: '573216119791', dest_bsuid: null, nombre: 'Ana', meet_url: null,
+      es_prueba: false, intentos: 0, forzar_plantilla: true,
+    };
+    const r = await ejecutar(f, bog('2026-09-29T15:02:00'), envios, 'vivo');
+    expect(r).toMatchObject({ estado: 'enviado', via: 'plantilla:recordatorio_llamada_confirmacion' });
+    expect(envios.whatsappTexto).not.toHaveBeenCalled();
+    delete process.env.RECORDATORIOS_PLANTILLAS_OK;
   });
 });
