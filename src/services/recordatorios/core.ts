@@ -67,6 +67,8 @@ export type Fila = {
   meet_url: string | null;
   es_prueba: boolean;
   intentos: number;
+  /** Reintento por plantilla después de un rechazo 131047 del texto libre. */
+  forzar_plantilla?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -127,6 +129,12 @@ export async function ejecutar(f: Fila, ahora: Date, envios: Envios, m: Modo = m
 
   // La confirmación sale con la ventana abierta: primero el texto libre, que lleva más. Si la
   // ventana estaba cerrada (el lead agendó por la web sin escribir), cae a la plantilla.
+  if (f.forzar_plantilla) {
+    if (!aprobada) return { estado: 'saltado', motivo: 'reintento_sin_plantilla' };
+    const rp = await porPlantilla();
+    return rp.ok ? { estado: 'enviado', via: rp.via, externalId: rp.messageId } : { estado: 'error', motivo: rp.error || 'kapso_fallo' };
+  }
+
   let r = f.tipo === 'confirmacion' || !aprobada ? await porTexto() : await porPlantilla();
   const fueraDeVentana = !r.ok && !!r.error && /24-hour window/i.test(r.error);
   if (fueraDeVentana && r.via === 'texto' && aprobada) r = await porPlantilla();
@@ -416,6 +424,14 @@ export function leerEntrega(json: unknown): Entrega | null {
   return { estado, error };
 }
 
+/** Un texto libre rechazado por ventana cerrada se reintenta una vez, por plantilla. */
+export function debeReintentarPorPlantilla(
+  f: { via: string | null; forzar_plantilla: boolean },
+  e: Entrega | null,
+): boolean {
+  return !!e && e.estado === 'failed' && f.via === 'texto' && !f.forzar_plantilla && /^131047\b/.test(e.error || '');
+}
+
 /** Estados finales: después de estos no se vuelve a preguntar. */
 const ENTREGA_FINAL = ['read', 'failed'];
 
@@ -426,8 +442,8 @@ const ENTREGA_FINAL = ['read', 'failed'];
 export async function actualizarEntregas(
   consultar: (wamid: string) => Promise<unknown>,
 ): Promise<{ revisados: number; fallidos: number }> {
-  const r = await db.execute<{ id: string; external_id: string }>(sql`
-    SELECT id, external_id FROM call_reminders
+  const r = await db.execute<{ id: string; external_id: string; via: string | null; forzar_plantilla: boolean }>(sql`
+    SELECT id, external_id, via, forzar_plantilla FROM call_reminders
     WHERE canal = 'whatsapp' AND status = 'enviado' AND external_id IS NOT NULL
       AND sent_at < now() - interval '30 seconds' AND sent_at > now() - interval '2 hours'
       AND (entrega IS NULL OR NOT (entrega = ANY(string_to_array(${ENTREGA_FINAL.join(',')}, ','))))
@@ -443,6 +459,17 @@ export async function actualizarEntregas(
       // Sin respuesta de Kapso: se marca revisado y se reintenta en 5 min.
     }
     if (e?.estado === 'failed') fallidos++;
+    if (debeReintentarPorPlantilla(f, e)) {
+      // Meta aceptó el texto y lo rechazó después: la ventana estaba cerrada. Vuelve a
+      // pendiente marcado para plantilla; el barredor lo envía en su siguiente corrida.
+      await db.execute(sql`
+        UPDATE call_reminders SET status = 'pendiente', forzar_plantilla = true, run_id = NULL,
+          external_id = NULL, via = NULL, entrega = NULL, entrega_error = NULL,
+          motivo = ${`reintento_plantilla: ${e!.error}`.slice(0, 500)}, updated_at = now()
+        WHERE id = ${Number(f.id)} AND status = 'enviado'
+      `);
+      continue;
+    }
     await db.execute(sql`
       UPDATE call_reminders SET entrega = coalesce(${e?.estado ?? null}, entrega),
         entrega_error = coalesce(${e?.error ?? null}, entrega_error), entrega_revisada_at = now()
