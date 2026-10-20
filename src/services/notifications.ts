@@ -2,7 +2,9 @@ import { Resend } from 'resend';
 import { createHmac } from 'node:crypto';
 import { DEFAULT_POLL_INTERVAL_S } from './scheduling.js';
 import { db } from '../db/client.js';
-import { notificationLogs } from '../db/schema.js';
+import { bots, notificationLogs, rescheduleLogs } from '../db/schema.js';
+import { eq, inArray } from 'drizzle-orm';
+import { diasConsularHistoricos } from './reschedule-attribution.js';
 
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -866,6 +868,44 @@ const ADMIN_RESCHEDULE_EMAIL = process.env.ADMIN_RESCHEDULE_EMAIL;
 const COBRO_WEBHOOK_URL = process.env.KAPSO_COBRO_WEBHOOK_URL
   ?? 'https://api.kapso.ai/platform/v1/functions/f3d28192-e744-4061-8469-ddf455aac24d/invoke';
 
+/**
+ * "Total ganado hasta hoy" del cliente: días consulares cobrables de todos sus bots b2c con
+ * ese teléfono. Devuelve null si la consulta falla; `send-cobro` cae entonces a los días de
+ * este movimiento, que es lo que mandaba antes.
+ */
+async function totalConsularDelCliente(
+  phone: string,
+  movimiento: { botId: number; oldConsularDate: string; newConsularDate: string } | undefined,
+): Promise<number | null> {
+  try {
+    const delCliente = (await db
+      .select({ id: bots.id, citaActual: bots.currentConsularDate, clientType: bots.clientType })
+      .from(bots)
+      .where(eq(bots.notificationPhone, phone)))
+      .filter((b) => b.clientType !== 'b2b');
+    if (delCliente.length === 0) return null;
+    const filas = await db
+      .select({
+        id: rescheduleLogs.id, botId: rescheduleLogs.botId, createdAt: rescheduleLogs.createdAt,
+        oldConsularDate: rescheduleLogs.oldConsularDate, newConsularDate: rescheduleLogs.newConsularDate,
+        success: rescheduleLogs.success, error: rescheduleLogs.error,
+      })
+      .from(rescheduleLogs)
+      .where(inArray(rescheduleLogs.botId, delCliente.map((b) => b.id)));
+    return diasConsularHistoricos(
+      delCliente.map((b) => ({
+        botId: b.id,
+        citaActual: b.citaActual,
+        filas: filas.filter((f) => f.botId === b.id),
+      })),
+      movimiento,
+    );
+  } catch (e) {
+    console.error(`[notify] total consular del cliente fallo phone=${phone} error=${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
 export async function notifyUser(
   bot: {
     id: number; notificationEmail: string | null; ownerEmail?: string | null;
@@ -933,7 +973,10 @@ export async function notifyUser(
 
   // Cobro por WhatsApp: solo adelantos de clientes directos. Los b2b se facturan a la agencia
   // quincenalmente, así que cobrarle al pasajero sería cobrar dos veces.
-  if (event === 'reschedule_success' && bot.clientType !== 'b2b' && bot.notificationPhone) {
+  // Un dry-run también emite reschedule_success (con fechas inventadas): nunca se cobra.
+  if (event === 'reschedule_success' && !data.dryRun && bot.clientType !== 'b2b' && bot.notificationPhone) {
+    const oldC = typeof data.oldConsularDate === 'string' ? data.oldConsularDate : null;
+    const newC = typeof data.newConsularDate === 'string' ? data.newConsularDate : null;
     const cobroPayload = {
       event,
       data: {
@@ -941,6 +984,13 @@ export async function notifyUser(
         phone: bot.notificationPhone,
         numPeople: Array.isArray(bot.applicantIds) ? bot.applicantIds.length : 1,
         visaType: bot.visaCategory ?? '',
+        // send-cobro solo pinta la línea de CAS con este flag. Nunca se mandaba, así que
+        // todo adelanto salía como "solo consular" aunque el CAS también se hubiera movido.
+        usesCas: !!(data.oldCasDate && data.newCasDate),
+        diasConsularHistoricos: await totalConsularDelCliente(
+          bot.notificationPhone,
+          oldC && newC ? { botId: bot.id, oldConsularDate: oldC, newConsularDate: newC } : undefined,
+        ),
       },
       timestamp: payload.timestamp,
     };

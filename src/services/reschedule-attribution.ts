@@ -222,3 +222,47 @@ export function auditReschedules(
 
   return { moves, firstDate, lastDate, botDays, externalDays, suspectDays, netDays, billableDays };
 }
+
+export interface HistorialBot {
+  botId: number;
+  /** `bots.current_consular_date`. Cierra la cadena igual que en el tab de Cobros. */
+  citaActual: string | null;
+  filas: AttributionRow[];
+}
+
+/**
+ * Días consulares cobrables de un cliente, sumados en todos sus bots.
+ *
+ * Es el "Total ganado hasta hoy" del mensaje de WhatsApp. Sale de `auditReschedules`, la
+ * misma cuenta del tab de Cobros: sin ella, el bot 190 sumaba 507 días cuando el cliente
+ * había movido la cita por fuera (-259) y lo cobrable era 248.
+ *
+ * `movimiento` es el adelanto que se está avisando. El aviso puede salir antes de que su fila
+ * quede en `reschedule_logs`; si falta, se agrega para que el total lo incluya siempre.
+ */
+export function diasConsularHistoricos(
+  bots: HistorialBot[],
+  movimiento?: { botId: number; oldConsularDate: string; newConsularDate: string },
+): number {
+  let total = 0;
+  for (const b of bots) {
+    let filas = b.filas;
+    if (movimiento && movimiento.botId === b.botId) {
+      const yaEsta = filas.some(
+        (f) => f.success === true &&
+          f.oldConsularDate === movimiento.oldConsularDate &&
+          f.newConsularDate === movimiento.newConsularDate,
+      );
+      if (!yaEsta) {
+        filas = [...filas, {
+          createdAt: new Date(),
+          oldConsularDate: movimiento.oldConsularDate,
+          newConsularDate: movimiento.newConsularDate,
+          success: true,
+        }];
+      }
+    }
+    total += auditReschedules(filas, { citaActual: b.citaActual }).billableDays;
+  }
+  return total;
+}
