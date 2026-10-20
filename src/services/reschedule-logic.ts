@@ -1344,6 +1344,7 @@ export async function executeReschedule(params: RescheduleParams): Promise<Resch
                   botId, event: 'reschedule_success',
                   data: {
                     oldConsularDate: prevConsularDate, oldConsularTime: prevConsularTime,
+                    oldCasDate: prevCasDate, oldCasTime: prevCasTime,
                     newConsularDate: verifyAppt.consularDate, newConsularTime: verifyAppt.consularTime,
                     newCasDate: verifyAppt.casDate, newCasTime: verifyAppt.casTime,
                     recoveredFromError: true,
