@@ -798,6 +798,17 @@ async function vuelta(): Promise<Resultado> {
 }
 
 async function main() {
+  // Node termina con codigo 0 y sin log cuando el bucle de eventos se queda sin handles.
+  // Pasa si una vuelta espera una promesa que nunca se resuelve y el unico timer vivo es
+  // un `AbortSignal.timeout`, que no mantiene vivo el proceso. El 2026-10-27 12:15:30 y el
+  // 2026-11-04 14:30:30 (Bogota) el sniper murio asi, 16 s despues del tick de un minuto
+  // multiplo de 5, y `Restart=on-failure` no lo revivio porque el codigo era 0.
+  // `beforeExit` no se emite con `process.exit()`, entonces los finales normales no cambian.
+  process.on('beforeExit', (code) => {
+    log(`  [salida] el bucle de eventos se vacio (code ${code}) con una vuelta colgada. Sale con 3 para que systemd reinicie.`);
+    process.exit(3);
+  });
+
   const row = await leerBot();
   const cupo = cupoEfectivo(configDe(row, row.currentConsularDate));
   log('═══ SNIPER PERU · bot ' + BOT_ID + ' ═══');
