@@ -938,7 +938,11 @@ async function main() {
       log(`  ERROR s${Math.floor((tDisparo % 60_000) / 1000)} (${n} seguidos): ${(e as Error).message}`);
       if (n % 10 === 0) log(`  ATENCION: ${n} errores seguidos y sigue intentando.`);
       // La sesion se suelta SOLO si la cookie de verdad murio. Ver `cookieSigueViva`.
-      if (sesion && !(await cookieSigueViva(sesion))) {
+      // Un timeout no prueba nada sobre la cookie, y en el minuto de liberacion `/groups`
+      // tambien se corta por carga. El 2026-11-06 01:05 eso tiro una sesion sana y forzo
+      // un login, que es el endpoint mas vigilado del portal.
+      const esTimeout = /timeout|aborted/i.test((e as Error).message);
+      if (sesion && !esTimeout && !esMinutoLiberacion(tDisparo) && !(await cookieSigueViva(sesion))) {
         log('  [sesion] la cookie murio. Se suelta y la vuelta siguiente entra de nuevo.');
         sesion = null;
       }
