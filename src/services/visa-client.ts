@@ -490,13 +490,14 @@ export class VisaClient {
 
   // ── Consular Days ──────────────────────────────────────
 
-  async getConsularDays(): Promise<DaySlot[]> {
+  /** `techoMs` existe para el sniper de Peru, que en el minuto de liberacion espera mas. */
+  async getConsularDays(techoMs: number = TECHO_DIAS_MS): Promise<DaySlot[]> {
     const resp = await this.fetchWithRetry(
       `${this.baseUrl}/schedule/${this.config.scheduleId}/appointment/days/${this.config.consularFacilityId}.json?appointments[expedite]=false`,
       { headers: this.ajaxHeaders() },
       'Consular days',
       'normal',
-      TECHO_DIAS_MS,
+      techoMs,
     );
     this.assertOk(resp, 'Consular days');
     return this.safeJson<DaySlot[]>(resp, 'Consular days');
