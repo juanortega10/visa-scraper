@@ -61,6 +61,8 @@ const QUEMADA_MS = 20 * 60_000;
 
 /** Clave del sniper en `sniper_scans`. La pagina /dashboard/peru la lee. */
 const SCAN_KEY = 'peru-299';
+/** Techo de `days.json` en el minuto de liberacion. El comun es 10 s (`TECHO_DIAS_MS`). */
+const TECHO_DIAS_LIBERACION_MS = 20_000;
 /** Cada cuanto se escribe un latido aunque nada cambie. */
 const LATIDO_MS = 5 * 60_000;
 
@@ -688,7 +690,9 @@ async function vuelta(tDisparo: number): Promise<Resultado> {
   // 1 · dias. Es la unica peticion en la vuelta normal.
   const t0 = Date.now();
   const segundoTick = Math.floor((tDisparo % 60_000) / 1000);
-  const dias = await s.client.getConsularDays();
+  // En el minuto de liberacion `days.json` tarda 8-10 s y el techo comun de 10 s cortaba
+  // los 4 disparos (medido 2026-11-06 01:10). Ahi se espera hasta 20 s.
+  const dias = await s.client.getConsularDays(esMinutoLiberacion(tDisparo) ? TECHO_DIAS_LIBERACION_MS : undefined);
   const msDias = Date.now() - t0;
   const tVisto = Date.now();
 
