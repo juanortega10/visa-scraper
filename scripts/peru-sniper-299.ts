@@ -39,7 +39,9 @@ import { VisaClient } from '../src/services/visa-client.js';
 import {
   elegirFecha, verificarDisparo, cupoEfectivo, veredictoToken, POLITICA_TOKEN,
   tocaDisparar, minutosEntreDisparos,
-  msHastaProximoTick, enVentana, VENTANA_PE,
+  enVentana, VENTANA_PE,
+  PLAN_DISPAROS, esMinutoLiberacion, msHastaProximoDisparo,
+  copiaCitaUsable, type CitaLeida,
   type SniperPeruConfig, type EstadoToken,
 } from '../src/services/peru-sniper-core.js';
 
@@ -48,13 +50,10 @@ const COMMIT = process.argv.includes('--commit');
 const UNA_VUELTA = process.argv.includes('--una-vuelta');
 
 /**
- * Segundos del minuto UTC en que se dispara. DOS por minuto, a proposito.
- *
- * El borde de liberacion cae en el segundo 14-15 UTC (ver [[release-clock-second-14]]).
- * Con `days.json` en 235-1.100 ms, un solo disparo en s14 puede llegar justo ANTES
- * de la liberacion y perder el cupo por un minuto entero. El de s18 lo recoge.
+ * Los segundos de disparo salen de `PLAN_DISPAROS` en `peru-sniper-core.ts`: 4 en el
+ * minuto multiplo de 5 (s14, s16, s18, s20, en paralelo) y 1 en los demas (s18).
+ * El plan anterior era [14, 18] en todos los minutos. Ver [[peru-reloj-5-min]].
  */
-const SEGUNDOS_TICK = [14, 18] as const;
 /** Edad maxima de la sesion antes de re-login preventivo. El TTL duro del portal es ~1h28m. */
 const SESION_MAX_MS = 44 * 60_000;
 /** Una fecha que fallo el POST no se reintenta durante este tiempo. */
@@ -145,6 +144,12 @@ export interface MetricasCamino {
   fechaEnsayo?: string | null;
   /** Dias entre hoy y la fecha del ensayo. La disponibilidad depende de la distancia. */
   diasHastaFecha?: number | null;
+  /** True si el disparo salio en un minuto UTC multiplo de 5. */
+  minutoLiberacion?: boolean;
+  /** De donde salio la cita en el camino critico: la copia en memoria o el portal en vivo. */
+  citaDe?: 'copia' | 'portal';
+  /** Edad de la copia de la cita al momento de la deteccion. */
+  edadCitaS?: number | null;
 }
 
 async function registrarEscaneo(args: {
@@ -173,7 +178,7 @@ async function registrarEscaneo(args: {
       phase: args.fase,
       payload: {
         masTemprana: args.masTemprana, dias: args.dias, msDias: args.msDias,
-        edadTokenS: args.edadTokenS, segundosTick: [...SEGUNDOS_TICK],
+        edadTokenS: args.edadTokenS, plan: PLAN_DISPAROS,
         ventanaSeg: [VENTANA_PE.inicioSeg, VENTANA_PE.finSeg - 1],
         ...(args.metricas ?? {}),
       },
@@ -379,7 +384,17 @@ async function intentarToken(s: Sesion): Promise<'ok' | 'fallo' | 'aplazado'> {
 }
 
 /** Devuelve una sesion con token utilizable. Re-login si la sesion es vieja o el token murio. */
-async function sesionLista(row: FilaBot): Promise<Sesion> {
+/**
+ * Con disparos en paralelo, dos vueltas pueden pedir la sesion a la vez. Sin este
+ * candado las dos harian login o refrescarian el token al mismo tiempo.
+ */
+let sesionEnVuelo: Promise<Sesion> | null = null;
+function sesionLista(row: FilaBot): Promise<Sesion> {
+  sesionEnVuelo ??= sesionListaSola(row).finally(() => { sesionEnVuelo = null; });
+  return sesionEnVuelo;
+}
+
+async function sesionListaSola(row: FilaBot): Promise<Sesion> {
   if (sesion && Date.now() - sesion.creadaMs > SESION_MAX_MS) {
     log('  [sesion] pasa de 44 min. Re-login preventivo.');
     sesion = null;
@@ -500,8 +515,13 @@ let cursorEnsayo = 0;
  * Aunque el codigo se rompiera, ninguna pasa V2 ni V3, entonces el ensayo no puede
  * disparar por accidente.
  */
-function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, msDias: number): void {
+function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, msDias: number, tDisparo: number): void {
   if (ensayoEnVuelo || Date.now() - ultimoEnsayoMs < ENSAYO_MS) return;
+  // Solo en el ultimo disparo del minuto de liberacion. Antes corria casi siempre fuera
+  // de ese minuto (216 de 3.173 veces dentro), entonces media el portal en calma:
+  // times p50 ~260 ms contra 3,5 s en las detecciones reales.
+  const ultimoSeg = PLAN_DISPAROS.liberacion[PLAN_DISPAROS.liberacion.length - 1];
+  if (!esMinutoLiberacion(tDisparo) || Math.floor((tDisparo % 60_000) / 1000) !== ultimoSeg) return;
   // Rota entre TODAS las fechas ofrecidas, no siempre la primera. El orden queda fijo
   // para que el cursor avance parejo aunque el portal reordene la respuesta.
   const fechas = dias.map((d) => d.date).filter(Boolean).sort();
@@ -532,7 +552,7 @@ function quizasEnsayo(s: Sesion, dias: Array<{ date: string }>, row: FilaBot, ms
         })(),
         (async () => {
           const t = Date.now();
-          try { return await s.client.getCurrentAppointment(); }
+          try { const a = await s.client.getCurrentAppointment(); guardarCopiaCita(a); return a; }
           catch (e) { fallo = `${fallo ? fallo + ' · ' : ''}cita: ${(e as Error).message}`; return null; }
           finally { msApt = Date.now() - t; }
         })(),
@@ -595,8 +615,51 @@ async function verificarCita(
   return ultima;
 }
 
+// ── Copia de la cita actual ─────────────────────────────────────────────────
+
+/**
+ * Ultima lectura de la cita del portal. Se refresca cada minuto FUERA del minuto de
+ * liberacion, y se usa en el camino critico solo si `copiaCitaUsable` la acepta.
+ *
+ * Antes la cita se leia en vivo en cada deteccion, en paralelo con `times.json`. Fue
+ * la peticion mas lenta en 18 de 26 detecciones y costo p50 3,0 s (max 8,6 s).
+ * La regla de "solo fechas anteriores" sigue igual: se aplica contra la copia, que
+ * tiene ~60-80 s y tiene que coincidir con la base. Si no cumple, se lee en vivo.
+ */
+let copiaCita: CitaLeida | null = null;
+let copiaEnVuelo = false;
+/** Cada cuanto se refresca la copia, fuera del minuto de liberacion. */
+const COPIA_REFRESCO_MS = 50_000;
+
+function guardarCopiaCita(a: { consularDate: string; consularTime?: string | null } | null): void {
+  if (a?.consularDate) copiaCita = { consularDate: a.consularDate, consularTime: a.consularTime ?? null, enMs: Date.now() };
+}
+
+function quizasRefrescarCopia(s: Sesion, tDisparo: number): void {
+  if (copiaEnVuelo || esMinutoLiberacion(tDisparo)) return;
+  if (copiaCita && Date.now() - copiaCita.enMs < COPIA_REFRESCO_MS) return;
+  copiaEnVuelo = true;
+  void s.client.getCurrentAppointment()
+    .then(guardarCopiaCita)
+    .catch((e) => log(`  [copia cita] no se pudo leer: ${(e as Error).message}`))
+    .finally(() => { copiaEnVuelo = false; });
+}
+
+// ── Vuelta ──────────────────────────────────────────────────────────────────
+
+/**
+ * Candado de la persecucion. En el minuto de liberacion corren hasta 4 vueltas a la
+ * vez. Solo UNA pasa de la deteccion al camino critico; las demas se apartan.
+ * El candado vence a los 90 s para que una vuelta colgada no bloquee las siguientes.
+ * Aunque venza, el reclamo atomico del cupo en la base impide un segundo POST.
+ */
+let persiguiendoDesde: number | null = null;
+const CANDADO_MAX_MS = 90_000;
+/** Se marca cuando el proceso tiene que terminar (agendado o sin cupo). */
+let fin: { agendado: boolean; motivo: string } | null = null;
+
 /** Una vuelta completa: pedir dias, verificar, y disparar si todo cierra. */
-async function vuelta(): Promise<Resultado> {
+async function vuelta(tDisparo: number): Promise<Resultado> {
   const tVuelta = Date.now();
   const tLeer = Date.now();
   const row = await leerBot();
@@ -607,9 +670,7 @@ async function vuelta(): Promise<Resultado> {
   const cupoDb = cupoEfectivo(configDe(row, row.currentConsularDate));
   if (cupoDb.quedan <= 0) {
     // La fila viene de memoria y puede tener hasta 60 s. Otra cadena puede haber
-    // tomado el cupo y devuelto un instante despues. Matar el proceso con un dato
-    // viejo lo deja muerto para siempre (`Restart=on-failure` no revive un exit 0).
-    // Se confirma EN VIVO antes de rendirse.
+    // tomado el cupo y devuelto un instante despues. Se confirma EN VIVO antes de rendirse.
     olvidarFila();
     const vivo = await leerBot();
     const cupoVivo = cupoEfectivo(configDe(vivo, vivo.currentConsularDate));
@@ -626,11 +687,9 @@ async function vuelta(): Promise<Resultado> {
 
   // 1 · dias. Es la unica peticion en la vuelta normal.
   const t0 = Date.now();
-  const segundoTick = Math.floor((t0 % 60_000) / 1000);
+  const segundoTick = Math.floor((tDisparo % 60_000) / 1000);
   const dias = await s.client.getConsularDays();
   const msDias = Date.now() - t0;
-  // Momento exacto en que el cupo se hace VISIBLE para nosotros. Desde aqui corre el
-  // reloj que perdimos las dos veces que el bot 299 vio algo util.
   const tVisto = Date.now();
 
   const cfgPrevia = configDe(row, row.currentConsularDate);
@@ -638,27 +697,42 @@ async function vuelta(): Promise<Resultado> {
   const quemadaHasta = fecha ? quemadas.get(fecha) ?? 0 : 0;
 
   if (!fecha) {
-    // Se muestra la mas temprana que el portal ofrece. Sirve para ver de lejos si
-    // el portal se acerca a la meta, y para notar un filtro que descarta de mas.
     const masTemprana = (dias as Array<{ date: string }>).map((d) => d.date).sort()[0] ?? '(ninguna)';
-    log(`  dias ${dias.length} · ${msDias} ms · nada util · mas temprana ${masTemprana} (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
+    log(`  s${segundoTick} dias ${dias.length} · ${msDias} ms · nada util · mas temprana ${masTemprana} (cita ${row.currentConsularDate}, meta < ${row.targetDateBefore})`);
     registrarEscaneoSinEsperar({
       masTemprana, dias: dias.length, msDias, fase: 'buscando',
       ventanaFin: row.targetDateBefore ?? null,
       edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
-      metricas: { msLeerBot, segundoTick, tokenPrecalentado, msVuelta: Date.now() - tVuelta },
+      metricas: { msLeerBot, segundoTick, tokenPrecalentado, msVuelta: Date.now() - tVuelta, minutoLiberacion: esMinutoLiberacion(tDisparo) },
     });
-    // El ensayo mide el camino critico de verdad, con la cadencia de ENSAYO_MS.
-    // Sale sin esperar y nunca puede postear.
-    quizasEnsayo(s, dias as Array<{ date: string }>, row, msDias);
+    quizasRefrescarCopia(s, tDisparo);
+    quizasEnsayo(s, dias as Array<{ date: string }>, row, msDias, tDisparo);
     return { agendado: false };
   }
   if (Date.now() < quemadaHasta) {
     log(`  ${fecha} quemada hasta ${new Date(quemadaHasta).toISOString().slice(11, 19)}Z. Se salta.`);
     return { agendado: false };
   }
+  if (fin) return { agendado: false };
+  if (persiguiendoDesde !== null && Date.now() - persiguiendoDesde < CANDADO_MAX_MS) {
+    log(`  s${segundoTick} ve ${fecha} · otra vuelta ya persigue. Se aparta.`);
+    return { agendado: false };
+  }
+  persiguiendoDesde = Date.now();
+  try {
+    return await perseguir({ row, s, fecha, dias: dias as Array<{ date: string }>, msDias, tVisto, segundoTick, msLeerBot, tokenPrecalentado });
+  } finally {
+    persiguiendoDesde = null;
+  }
+}
 
-  log(`  DETECCION ${fecha} · dias ${dias.length} · ${msDias} ms · ventana ${enVentana(Date.now()) ? 'SI' : 'NO'}`);
+/** Camino critico: de la fecha vista al POST y su verificacion. */
+async function perseguir(c: {
+  row: FilaBot; s: Sesion; fecha: string; dias: Array<{ date: string }>; msDias: number;
+  tVisto: number; segundoTick: number; msLeerBot: number; tokenPrecalentado: boolean;
+}): Promise<Resultado> {
+  const { row, s, fecha, dias, msDias, tVisto, segundoTick, msLeerBot, tokenPrecalentado } = c;
+  log(`  DETECCION ${fecha} · s${segundoTick} · dias ${dias.length} · ${msDias} ms · ventana ${enVentana(Date.now()) ? 'SI' : 'NO'}`);
   ultimoEscaneo = null;   // una deteccion siempre se escribe
   registrarEscaneoSinEsperar({
     masTemprana: fecha, dias: dias.length, msDias, fase: 'deteccion',
@@ -667,45 +741,41 @@ async function vuelta(): Promise<Resultado> {
     metricas: { msLeerBot, segundoTick, tokenPrecalentado },
   });
 
-  // 2 y 3 · horas Y cita actual, EN PARALELO.
-  //
-  // Las dos son peticiones al portal y ninguna depende de la otra. En serie
-  // sumaban; ahora se cobra el maximo. `times.json` es la carrera: el cupo del
-  // 2026-10-26 vivio 15 segundos y el bot llego a los 16,6 (medido 2026-08-27).
-  //
-  // La cita actual sale del PORTAL, nunca de la base de datos: la regla critica se
-  // verifica contra lo que el portal dice hoy. Si esa lectura falla queda en null, y
-  // V2 de `verificarDisparo` cancela el disparo. No se cachea: en Peru el bloqueo es
-  // irreversible y un dato viejo podria autorizar un movimiento hacia adelante.
+  // 2 · horas, y la cita solo si la copia no sirve.
   const tCarrera = Date.now();
-  // Tiempo REGALADO: de ver el cupo a pedir las horas. Era 4.408 ms y 13.832 ms en
-  // las dos detecciones del 2026-08-27. Con el escaneo sin esperar y el token
-  // precalentado tiene que quedar en pocos milisegundos.
   const msDiasAHoras = tCarrera - tVisto;
+  const usarCopia = copiaCitaUsable(copiaCita, row.currentConsularDate, Date.now());
+  const edadCitaS = copiaCita ? Math.round((Date.now() - copiaCita.enMs) / 1000) : null;
   let msTimes = 0;
   let msApt = 0;
   const [resHoras, apt] = await Promise.all([
     (async () => { const t = Date.now(); try { return await s.client.getConsularTimes(fecha); } finally { msTimes = Date.now() - t; } })(),
-    (async () => {
-      const t = Date.now();
-      try { return await s.client.getCurrentAppointment(); }
-      catch (e) { log(`  [cita] no se pudo leer del portal: ${(e as Error).message}`); return null; }
-      finally { msApt = Date.now() - t; }
-    })(),
+    usarCopia
+      ? Promise.resolve(copiaCita)
+      : (async () => {
+        const t = Date.now();
+        try { const a = await s.client.getCurrentAppointment(); guardarCopiaCita(a); return a; }
+        catch (e) { log(`  [cita] no se pudo leer del portal: ${(e as Error).message}`); return null; }
+        finally { msApt = Date.now() - t; }
+      })(),
   ]);
   const msCarrera = Date.now() - tCarrera;
+  const citaDe = usarCopia ? 'copia' : 'portal';
   const cfg = configDe(row, apt?.consularDate ?? null);
-  log(`  regalado ${msDiasAHoras} ms · carrera ${msCarrera} ms (times ${msTimes}, cita ${msApt}) · portal dice cita ${apt?.consularDate ?? '(no leida)'} ${apt?.consularTime ?? ''}`);
-  // Se escribe la medicion de la deteccion real, sin esperar.
+  const horas = (resHoras.available_times ?? []).filter(Boolean) as string[];
+  const horasNegocio = (resHoras.business_times ?? []).filter(Boolean) as string[];
+  log(`  regalado ${msDiasAHoras} ms · carrera ${msCarrera} ms (times ${msTimes}, cita ${citaDe}${usarCopia ? ` de ${edadCitaS} s` : ` ${msApt} ms`}) · cita ${apt?.consularDate ?? '(no leida)'} · horas [${horas.join(',')}]`);
   registrarEscaneoSinEsperar({
     masTemprana: fecha, dias: dias.length, msDias, fase: 'deteccion_medida',
     ventanaFin: row.targetDateBefore ?? null,
     edadTokenS: s.token ? Math.round((Date.now() - s.token.emitidoMs) / 1000) : null,
     siempre: true,
-    metricas: { msLeerBot, segundoTick, tokenPrecalentado, msDiasAHoras, msCarrera, msTimes, msApt },
+    metricas: {
+      msLeerBot, segundoTick, tokenPrecalentado, msDiasAHoras, msCarrera, msTimes, msApt,
+      citaDe, edadCitaS, horasEncontradas: horas.length, horas, horasNegocio,
+    },
   });
 
-  const horas = (resHoras.available_times ?? []).filter(Boolean) as string[];
   if (!horas.length) {
     log(`  ${fecha} sin horas. Se quema 20 min.`);
     quemadas.set(fecha, Date.now() + QUEMADA_MS);
@@ -714,7 +784,7 @@ async function vuelta(): Promise<Resultado> {
   // La ultima hora del dia compite menos que la primera.
   const hora = horas[horas.length - 1]!;
 
-  // 4 · verificadores duros
+  // 3 · verificadores duros
   const fallos = verificarDisparo(fecha, hora, cfg, hoyUtc());
   if (fallos.length) {
     log(`  ABORTA. ${fallos.length} verificador(es):`);
@@ -723,7 +793,7 @@ async function vuelta(): Promise<Resultado> {
     return { agendado: false };
   }
 
-  // 5 · el token debe estar vivo AHORA, no cuando se precalento
+  // 4 · el token debe estar vivo AHORA, no cuando se precalento
   if (veredictoToken(s.token, s.id, Date.now(), POLITICA_TOKEN) === 'vencido') {
     log('  ABORTA: el token vencio justo antes del POST. Se refresca para la proxima.');
     await intentarToken(s);
@@ -731,48 +801,68 @@ async function vuelta(): Promise<Resultado> {
   }
 
   const edadTokenS = Math.round((Date.now() - (s.token?.emitidoMs ?? 0)) / 1000);
-  log(`  LISTO → ${fecha} ${hora} (de ${horas.length} horas) · token de ${edadTokenS} s · cita actual ${cfg.citaActual}`);
+  log(`  LISTO → ${fecha} ${hora} (de ${horas.length} horas) · token de ${edadTokenS} s · cita actual ${cfg.citaActual} (${citaDe})`);
 
   if (!COMMIT) {
     log('  DRY-RUN. No se manda el POST.');
     return { agendado: false };
   }
+  if (fin) return { agendado: false };
 
-  // 6 · reclamo atomico. Solo despues de esto se toca el portal.
+  // 5 · reclamo atomico. Solo despues de esto se toca el portal.
   if (!(await reclamarCupo())) {
-    // NO es fatal. `poll-visa` corre sobre el mismo bot y puede reclamar y devolver el
-    // cupo en la misma vuelta. Antes esto mataba el sniper para siempre por una
-    // carrera de segundos. Se salta el tick y la vuelta siguiente lee en vivo.
     log('  Se salta: otra cadena tiene el cupo ahora (UPDATE atomico sin filas).');
     olvidarFila();
     return { agendado: false };
   }
 
-  // 7 · UN solo POST por deteccion. Sin reintento a ciegas.
+  // 6 · UN solo POST por deteccion. Sin reintento a ciegas.
   const tPost = Date.now();
+  const msVistoAPost = tPost - tVisto;
   let dijoOk = false;
   let errPost: string | null = null;
   try { dijoOk = await s.client.reschedule(fecha, hora); }
   catch (e) { errPost = (e as Error).message; }
-  log(`  POST → ${dijoOk ? 'dice OK' : `dice NO (${errPost ?? 'sin excepcion'})`} · ${Date.now() - tPost} ms`);
+  const msPost = Date.now() - tPost;
+  log(`  POST → ${dijoOk ? 'dice OK' : `dice NO (${errPost ?? 'sin excepcion'})`} · ${msPost} ms · ${msVistoAPost} ms desde ver la fecha`);
 
-  // 8 · verificacion contra el portal. El POST miente: ver `followRedirectChain`.
+  // 7 · verificacion contra el portal. El POST miente: ver `followRedirectChain`.
   const tVerif = Date.now();
   const real = await verificarCita(s, fecha);
+  guardarCopiaCita(real);
+  const msVerif = Date.now() - tVerif;
   const quedo = real?.consularDate === fecha;
-  log(`  portal ahora: ${real?.consularDate ?? '?'} ${real?.consularTime ?? ''} → ${quedo ? 'QUEDO' : 'NO QUEDO'} · ${Date.now() - tVerif} ms`);
+  log(`  portal ahora: ${real?.consularDate ?? '?'} ${real?.consularTime ?? ''} → ${quedo ? 'QUEDO' : 'NO QUEDO'} · ${msVerif} ms`);
 
-  await db.insert(rescheduleLogs).values({
-    botId: BOT_ID,
-    oldConsularDate: cfg.citaActual, oldConsularTime: apt?.consularTime ?? null,
-    newConsularDate: quedo ? fecha : null, newConsularTime: quedo ? hora : null,
-    success: quedo,
-    provider: row.proxyProvider,
-    failStep: quedo ? null : 'post_reschedule',
-    failReason: quedo ? null : (errPost ? 'post_error' : 'post_failed'),
-    error: quedo ? null : `[peru_sniper] dijoOk=${dijoOk} objetivo=${fecha} ${hora} real=${real?.consularDate ?? '?'} ${errPost ?? ''}`,
-    detail: { source: 'peru-sniper-299', horasVistas: horas, edadTokenS, msDias },
+  const medidas = {
+    source: 'peru-sniper-299', horasVistas: horas, horasNegocio, edadTokenS, msDias, segundoTick,
+    msCarrera, msTimes, msApt, citaDe, edadCitaS, msVistoAPost, msPost, msVerif, dijoOk, errPost,
+  };
+  registrarEscaneoSinEsperar({
+    masTemprana: fecha, dias: dias.length, msDias, fase: 'post',
+    ventanaFin: row.targetDateBefore ?? null, edadTokenS, siempre: true,
+    metricas: { ...medidas, hora, quedo } as MetricasCamino,
   });
+
+  // Contabilidad: si no quedo, el cupo vuelve aunque el INSERT falle.
+  try {
+    await db.insert(rescheduleLogs).values({
+      botId: BOT_ID,
+      oldConsularDate: cfg.citaActual, oldConsularTime: apt?.consularTime ?? null,
+      newConsularDate: quedo ? fecha : null, newConsularTime: quedo ? hora : null,
+      success: quedo,
+      provider: row.proxyProvider,
+      failStep: quedo ? null : 'post_reschedule',
+      failReason: quedo ? null : (errPost ? 'post_error' : 'post_failed'),
+      error: quedo ? null : `[peru_sniper] dijoOk=${dijoOk} objetivo=${fecha} ${hora} real=${real?.consularDate ?? '?'} ${errPost ?? ''}`,
+      msToPost: msVistoAPost,
+      timesSeen: horas.length,
+      durationMs: Date.now() - tVisto,
+      detail: medidas,
+    });
+  } catch (e) {
+    log(`  [reschedule_logs] no se pudo escribir: ${(e as Error).message}`);
+  }
 
   if (quedo && real) {
     await db.update(bots).set({
@@ -815,23 +905,55 @@ async function main() {
   log(`  modo: ${COMMIT ? '*** COMMIT (REAL) ***' : 'DRY-RUN'}${UNA_VUELTA ? ' · una vuelta' : ''}`);
   log(`  cita ${row.currentConsularDate} ${row.currentConsularTime} · meta antes de ${row.targetDateBefore}`);
   log(`  cupo ${cupo.quedan} (tope ${cupo.topeDe}) · nuestro ${row.rescheduleCount}/${row.maxReschedules} · portal ${row.portalRemainingReschedules}`);
-  log(`  fase: ${SEGUNDOS_TICK.length} peticiones por minuto, segundos ${SEGUNDOS_TICK.join(' y ')} UTC · ventana s${VENTANA_PE.inicioSeg}-${VENTANA_PE.finSeg - 1}`);
+  log(`  plan: minuto %5=0 en s${PLAN_DISPAROS.liberacion.join(',')} (en paralelo) · resto en s${PLAN_DISPAROS.resto.join(',')} · ventana s${VENTANA_PE.inicioSeg}-${VENTANA_PE.finSeg - 1}`);
   log(`  token: refresco cada ${POLITICA_TOKEN.cadenciaMs / 60000} min, techo ${POLITICA_TOKEN.techoMs / 60000} min`);
 
-  // La sesion se abre ANTES del bucle. El login tarda ~17 s y desalinearia la
-  // primera vuelta: la peticion caeria en el segundo 25, fuera de la ventana.
-  try { await sesionLista(row); } catch (e) { log(`  [sesion] arranque fallo: ${(e as Error).message}`); }
+  // La sesion y la copia de la cita se preparan ANTES del bucle.
+  try {
+    const s = await sesionLista(row);
+    guardarCopiaCita(await s.client.getCurrentAppointment());
+    log(`  copia de la cita: ${copiaCita?.consularDate ?? '(no leida)'} ${copiaCita?.consularTime ?? ''}`);
+  } catch (e) { log(`  [sesion] arranque fallo: ${(e as Error).message}`); }
 
   let errores = 0;
   let ultimoDisparoMs = 0;
   let saltadosSeguidos = 0;
-  for (;;) {
-    await sleep(msHastaProximoTick(Date.now(), SEGUNDOS_TICK));
 
-    // Cadencia degradada. NO es una pausa: el proceso sigue despertando en los segundos
-    // 14 y 18, conserva su fase contra la ventana de liberacion, y solo saltea disparos
-    // mientras la racha de errores dure. Al primer poll sano vuelve a la cadencia plena.
-    if (!tocaDisparar(errores, ultimoDisparoMs, Date.now())) {
+  /**
+   * Corre una vuelta y lleva la cuenta de errores. El bucle NO la espera: en el minuto
+   * de liberacion los disparos de s16, s18 y s20 salen aunque el de s14 siga esperando
+   * un `days.json` que tarda 5-15 s. Una vuelta colgada ya no detiene al sniper.
+   */
+  async function correrVuelta(tDisparo: number): Promise<void> {
+    try {
+      const r = await vuelta(tDisparo);
+      if (errores > 0) log(`  recuperado tras ${errores} errores. Cadencia plena otra vez.`);
+      errores = 0;
+      if (r.agendado) fin = { agendado: true, motivo: 'objetivo cumplido' };
+      else if (r.fatal) fin ??= { agendado: false, motivo: r.fatal };
+    } catch (e) {
+      // Se toma el numero ANTES de cualquier await: con vueltas en paralelo, otra puede
+      // terminar bien en el medio y poner `errores` en 0 (visto en el ensayo del 2026-11-06).
+      const n = ++errores;
+      log(`  ERROR s${Math.floor((tDisparo % 60_000) / 1000)} (${n} seguidos): ${(e as Error).message}`);
+      if (n % 10 === 0) log(`  ATENCION: ${n} errores seguidos y sigue intentando.`);
+      // La sesion se suelta SOLO si la cookie de verdad murio. Ver `cookieSigueViva`.
+      if (sesion && !(await cookieSigueViva(sesion))) {
+        log('  [sesion] la cookie murio. Se suelta y la vuelta siguiente entra de nuevo.');
+        sesion = null;
+      }
+    }
+  }
+
+  const enVuelo = new Set<Promise<void>>();
+  for (;;) {
+    await sleep(msHastaProximoDisparo(Date.now()));
+    if (fin) break;
+    const tDisparo = Date.now();
+
+    // Cadencia degradada por racha de errores. No aplica al minuto de liberacion:
+    // ahi aparecen los cupos, y una racha de timeouts en s14 es lo normal en ese minuto.
+    if (!esMinutoLiberacion(tDisparo) && !tocaDisparar(errores, ultimoDisparoMs, tDisparo)) {
       saltadosSeguidos += 1;
       if (saltadosSeguidos === 1) {
         log(`  cadencia reducida a 1 cada ${minutosEntreDisparos(errores)} min por ${errores} errores seguidos. Sigue vivo.`);
@@ -839,32 +961,17 @@ async function main() {
       continue;
     }
     saltadosSeguidos = 0;
-    ultimoDisparoMs = Date.now();
+    ultimoDisparoMs = tDisparo;
 
-    try {
-      const r = await vuelta();
-      if (errores > 0) log(`  recuperado tras ${errores} errores. Cadencia plena otra vez.`);
-      errores = 0;
-      if (r.agendado) { log('  objetivo cumplido. Fin.'); break; }
-      if (r.fatal) { log(`  ALTO: ${r.fatal}. Fin.`); break; }
-    } catch (e) {
-      errores += 1;
-      // SIN PAUSA. Una pausa de 15 min se come 30 ventanas de liberacion seguidas, y
-      // el cupo de Peru aparece justo ahi. Se sigue disparando y se avisa en el log.
-      //
-      // La sesion se suelta SOLO si la cookie de verdad murio. Un fallo de `days.json`
-      // no prueba nada sobre la cookie: el 2026-08-31 la ruta del schedule estaba
-      // cerrada y `/groups` respondia 200. Tirar la sesion ahi costaba un login por
-      // error, contra el endpoint mas vigilado del portal. Ver `cookieSigueViva`.
-      if (sesion && !(await cookieSigueViva(sesion))) {
-        log('  [sesion] la cookie murio. Se suelta y la vuelta siguiente entra de nuevo.');
-        sesion = null;
-      }
-      log(`  ERROR (${errores} seguidos): ${(e as Error).message}`);
-      if (errores % 10 === 0) log(`  ATENCION: ${errores} errores seguidos y sigue intentando.`);
-    }
-    if (UNA_VUELTA) break;
+    const p = correrVuelta(tDisparo);
+    enVuelo.add(p);
+    void p.finally(() => enVuelo.delete(p));
+    if (UNA_VUELTA) { await p; break; }
   }
+
+  // Espera las vueltas en vuelo antes de salir, con techo, para no cortar un POST.
+  await Promise.race([Promise.allSettled([...enVuelo]), sleep(60_000)]);
+  if (fin) log(`  ${fin.agendado ? 'objetivo cumplido' : `ALTO: ${fin.motivo}`}. Fin.`);
   process.exit(0);
 }
 

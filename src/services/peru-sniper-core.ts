@@ -284,3 +284,80 @@ export function enVentana(ahoraMs: number, v = VENTANA_PE): boolean {
   const seg = Math.floor((ahoraMs % 60_000) / 1000);
   return seg >= v.inicioSeg && seg < v.finSeg;
 }
+
+// ── Plan de disparos por minuto (2026-11-05) ─────────────────────────────────
+
+/**
+ * Segundos de disparo segun el minuto UTC.
+ *
+ * Medido sobre 10.244 filas de `sniper_scans` (2026-08-28 al 2026-10-27): 27 de 28
+ * detecciones del bot 299 cayeron en un minuto con `minuto % 5 = 0`. En ese minuto
+ * `days.json` tarda p50 5.201 ms, contra 803 ms en los demas, y el pedido de s14 se
+ * corta por timeout casi siempre. Por eso el minuto de liberacion lleva 4 disparos
+ * escalonados que corren EN PARALELO, y el resto lleva 1. Son 8 pedidos cada 5 min,
+ * contra los 10 del plan anterior de [14, 18] en todos los minutos.
+ */
+export const PLAN_DISPAROS = {
+  liberacion: [14, 16, 18, 20],
+  resto: [18],
+} as const;
+
+/** True si el instante cae en un minuto UTC multiplo de 5. */
+export function esMinutoLiberacion(ahoraMs: number): boolean {
+  return Math.floor(ahoraMs / 60_000) % 5 === 0;
+}
+
+/** Segundos de disparo del minuto que contiene a `ahoraMs`. */
+export function segundosDelMinuto(ahoraMs: number, plan = PLAN_DISPAROS): readonly number[] {
+  return esMinutoLiberacion(ahoraMs) ? plan.liberacion : plan.resto;
+}
+
+/**
+ * Milisegundos hasta el proximo disparo del plan. Siempre mayor que 0.
+ * Revisa el minuto actual y los 5 siguientes, que cubren un ciclo entero.
+ */
+export function msHastaProximoDisparo(ahoraMs: number, plan = PLAN_DISPAROS): number {
+  const minuto0 = Math.floor(ahoraMs / 60_000);
+  for (let m = minuto0; m <= minuto0 + 5; m++) {
+    const segundos = m % 5 === 0 ? plan.liberacion : plan.resto;
+    for (const s of [...segundos].sort((a, b) => a - b)) {
+      const t = m * 60_000 + s * 1000;
+      if (t > ahoraMs) return t - ahoraMs;
+    }
+  }
+  return 60_000;
+}
+
+// ── Copia de la cita actual (2026-11-05) ─────────────────────────────────────
+
+/** Una lectura de la cita del portal y cuando se hizo. */
+export interface CitaLeida {
+  consularDate: string;
+  consularTime: string | null;
+  enMs: number;
+}
+
+/**
+ * Edad maxima de la copia para usarla en el camino critico. La copia se refresca
+ * cada minuto fuera del minuto de liberacion, entonces en ese minuto tiene ~60-80 s.
+ */
+export const CITA_COPIA_MAX_MS = 3 * 60_000;
+
+/**
+ * Decide si el disparo puede usar la copia de la cita en vez de leer `/groups`.
+ *
+ * Leer `/groups` en el momento costo p50 3,0 s en 18 de 26 detecciones. La copia
+ * sirve SOLO si es reciente y coincide con la fecha de la base. Si el dueno movio la
+ * cita a mano, la base o la copia lo delatan, y en ese caso se lee en vivo.
+ */
+export function copiaCitaUsable(
+  copia: CitaLeida | null,
+  citaEnBase: string | null,
+  ahoraMs: number,
+  maxMs = CITA_COPIA_MAX_MS,
+): boolean {
+  if (!copia || !citaEnBase) return false;
+  const edad = ahoraMs - copia.enMs;
+  if (edad < 0 || edad > maxMs) return false;
+  return copia.consularDate === citaEnBase;
+}
